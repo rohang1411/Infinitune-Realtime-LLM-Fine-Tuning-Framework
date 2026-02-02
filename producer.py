@@ -7,7 +7,8 @@ import time
 def create_producer():
     return KafkaProducer(
         bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10),
+        # Do not force `api_version`. Let kafka-python auto-detect the broker
+        # supported API versions to avoid UnsupportedVersionException.
         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
         key_serializer=lambda k: k.encode('utf-8')  # expects key as a string
     )
@@ -38,7 +39,7 @@ if __name__ == "__main__":
             key=key,   # this is now a stable hexadecimal string
             value=example
         )
-        # print("sent sample")
+        print("sent sample")
         time.sleep(0.1)  # Control data generation speed
 
     producer.flush()

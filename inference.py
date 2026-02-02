@@ -68,11 +68,11 @@ def kafka_consumer_thread(update_queue: queue.Queue):
             if not messages: # No messages, continue loop
                  time.sleep(0.1)
                  continue
-
+            print("Message received at:", time.time())
             for tp, records in messages.items():
                 for message in records:
                     if message.key and message.value is not None:
-                        # print(f"Received update for layer: {message.key}") # Can be verbose
+                        print(f"Received update for layer: {message.key}") # Can be verbose
                         update_queue.put((message.key, message.value))
                     else:
                         print(f"Warning: Received message with missing key or value.")
@@ -110,13 +110,13 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue, model
                     break # No more updates in the queue for now
             
             if updates_to_apply:
-                # print(f"Applying {len(updates_to_apply)} weight updates...") # Can be verbose
+                print(f"Applying {len(updates_to_apply)} weight updates...") # Can be verbose
                 with model_lock: # Acquire lock before modifying model state
                     updates_to_apply_on_device = {
                         k: v.to(DEVICE) for k, v in updates_to_apply.items()
                     }
                     model.load_state_dict(updates_to_apply_on_device, strict=False) 
-                # print("Weight updates applied successfully.") # Can be verbose
+                print("Weight updates applied successfully.") # Can be verbose
                 
         except queue.Empty:
              # This happens if the initial get times out (if timeout is set)
