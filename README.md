@@ -18,6 +18,15 @@ brew install kafka
 brew install zookeeper
 zookeeper-server-start /opt/homebrew/etc/kafka/zookeeper.properties
 
+
+# Start Kafka (KRaft mode - no Zookeeper needed)
+# Note: Zookeeper is no longer required or installed by default in newer Kafka versions
+kafka-server-start /opt/homebrew/etc/kafka/server.properties
+
+# test kafka (in a new terminal)
+kafka-topics --bootstrap-server localhost:9092 --list
+
+
 nano ~/.zshrc 
 export PATH="/opt/homebrew/Cellar/kafka/3.9.0/libexec/bin:$PATH"
 source ~/.zshrc
@@ -98,3 +107,26 @@ python trainer.py
 # Inference Server (in separate terminal)
 python inference.py
 ```
+
+
+
+
+-------------------------
+Running command WITH ARGGS
+
+# Terminal 1 — Start the Producer
+python producer.py --config configs/imdb_config.yaml
+
+# Terminal 2 — Start the Trainer
+python trainer.py --config configs/imdb_config.yaml
+
+# Terminal 3 — Start the Inference Server
+python inference.py --config configs/imdb_config.yaml
+
+# Terminal 4 — Test the API
+curl -X POST http://localhost:5000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Review: This movie was absolutely terrible.\nSentiment:"}'
+
+# Health check
+curl http://localhost:5000/health

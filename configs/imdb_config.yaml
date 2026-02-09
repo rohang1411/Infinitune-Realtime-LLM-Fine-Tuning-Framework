@@ -1,0 +1,79 @@
+# ============================================================
+# InfiniTune Configuration — IMDb Sentiment Analysis
+# Task Type : Qualitative / Classification (Causal LM head)
+# Model     : distilgpt2 (82M params) — chosen for fast testing
+# ============================================================
+
+project:
+  name: "infinitune-imdb-sentiment"
+  output_dir: "./output/imdb"
+
+# --- Model ---
+model:
+  name: "distilgpt2"
+  task_type: "CAUSAL_LM"
+  precision: "fp32"          # fp16 | fp32 | 4bit
+  max_seq_length: 256
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "c_attn"               # GPT-2 combined QKV projection
+
+# --- Dataset ---
+dataset:
+  name: "imdb"
+  config_name: null
+  split: "train"
+  eval_split: "test"
+  column_mapping:
+    input_col: "text"         # raw dataset column for input
+    target_col: "label"       # raw dataset column for target
+  label_map:                  # maps numeric IDs → human-readable strings
+    0: "negative"
+    1: "positive"
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "Review: {{ input }}\nSentiment:"
+  response_template: " {{ target }}"
+  hash_column: "input"        # which standardized column to hash for dedup
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data"
+  lora_updates_topic: "lora-updates"
+  producer_send_interval: 0.1
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 2e-4
+  max_steps: 2000              # reduced for fast testing (original: 1000)
+  logging_steps: 1
+  weight_push_interval: 10    # seconds between LoRA pushes to Kafka
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 50
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Evaluation (Polymorphic) ---
+evaluation:
+  enabled: true
+  strategy: "class_match"     # class_match | regex_extract | perplexity
+  eval_interval: 50           # evaluate every N optimizer steps
+  eval_samples: 20
+  answer_regex: null           # not used for class_match
