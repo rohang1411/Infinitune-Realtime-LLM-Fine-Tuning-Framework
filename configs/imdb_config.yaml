@@ -12,7 +12,7 @@ project:
 model:
   name: "distilgpt2"
   task_type: "CAUSAL_LM"
-  precision: "fp32"          # fp16 | fp32 | 4bit
+  precision: "fp16"          # fp16 | fp32 | 4bit
   max_seq_length: 256
 
 # --- LoRA Adapter ---
@@ -42,6 +42,24 @@ preprocessing:
   prompt_template: "Review: {{ input }}\nSentiment:"
   response_template: " {{ target }}"
   hash_column: "input"        # which standardized column to hash for dedup
+
+# --- Data (SSoT superset) ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 15
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5  # Drops purely symbol-based garbage
+      max_repetition_ratio: 0.2    # (Compressed Size / Original Size) - Drops spam like "A A A A"
+    domain_specific:
+      require_numeric_content: null # Boolean
+      custom_regex_must_match: null # List of strings
+      custom_regex_must_not_match: null # List of strings
+      chat_structure:
+        min_turns: null             # Integer
+        require_assistant_final: null # Boolean
 
 # --- Kafka ---
 kafka:

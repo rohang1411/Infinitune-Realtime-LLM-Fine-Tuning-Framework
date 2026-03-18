@@ -6,6 +6,8 @@ import json
 import time
 import yaml
 
+from utils.stream_filter import StreamFilter
+
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -87,6 +89,7 @@ if __name__ == "__main__":
 
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
+    stream_filter = StreamFilter(config, log_fn=_log)
     producer = create_producer(config)
     topic_name = config['kafka']['training_topic']
     send_interval = config['kafka'].get('producer_send_interval', 0.1)
@@ -111,8 +114,33 @@ if __name__ == "__main__":
     last_progress_time = time.time()
     progress_every_s = 5.0
 
+    # Filtering telemetry (non-blocking)
+    total_records = 0
+    dropped_records = 0
+    last_filter_telemetry_time = time.time()
+    filter_telemetry_every_n = 1000
+    filter_telemetry_every_s = 60.0
+
     _log(f"Starting to stream samples to topic '{topic_name}'...")
     for example in generate_training_examples(config):
+        total_records += 1
+
+        extracted_text = str(example.get(hash_column, ""))
+        if not stream_filter.is_valid(raw_record=example, extracted_text=extracted_text):
+            dropped_records += 1
+            now = time.time()
+            if (
+                total_records % filter_telemetry_every_n == 0
+                or now - last_filter_telemetry_time >= filter_telemetry_every_s
+            ):
+                drop_rate = (dropped_records / float(total_records)) * 100.0 if total_records > 0 else 0.0
+                _log(
+                    f"FILTER STATS: Ingested={total_records} | Dropped={dropped_records} | "
+                    f"Drop Rate={drop_rate:.2f}%"
+                )
+                last_filter_telemetry_time = now
+            continue
+
         key = compute_hash(example[hash_column])
         future = producer.send(
             topic=topic_name,
