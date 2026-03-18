@@ -76,7 +76,8 @@ def tokenize_with_label_masking(tokenizer, prompt_text, response_text, max_seq_l
         prompt_ids = []
         max_prompt_len = 0
     else:
-        prompt_ids = prompt_ids[:max_prompt_len]
+        # Keep the end of the prompt (the actual question)
+        prompt_ids = prompt_ids[-max_prompt_len:]
 
     input_ids = prompt_ids + response_ids
     attention_mask = [1] * len(input_ids)
@@ -378,41 +379,42 @@ def train_model(config):
     _log("Starting manual training loop...")
     _log("Label masking enabled: loss computed on response tokens only (prompt tokens masked with -100).")
     
+    message_queue = []
+    accumulated_loss = 0.0
+    
     while optimization_step < training_args.max_steps:
         batch_samples = []
         # Assemble a mini-batch of raw examples.
         while len(batch_samples) < training_args.per_device_train_batch_size:
-            messages = consumer.poll(timeout_ms=poll_timeout_ms)
-            if not messages:
-                # Heartbeat so it never looks "stuck" while waiting for producer data.
-                now = time.time()
-                if now - last_heartbeat_time >= heartbeat_every_s:
-                    _log(f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s")
-                    last_heartbeat_time = now
-                time.sleep(0.1)
-                continue
+            if not message_queue:
+                messages = consumer.poll(timeout_ms=poll_timeout_ms)
+                if not messages:
+                    # Heartbeat so it never looks "stuck" while waiting for producer data.
+                    now = time.time()
+                    if now - last_heartbeat_time >= heartbeat_every_s:
+                        _log(f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s")
+                        last_heartbeat_time = now
+                    time.sleep(0.1)
+                    continue
 
-            for tp, records in messages.items():
-                for message in records:
-                    if message is None or message.value is None:
-                        continue
-                    sample_data = message.value
-                    prompt_text = prompt_template.render(**sample_data)
-                    response_text = response_template.render(**sample_data)
+                for tp, records in messages.items():
+                    for message in records:
+                        if message is not None and message.value is not None:
+                            message_queue.append(message.value)
 
-                    # Tokenize with prompt/response separation, truncate prompt (not response),
-                    # and mask prompt tokens in labels.
-                    tok = tokenize_with_label_masking(
-                        tokenizer, prompt_text, response_text, max_seq_length
-                    )
-                    batch_samples.append(tok)
-                    total_messages_seen += 1
-                    last_data_time = time.time()
+            if message_queue:
+                sample_data = message_queue.pop(0)
+                prompt_text = prompt_template.render(**sample_data)
+                response_text = response_template.render(**sample_data)
 
-                    if len(batch_samples) >= training_args.per_device_train_batch_size:
-                        break
-                if len(batch_samples) >= training_args.per_device_train_batch_size:
-                    break
+                # Tokenize with prompt/response separation, truncate prompt (not response),
+                # and mask prompt tokens in labels.
+                tok = tokenize_with_label_masking(
+                    tokenizer, prompt_text, response_text, max_seq_length
+                )
+                batch_samples.append(tok)
+                total_messages_seen += 1
+                last_data_time = time.time()
     
         _log(f"Assembled batch: size={len(batch_samples)} (padding & moving to device...)")
 
@@ -423,6 +425,9 @@ def train_model(config):
         step_start = time.time()
         outputs = model(**batch)
         loss = outputs.loss
+        
+        accumulated_loss += loss.item()
+        
         # Scale loss appropriately for gradient accumulation.
         loss = loss / training_args.gradient_accumulation_steps
         loss.backward()
@@ -436,9 +441,11 @@ def train_model(config):
     
             # Optionally, print loss every logging_steps updates.
             if optimization_step % training_args.logging_steps == 0:
-            # Multiply back our loss to get an approximated per-update loss
+                avg_loss = accumulated_loss / training_args.gradient_accumulation_steps
                 elapsed = time.time() - step_start
-                _log(f"Step {optimization_step}: loss = {loss.item() * training_args.gradient_accumulation_steps:.4f} (batch_time={elapsed:.2f}s, total_messages_seen={total_messages_seen})")
+                _log(f"Step {optimization_step}: loss = {avg_loss:.4f} (batch_time={elapsed:.2f}s, total_messages_seen={total_messages_seen})")
+                
+            accumulated_loss = 0.0
 
             # Periodic evaluation
             if evaluator.enabled and optimization_step % evaluator.eval_interval == 0:
