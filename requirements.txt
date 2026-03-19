@@ -7,3 +7,4 @@ flask
 trl
 wandb
 accelerate
+matplotlib

@@ -110,8 +110,16 @@ class StreamFilter:
         return True
 
     def is_valid(self, raw_record, extracted_text):
+        ok, _reason = self.validate(raw_record, extracted_text)
+        return ok
+
+    def validate(self, raw_record, extracted_text):
+        """
+        Returns (is_valid: bool, reason: str|None).
+        Reason is intended for debugging/telemetry and is kept lightweight.
+        """
         if not self.enabled:
-            return True
+            return True, None
 
         try:
             text = self._build_text_for_metrics(raw_record, extracted_text)
@@ -121,23 +129,24 @@ class StreamFilter:
             # O(1) checks first
             # -------------------------
             if self.min_chars is not None and n < self.min_chars:
-                return False
+                return False, f"min_chars({n}<{self.min_chars})"
             if self.max_chars is not None and n > self.max_chars:
-                return False
+                return False, f"max_chars({n}>{self.max_chars})"
 
             # -------------------------
             # O(N) scans second
             # -------------------------
             if self.require_numeric_content is True:
                 if not any(ch.isdigit() for ch in text):
-                    return False
+                    return False, "require_numeric_content(no_digit_found)"
 
             if self.min_alphanumeric_ratio is not None:
                 if n == 0:
-                    return False  # avoids division by zero
+                    return False, "min_alphanumeric_ratio(empty_text)"
                 alnum = sum(1 for ch in text if ch.isalnum())
-                if (alnum / float(n)) < self.min_alphanumeric_ratio:
-                    return False
+                ratio = alnum / float(n)
+                if ratio < self.min_alphanumeric_ratio:
+                    return False, f"min_alphanumeric_ratio({ratio:.3f}<{self.min_alphanumeric_ratio})"
 
             # -------------------------
             # repetition (zlib) third
@@ -148,9 +157,8 @@ class StreamFilter:
                     try:
                         comp = zlib.compress(raw_bytes)
                         ratio = len(comp) / float(len(raw_bytes))  # safe: len(raw_bytes)>0
-                        # Very repetitive spam compresses extremely well (tiny ratio).
                         if ratio <= self.max_repetition_ratio:
-                            return False
+                            return False, f"max_repetition_ratio({ratio:.3f}<={self.max_repetition_ratio})"
                     except Exception as e:
                         self._log(f"[{self._ts()}][FILTER] WARNING: zlib failed: {e}")
 
@@ -158,7 +166,7 @@ class StreamFilter:
             # chat-structure fourth
             # -------------------------
             if not self._passes_chat_structure(raw_record):
-                return False
+                return False, "chat_structure(failed)"
 
             # -------------------------
             # regex last
@@ -166,20 +174,19 @@ class StreamFilter:
             for pat in self.custom_regex_must_match:
                 try:
                     if not pat.search(text):
-                        return False
+                        return False, f"custom_regex_must_match(missed:{pat.pattern})"
                 except Exception as e:
                     self._log(f"[{self._ts()}][FILTER] WARNING: must_match exec failed: {e}")
 
             for pat in self.custom_regex_must_not_match:
                 try:
                     if pat.search(text):
-                        return False
+                        return False, f"custom_regex_must_not_match(hit:{pat.pattern})"
                 except Exception as e:
                     self._log(f"[{self._ts()}][FILTER] WARNING: must_not_match exec failed: {e}")
 
-            return True
+            return True, None
         except Exception as e:
-            # Safety & stability: never crash the producer due to filtering.
-            self._log(f"[{self._ts()}][FILTER] ERROR: is_valid crashed: {e}")
-            return True
+            self._log(f"[{self._ts()}][FILTER] ERROR: validate crashed: {e}")
+            return True, None
 

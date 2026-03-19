@@ -38,14 +38,17 @@ def deserialize_tensor(value_bytes):
 # --------------------------------------------------
 # Kafka Consumer Thread
 # --------------------------------------------------
+_DONE_SENTINEL = ("__done__", None)
+
 def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
     Listens to the Kafka topic for LoRA weight updates and puts them in a queue.
+    Stops gracefully when it receives a '__done__' signal from the trainer.
     """
     kafka_cfg = config['kafka']
     topic = kafka_cfg['lora_updates_topic']
     _log(f"Consumer thread started, listening to topic '{topic}'...")
-    consumer = None # Initialize consumer to None
+    consumer = None
     try:
         consumer_timeout_ms = int(kafka_cfg.get('consumer_timeout_ms', 1000))
         poll_timeout_ms = int(kafka_cfg.get('poll_timeout_ms', 1000))
@@ -53,10 +56,10 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
         consumer = KafkaConsumer(
             topic,
             bootstrap_servers=kafka_cfg['bootstrap_servers'],
-            key_deserializer=lambda k: k.decode("utf-8") if k else None, 
-            value_deserializer=deserialize_tensor, 
+            key_deserializer=lambda k: k.decode("utf-8") if k else None,
+            value_deserializer=deserialize_tensor,
             group_id=kafka_cfg.get('consumer_group_inference', 'inference-api-group'),
-            auto_offset_reset="latest", 
+            auto_offset_reset="latest",
             consumer_timeout_ms=consumer_timeout_ms
         )
         
@@ -64,9 +67,9 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
         last_heartbeat_time = time.time()
         heartbeat_every_s = 5.0
 
-        while True: 
-            messages = consumer.poll(timeout_ms=poll_timeout_ms) # Poll for messages
-            if not messages: # No messages, continue loop
+        while True:
+            messages = consumer.poll(timeout_ms=poll_timeout_ms)
+            if not messages:
                  now = time.time()
                  if now - last_heartbeat_time >= heartbeat_every_s:
                      _log(f"Waiting for LoRA updates... received_count={received_count}, queue_size={update_queue.qsize()}")
@@ -74,13 +77,26 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                  time.sleep(0.1)
                  continue
 
+            done = False
             for tp, records in messages.items():
                 for message in records:
+                    # Trainer sends '__done__' after final weight push to signal
+                    # that training is over and no more updates will arrive.
+                    if message.key == "__done__":
+                        _log("Received training-done signal from trainer. Stopping LoRA listener.")
+                        done = True
+                        break
                     if message.key and message.value is not None:
                         received_count += 1
                         update_queue.put((message.key, message.value))
                     else:
                         _log("Warning: Received message with missing key or value.")
+                if done:
+                    break
+            if done:
+                # Put sentinel so the weight-application thread also stops.
+                update_queue.put(_DONE_SENTINEL)
+                break
 
     except Exception as e:
         _log(f"Error in Kafka consumer thread: {e}")
@@ -97,40 +113,55 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                               model_lock: threading.Lock, device: str):
     """
     Applies LoRA weight updates from the queue to the model.
+    Stops when it receives the _DONE_SENTINEL from the consumer thread.
     """
     _log("Weight application thread started...")
     applied_batches = 0
     while True:
         try:
             # Wait for the first update (blocking)
-            layer_name, tensor = update_queue.get(block=True, timeout=None) 
-            
+            item = update_queue.get(block=True, timeout=None)
+
+            # Check for the done sentinel pushed by the consumer thread
+            if item == _DONE_SENTINEL:
+                _log("Weight application thread received done signal. Stopping.")
+                break
+
+            layer_name, tensor = item
             updates_to_apply = {layer_name: tensor}
             
-            # Process any other updates currently in the queue non-blockingly
+            # Drain any other updates currently in the queue non-blockingly
             while True:
                 try:
-                    layer_name, tensor = update_queue.get(block=False)
-                    updates_to_apply[layer_name] = tensor
+                    item = update_queue.get(block=False)
+                    if item == _DONE_SENTINEL:
+                        _log("Weight application thread received done signal. Applying remaining batch, then stopping.")
+                        # Apply what we have, then break both loops
+                        break
+                    name, t = item
+                    updates_to_apply[name] = t
                 except queue.Empty:
-                    break # No more updates in the queue for now
+                    break
             
             if updates_to_apply:
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
-                with model_lock: # Acquire lock before modifying model state
+                with model_lock:
                     updates_to_apply_on_device = {
                         k: v.to(device) for k, v in updates_to_apply.items()
                     }
-                    model.load_state_dict(updates_to_apply_on_device, strict=False) 
+                    model.load_state_dict(updates_to_apply_on_device, strict=False)
                 applied_batches += 1
                 _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
+
+            # If we hit the sentinel inside the drain loop, stop after this apply
+            if item == _DONE_SENTINEL:
+                break
                 
         except queue.Empty:
-             # This happens if the initial get times out (if timeout is set)
              continue
         except Exception as e:
             _log(f"Error applying weights: {e}")
-            time.sleep(1) 
+            time.sleep(1)
 
 # --------------------------------------------------
 # Inference Function
@@ -139,24 +170,29 @@ def generate_text(prompt: str, model: PeftModel, tokenizer: AutoTokenizer,
                   model_lock: threading.Lock, device: str, inference_cfg: dict):
     """
     Generates text using the current state of the LoRA-adapted model.
+    Returns only the completion (new tokens), not the echoed prompt.
     """
-    with model_lock: # Acquire lock to ensure model state is stable during generation
+    with model_lock:
         start = time.time()
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt_token_len = inputs['input_ids'].shape[1]
         
         generation_config = GenerationConfig(
             max_new_tokens=inference_cfg.get('max_new_tokens', 100),
-            do_sample=True, 
+            do_sample=bool(inference_cfg.get('do_sample', True)),
             temperature=inference_cfg.get('temperature', 0.7),
             top_p=inference_cfg.get('top_p', 0.9),
-            pad_token_id=tokenizer.eos_token_id 
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
         
         with torch.no_grad(): 
             outputs = model.generate(**inputs, generation_config=generation_config)
-            
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        _log(f"generate_text completed in {time.time() - start:.2f}s (prompt_len={len(prompt)})")
+
+        # Slice off the prompt tokens and decode only the generated completion
+        generated_ids = outputs[0, prompt_token_len:]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        _log(f"generate_text completed in {time.time() - start:.2f}s (prompt_len={len(prompt)}, gen_tokens={len(generated_ids)})")
         
     return generated_text
 
@@ -287,20 +323,20 @@ if __name__ == "__main__":
     # 3. Create shared resources: update queue and model lock
     update_queue = queue.Queue()
     model_lock = threading.Lock()
-    model_lock_global = model_lock # Assign lock to global var
+    model_lock_global = model_lock
 
-    # 4. Start the background threads
+    # 4. Start background Kafka threads for receiving LoRA weight updates.
+    #    These threads stop automatically when the trainer sends a '__done__' signal.
     consumer_thread = threading.Thread(
-        target=kafka_consumer_thread, 
-        args=(update_queue, config), 
-        daemon=True 
-    )
-    applier_thread = threading.Thread(
-        target=weight_application_thread, 
-        args=(model_global, update_queue, model_lock_global, DEVICE), 
+        target=kafka_consumer_thread,
+        args=(update_queue, config),
         daemon=True
     )
-    
+    applier_thread = threading.Thread(
+        target=weight_application_thread,
+        args=(model_global, update_queue, model_lock_global, DEVICE),
+        daemon=True
+    )
     consumer_thread.start()
     applier_thread.start()
 

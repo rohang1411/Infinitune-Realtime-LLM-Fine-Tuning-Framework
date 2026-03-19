@@ -7,6 +7,7 @@ import time
 import yaml
 
 from utils.stream_filter import StreamFilter
+from collections import deque
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -60,6 +61,14 @@ def generate_training_examples(config):
         ds_kwargs["name"] = dataset_cfg['config_name']
 
     dataset = load_dataset(**ds_kwargs)
+
+    # Shuffle if configured (critical for sorted datasets like IMDb where
+    # all label-0 examples come before label-1, starving the model of diversity).
+    if dataset_cfg.get('shuffle', False):
+        shuffle_seed = dataset_cfg.get('shuffle_seed')
+        dataset = dataset.shuffle(seed=shuffle_seed)
+        _log(f"Dataset shuffled (seed={shuffle_seed}).")
+
     _log(f"Loaded dataset: {dataset_cfg['name']} split={dataset_cfg['split']} ({len(dataset)} examples)")
     _log(f"Column mapping: input_col='{input_col}', target_col='{target_col}', label_map={'enabled' if label_map is not None else 'disabled'}")
 
@@ -117,6 +126,9 @@ if __name__ == "__main__":
     # Filtering telemetry (non-blocking)
     total_records = 0
     dropped_records = 0
+    dropped_examples_printed = 0
+    dropped_examples_max_to_print = 3
+    recent_drop_reasons = deque(maxlen=10)
     last_filter_telemetry_time = time.time()
     filter_telemetry_every_n = 1000
     filter_telemetry_every_s = 60.0
@@ -126,17 +138,31 @@ if __name__ == "__main__":
         total_records += 1
 
         extracted_text = str(example.get(hash_column, ""))
-        if not stream_filter.is_valid(raw_record=example, extracted_text=extracted_text):
+        ok, reason = stream_filter.validate(raw_record=example, extracted_text=extracted_text)
+        if not ok:
             dropped_records += 1
+            if reason:
+                recent_drop_reasons.append(reason)
+
+            # Print first 3 dropped examples (temporary debugging aid)
+            if dropped_examples_printed < dropped_examples_max_to_print:
+                # preview = extracted_text.replace("\n", "\\n")
+                # if len(preview) > 180:
+                #     preview = preview[:180] + "..."
+                # _log(f"FILTER DROP EXAMPLE #{dropped_examples_printed + 1}: reason='{reason}' text_preview='{preview}'")
+                _log(f"FILTER DROP EXAMPLE #{dropped_examples_printed + 1}: reason='{reason}'")
+                dropped_examples_printed += 1
+
             now = time.time()
             if (
                 total_records % filter_telemetry_every_n == 0
                 or now - last_filter_telemetry_time >= filter_telemetry_every_s
             ):
                 drop_rate = (dropped_records / float(total_records)) * 100.0 if total_records > 0 else 0.0
+                common_reasons = ", ".join(list(recent_drop_reasons)) if recent_drop_reasons else "n/a"
                 _log(
                     f"FILTER STATS: Ingested={total_records} | Dropped={dropped_records} | "
-                    f"Drop Rate={drop_rate:.2f}%"
+                    f"Drop Rate={drop_rate:.2f}% | RecentReasons=[{common_reasons}]"
                 )
                 last_filter_telemetry_time = now
             continue
@@ -160,6 +186,15 @@ if __name__ == "__main__":
                 _log("FATAL: Too many delivery errors — aborting. Check broker logs.")
                 break
         time.sleep(send_interval)  # Control data generation speed
+
+    # Signal end-of-stream so the trainer can stop cleanly when no more data is coming.
+    try:
+        _log("Sending end-of-stream marker...")
+        eof_future = producer.send(topic_name, key="__eof__", value={"_eof": True})
+        eof_future.get(timeout=10)
+        _log("End-of-stream marker delivered.")
+    except Exception as e:
+        _log(f"WARNING: Failed to send end-of-stream marker: {e}")
 
     _log(f"Stream finished. Total sent: {sent_count}. Flushing...")
     producer.flush()

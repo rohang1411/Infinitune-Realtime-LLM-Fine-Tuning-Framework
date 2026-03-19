@@ -34,6 +34,8 @@ dataset:
     input_col: "question"     # raw dataset column for input
     target_col: "answer"      # raw dataset column for target
   label_map: null             # no label remapping needed for generative tasks
+  shuffle: true               # shuffle before streaming
+  shuffle_seed: 42            # null for non-deterministic shuffle
 
 # --- Preprocessing / Templating ---
 preprocessing:
@@ -63,14 +65,15 @@ data:
 kafka:
   bootstrap_servers:
     - "localhost:9092"
-  training_topic: "training-data"
-  lora_updates_topic: "lora-updates"
+  training_topic: "training-data-gsm8k"
+  lora_updates_topic: "lora-updates-gsm8k"
   producer_send_interval: 0.1
   consumer_group_trainer: "trainer-group"
   consumer_group_inference: "inference-api-group"
 
 # --- Training ---
 training:
+  test_mode: true              # true = train entire dataset, stop all services on EOF
   batch_size: 2               # smaller batch (longer sequences for math)
   gradient_accumulation_steps: 4
   learning_rate: 2e-4
@@ -83,6 +86,7 @@ inference:
   host: "localhost"
   port: 5000
   max_new_tokens: 150         # longer output for step-by-step reasoning
+  do_sample: true             # generative reasoning benefits from sampling
   temperature: 0.7
   top_p: 0.9
 
