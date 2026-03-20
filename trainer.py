@@ -5,6 +5,7 @@ import json
 import sys
 import argparse
 import torch
+import math
 import yaml
 import os
 import csv
@@ -43,7 +44,7 @@ class MetricsLogger:
     """
 
     COLUMNS = [
-        "step", "loss", "eval_loss", "perplexity", "accuracy",
+        "step", "loss", "lr", "eval_loss", "perplexity", "accuracy",
         "step_time_s", "records_used_total",
     ]
 
@@ -257,10 +258,19 @@ class Evaluator:
         self.enabled = self.eval_cfg.get('enabled', False)
         self.strategy = self.eval_cfg.get('strategy', 'perplexity')
         self.eval_interval = self.eval_cfg.get('eval_interval', 100)
-        self.eval_samples = self.eval_cfg.get('eval_samples', 50)
         self.answer_regex = self.eval_cfg.get('answer_regex')
         self.tokenizer = tokenizer
         self.device = device
+
+        # New config-driven parameters (backward-compat: fall back to eval_samples)
+        self.eval_pool_size = self.eval_cfg.get(
+            'eval_pool_size', self.eval_cfg.get('eval_samples', 50)
+        )
+        self.eval_batch_size = self.eval_cfg.get('eval_batch_size', self.eval_pool_size)
+        self.verbose = self.eval_cfg.get('verbose', False)
+
+        # Sliding window cursor — tracks position within the eval pool
+        self._eval_cursor = 0
 
         # Pre-compile Jinja2 templates
         preproc = config['preprocessing']
@@ -274,7 +284,7 @@ class Evaluator:
             self._load_eval_data()
 
     def _load_eval_data(self):
-        """Load a small evaluation dataset from the configured eval_split."""
+        """Load evaluation dataset pool from the configured eval_split."""
         dataset_cfg = self.config['dataset']
         eval_split = dataset_cfg.get('eval_split', 'test')
         col_map = dataset_cfg['column_mapping']
@@ -293,7 +303,7 @@ class Evaluator:
             dataset = dataset.shuffle(seed=42)
 
             for i, example in enumerate(dataset):
-                if i >= self.eval_samples:
+                if i >= self.eval_pool_size:
                     break
                 input_val = str(example[col_map['input_col']])
                 target_val = example[col_map['target_col']]
@@ -304,17 +314,36 @@ class Evaluator:
                         target_val = label_map[str(target_val)]
                 target_val = str(target_val)
                 self.eval_data.append({"input": input_val, "target": target_val})
-            _log(f"Loaded {len(self.eval_data)} evaluation samples (split='{eval_split}').")
+            _log(f"Loaded {len(self.eval_data)} evaluation samples into pool (split='{eval_split}', batch_size={self.eval_batch_size}).")
         except Exception as e:
             _log(f"Warning: Could not load eval dataset: {e}")
             self.enabled = False
+
+    def _get_eval_window(self):
+        """Return the next sliding window of eval samples and advance cursor."""
+        pool_size = len(self.eval_data)
+        start = self._eval_cursor
+        end = start + self.eval_batch_size
+
+        if end <= pool_size:
+            window = self.eval_data[start:end]
+        else:
+            # Wrap around: take the tail + the head
+            window = self.eval_data[start:] + self.eval_data[:end - pool_size]
+
+        self._eval_cursor = end % pool_size
+        return window, start
 
     def evaluate(self, model, step):
         """Run evaluation and return a metrics dict."""
         if not self.enabled or not self.eval_data:
             return None
 
-        _log(f"--- Eval @ Step {step} ---")
+        # Select the current eval window (sliding)
+        eval_window, window_start = self._get_eval_window()
+        window_end = (window_start + len(eval_window) - 1) % len(self.eval_data)
+
+        _log(f"--- Eval @ Step {step} | samples [{window_start}..{window_end}] ({len(eval_window)} samples) ---")
         model.eval()
         metrics = {}
 
@@ -322,7 +351,7 @@ class Evaluator:
         total_loss = 0.0
         count = 0
 
-        for sample in self.eval_data:
+        for sample in eval_window:
             prompt_text = self.prompt_template.render(**sample)
             response_text = self.response_template.render(**sample)
             tok = tokenize_with_label_masking(
@@ -351,10 +380,7 @@ class Evaluator:
             else:
                 eval_max_new_tokens = cfg_max_new_tokens
 
-            # Only evaluate a small subset for generation (it's expensive)
-            gen_samples = self.eval_data[:min(10, len(self.eval_data))]
-
-            for i, sample in enumerate(gen_samples):
+            for i, sample in enumerate(eval_window):
                 prompt_text = self.prompt_template.render(**sample)
                 # Truncate prompt the same way training does so behaviour
                 # is consistent (long reviews won't exceed context window).
@@ -398,11 +424,13 @@ class Evaluator:
                     correct += 1
                 total += 1
 
-                # Log each prediction so we can see what the model is doing
-                mark = "✓" if is_correct else "✗"
-                _log(f"  [{mark}] sample {i}: expected='{sample['target']}' got='{response[:80]}'")
+                # Log each prediction only in verbose mode
+                if self.verbose:
+                    mark = "✓" if is_correct else "✗"
+                    _log(f"  [{mark}] sample {i}: expected='{sample['target']}' got='{response[:80]}'")
 
             metrics['accuracy'] = correct / max(total, 1)
+            _log(f"  Correct: {correct} / {total}")
 
         model.train()
 
@@ -411,6 +439,58 @@ class Evaluator:
         _log("--- End Eval ---")
 
         return metrics
+
+# --------------------------------------------------
+# Adaptive LR Scheduler
+# --------------------------------------------------
+def build_lr_scheduler(optimizer, config):
+    """Build a LambdaLR scheduler from config.
+
+    Supported types:
+      - cosine_with_warmup : linear warmup then cosine decay to min_lr_ratio
+      - linear             : linear warmup then linear decay to min_lr_ratio
+      - constant           : no scheduling (lambda = 1)
+    """
+    sched_cfg = config.get('training', {}).get('lr_scheduler', {})
+    sched_type = sched_cfg.get('type', 'constant')
+
+    if sched_type == 'constant' or not sched_cfg:
+        _log("LR scheduler: constant (no scheduling).")
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+
+    warmup_steps = sched_cfg.get('warmup_steps', 0)
+    min_lr_ratio = sched_cfg.get('min_lr_ratio', 0.0)
+    T_max = sched_cfg.get('T_max', 1000)
+
+    if sched_type == 'cosine_with_warmup':
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup: 0 → 1
+                return max(current_step / max(warmup_steps, 1), 0.0)
+            # Cosine decay: 1 → min_lr_ratio
+            progress = (current_step - warmup_steps) / max(T_max - warmup_steps, 1)
+            progress = min(progress, 1.0)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+        _log(f"LR scheduler: cosine_with_warmup (warmup={warmup_steps}, T_max={T_max}, min_lr_ratio={min_lr_ratio})")
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    elif sched_type == 'linear':
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return max(current_step / max(warmup_steps, 1), 0.0)
+            progress = (current_step - warmup_steps) / max(T_max - warmup_steps, 1)
+            progress = min(progress, 1.0)
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
+
+        _log(f"LR scheduler: linear (warmup={warmup_steps}, T_max={T_max}, min_lr_ratio={min_lr_ratio})")
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    else:
+        _log(f"LR scheduler: unknown type '{sched_type}', falling back to constant.")
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+
 
 # --------------------------------------------------
 # Manual training loop function
@@ -534,6 +614,9 @@ def train_model(config):
     
     # Create an optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+
+    # Create LR scheduler
+    scheduler = build_lr_scheduler(optimizer, config)
     
     # Instantiate our Kafka producer for LoRA updates.
     lora_producer = LoRAProducer(config)
@@ -663,21 +746,24 @@ def train_model(config):
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 optimization_step += 1
 
                 avg_step_loss = accumulated_loss / training_args.gradient_accumulation_steps
+                current_lr = scheduler.get_last_lr()[0]
 
                 if optimization_step % training_args.logging_steps == 0:
                     elapsed = time.time() - step_start
                     _log(
-                        f"Step {optimization_step}: loss = {avg_step_loss:.4f} "
+                        f"Step {optimization_step}: loss = {avg_step_loss:.4f}, lr = {current_lr:.2e} "
                         f"(step_time={elapsed:.2f}s, records_used_total={total_messages_seen})"
                     )
                     metrics_logger.log(
                         {
                             "step": optimization_step,
                             "loss": avg_step_loss,
+                            "lr": current_lr,
                             "step_time_s": elapsed,
                             "records_used_total": total_messages_seen,
                         }
