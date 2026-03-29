@@ -45,6 +45,8 @@ class MetricsLogger:
 
     COLUMNS = [
         "step", "loss", "lr", "eval_loss", "perplexity", "accuracy",
+        "f1", "mcc", "kappa", "exact_match",
+        "grad_norm", "tokens_per_sec",
         "step_time_s", "records_used_total",
     ]
 
@@ -114,6 +116,12 @@ class MetricsLogger:
             ("eval_loss", "Eval Loss", "eval_loss"),
             ("perplexity", "Perplexity", "perplexity"),
             ("accuracy", "Accuracy", "accuracy"),
+            ("f1", "Macro F1 Score", "f1"),
+            ("mcc", "Matthews Correlation Coefficient", "mcc"),
+            ("kappa", "Cohen's Kappa", "kappa"),
+            ("exact_match", "Exact Match Rate", "exact_match"),
+            ("grad_norm", "Gradient Norm", "grad_norm"),
+            ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
         ]
 
         generated = 0
@@ -369,8 +377,6 @@ class Evaluator:
 
         # --- Strategy-specific evaluation (generation-based) ---
         if self.strategy in ('class_match', 'regex_extract'):
-            correct = 0
-            total = 0
             cfg_max_new_tokens = self.config['inference'].get('max_new_tokens', 50)
 
             # For classification, the answer is a few words — cap generation to
@@ -379,6 +385,11 @@ class Evaluator:
                 eval_max_new_tokens = min(cfg_max_new_tokens, 10)
             else:
                 eval_max_new_tokens = cfg_max_new_tokens
+
+            # Collect (gold_label, pred_label) pairs for all samples so we can
+            # compute the full confusion matrix in one pass at the end.
+            gold_labels = []
+            pred_labels = []
 
             for i, sample in enumerate(eval_window):
                 prompt_text = self.prompt_template.render(**sample)
@@ -404,33 +415,94 @@ class Evaluator:
                 generated_ids = output_ids[0, prompt_token_len:]
                 response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-                is_correct = False
+                gold = sample['target'].lower().strip()
+                pred = None
+
                 if self.strategy == 'class_match':
                     # Compare first N words exactly (handles single-word labels
                     # like "negative" and multi-word labels like "very positive"
                     # without being fooled by repetition).
-                    target_words = sample['target'].lower().split()
+                    target_words = gold.split()
                     response_words = response.lower().split()
                     pred_words = response_words[:len(target_words)]
-                    if pred_words == target_words:
-                        is_correct = True
+                    pred = " ".join(pred_words)
                 elif self.strategy == 'regex_extract' and self.answer_regex:
                     pred_match = re.search(self.answer_regex, response)
                     gold_match = re.search(self.answer_regex, sample['target'])
-                    if pred_match and gold_match and pred_match.group(1) == gold_match.group(1):
-                        is_correct = True
+                    if pred_match:
+                        pred = pred_match.group(1).strip().lower()
+                    if gold_match:
+                        gold = gold_match.group(1).strip().lower()
 
-                if is_correct:
-                    correct += 1
-                total += 1
+                if pred is None:
+                    pred = response.lower().strip()
+
+                gold_labels.append(gold)
+                pred_labels.append(pred)
 
                 # Log each prediction only in verbose mode
                 if self.verbose:
-                    mark = "✓" if is_correct else "✗"
+                    mark = "✓" if pred == gold else "✗"
                     _log(f"  [{mark}] sample {i}: expected='{sample['target']}' got='{response[:80]}'")
 
+            # ── Derived metrics from the collected labels ──────────────────────
+            total = len(gold_labels)
+            correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
             metrics['accuracy'] = correct / max(total, 1)
             _log(f"  Correct: {correct} / {total}")
+
+            # Exact Match: full-string equality after stripping punctuation
+            import string as _string
+            _punct_table = str.maketrans('', '', _string.punctuation)
+            def _normalize(s):
+                return s.lower().translate(_punct_table).strip()
+            em_correct = sum(
+                _normalize(g) == _normalize(p)
+                for g, p in zip(gold_labels, pred_labels)
+            )
+            metrics['exact_match'] = em_correct / max(total, 1)
+
+            # Build confusion matrix over unique label classes
+            classes = sorted(set(gold_labels))
+            class_idx = {c: i for i, c in enumerate(classes)}
+            n = len(classes)
+            cm = [[0] * n for _ in range(n)]
+            for g, p in zip(gold_labels, pred_labels):
+                if g in class_idx and p in class_idx:
+                    cm[class_idx[g]][class_idx[p]] += 1
+
+            # Macro F1
+            f1_scores = []
+            for i in range(n):
+                tp = cm[i][i]
+                fp = sum(cm[r][i] for r in range(n)) - tp
+                fn = sum(cm[i][c] for c in range(n)) - tp
+                prec = tp / max(tp + fp, 1)
+                rec  = tp / max(tp + fn, 1)
+                f1_scores.append(2 * prec * rec / max(prec + rec, 1e-9))
+            metrics['f1'] = sum(f1_scores) / max(len(f1_scores), 1)
+
+            # Matthews Correlation Coefficient (multi-class generalisation)
+            t = sum(cm[i][i] for i in range(n))
+            s = total   # grand total
+            p_k = [sum(cm[i][c] for c in range(n)) for i in range(n)]  # row sums (actual)
+            t_k = [sum(cm[r][i] for r in range(n)) for i in range(n)]  # col sums (predicted)
+            cov_yy = s * s - sum(pk * pk for pk in p_k)
+            cov_xx = s * s - sum(tk * tk for tk in t_k)
+            if cov_yy > 0 and cov_xx > 0:
+                mcc_num = t * s - sum(p_k[i] * t_k[i] for i in range(n))
+                metrics['mcc'] = mcc_num / math.sqrt(cov_yy * cov_xx)
+            else:
+                metrics['mcc'] = 0.0
+
+            # Cohen's Kappa
+            p_o = correct / max(total, 1)   # observed agreement
+            p_e = sum(
+                (sum(cm[i][c] for c in range(n)) / max(total, 1)) *
+                (sum(cm[r][i] for r in range(n)) / max(total, 1))
+                for i in range(n)
+            )                               # chance agreement
+            metrics['kappa'] = (p_o - p_e) / max(1.0 - p_e, 1e-9)
 
         model.train()
 
@@ -734,6 +806,12 @@ def train_model(config):
             # Pad batch and create tensors
             batch = pad_batch(batch_samples, tokenizer.pad_token_id, device)
 
+            # Count response tokens in the batch for throughput calculation
+            batch_response_tokens = sum(
+                sum(1 for lbl in s['labels'] if lbl != -100)
+                for s in batch_samples
+            )
+
             # Forward pass
             outputs = model(**batch)
             loss = outputs.loss
@@ -743,6 +821,20 @@ def train_model(config):
             scaled_loss.backward()
             grad_accum_counter += 1
 
+            # Compute gradient norm BEFORE the optimizer clips / steps so we
+            # capture the raw pre-clip magnitude for diagnostic purposes.
+            step_grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    step_grad_norm += p.grad.detach().norm(2).item() ** 2
+            step_grad_norm = step_grad_norm ** 0.5
+            accumulated_grad_norm = getattr(train_model, '_acc_grad_norm', 0.0) + step_grad_norm
+            train_model._acc_grad_norm = accumulated_grad_norm
+
+            # Accumulate response‑token count across micro-batches
+            accumulated_response_tokens = getattr(train_model, '_acc_tokens', 0) + batch_response_tokens
+            train_model._acc_tokens = accumulated_response_tokens
+
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
                 optimizer.step()
@@ -751,12 +843,15 @@ def train_model(config):
                 optimization_step += 1
 
                 avg_step_loss = accumulated_loss / training_args.gradient_accumulation_steps
+                avg_grad_norm = train_model._acc_grad_norm / training_args.gradient_accumulation_steps
                 current_lr = scheduler.get_last_lr()[0]
 
                 if optimization_step % training_args.logging_steps == 0:
                     elapsed = time.time() - step_start
+                    tokens_per_sec = train_model._acc_tokens / max(elapsed, 1e-6)
                     _log(
-                        f"Step {optimization_step}: loss = {avg_step_loss:.4f}, lr = {current_lr:.2e} "
+                        f"Step {optimization_step}: loss = {avg_step_loss:.4f}, lr = {current_lr:.2e}, "
+                        f"grad_norm = {avg_grad_norm:.4f}, tok/s = {tokens_per_sec:.1f} "
                         f"(step_time={elapsed:.2f}s, records_used_total={total_messages_seen})"
                     )
                     metrics_logger.log(
@@ -764,10 +859,16 @@ def train_model(config):
                             "step": optimization_step,
                             "loss": avg_step_loss,
                             "lr": current_lr,
+                            "grad_norm": avg_grad_norm,
+                            "tokens_per_sec": tokens_per_sec,
                             "step_time_s": elapsed,
                             "records_used_total": total_messages_seen,
                         }
                     )
+
+                # Reset per-step accumulators
+                train_model._acc_grad_norm = 0.0
+                train_model._acc_tokens = 0
 
                 # Reset accumulators for the next optimization step
                 accumulated_loss = 0.0
