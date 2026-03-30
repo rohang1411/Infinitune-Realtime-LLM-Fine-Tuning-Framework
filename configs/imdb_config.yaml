@@ -120,3 +120,7 @@ evaluation:
     compute_kappa: true
     # If distinct gold/pred labels exceed this, F1/MCC/kappa are skipped (open-ended safety).
     max_distinct_labels_for_structure_metrics: 32
+    # Online diagnostics (stable eval pool recommended; sliding window can mix distribution shift with true forgetting)
+    compute_forgetting: true # peak-vs-current on tracked scalars; see forgetting_track_metrics
+    compute_update_latency: true # wall seconds since previous eval ended (training + I/O between evals)
+    forgetting_track_metrics: ["accuracy", "f1", "exact_match", "eval_loss", "perplexity"] # subset of supported keys

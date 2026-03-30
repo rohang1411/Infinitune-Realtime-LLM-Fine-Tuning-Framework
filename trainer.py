@@ -45,10 +45,23 @@ class MetricsLogger:
     """
 
     COLUMNS = [
-        "step", "loss", "lr", "eval_loss", "perplexity", "accuracy",
-        "backward_transfer", "f1", "mcc", "kappa", "exact_match",
-        "grad_norm", "tokens_per_sec",
-        "step_time_s", "records_used_total",
+        "step",
+        "loss",
+        "lr",
+        "eval_loss",
+        "perplexity",
+        "accuracy",
+        "f1",
+        "mcc",
+        "kappa",
+        "exact_match",
+        "forgetting_max",
+        "update_latency_s",
+        "backward_transfer",
+        "grad_norm",
+        "tokens_per_sec",
+        "step_time_s",
+        "records_used_total",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -122,6 +135,8 @@ class MetricsLogger:
             ("mcc", "Matthews Correlation Coefficient", "mcc"),
             ("kappa", "Cohen's Kappa", "kappa"),
             ("exact_match", "Exact Match Rate", "exact_match"),
+            ("forgetting_max", "Max Forgetting (tracked metrics)", "forgetting_max"),
+            ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
             ("grad_norm", "Gradient Norm", "grad_norm"),
             ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
         ]
@@ -485,6 +500,8 @@ def train_model(config):
                     "mcc": eval_metrics.get("mcc"),
                     "kappa": eval_metrics.get("kappa"),
                     "exact_match": eval_metrics.get("exact_match"),
+                    "forgetting_max": eval_metrics.get("forgetting_max"),
+                    "update_latency_s": eval_metrics.get("update_latency_s"),
                     "records_used_total": total_messages_seen,
                 }
             )
