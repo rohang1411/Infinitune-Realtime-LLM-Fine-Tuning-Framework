@@ -107,3 +107,16 @@ evaluation:
   eval_batch_size: 100 # samples evaluated per eval step (sliding window)
   verbose: false # if true, print per-sample predictions during eval
   answer_regex: null # not used for class_match
+  # Optional: override which metrics run (defaults follow strategy; booleans only).
+  # classification (class_match) defaults: all generation + structure metrics on.
+  # regex_extract defaults: accuracy + exact_match only (F1/MCC/kappa off).
+  # perplexity strategy: only forward loss + perplexity.
+  metrics:
+    compute_loss: true # eval_loss + perplexity (recommended)
+    compute_accuracy: true
+    compute_exact_match: true
+    compute_f1: true # macro F1 over discrete labels in the eval window
+    compute_mcc: true
+    compute_kappa: true
+    # If distinct gold/pred labels exceed this, F1/MCC/kappa are skipped (open-ended safety).
+    max_distinct_labels_for_structure_metrics: 32

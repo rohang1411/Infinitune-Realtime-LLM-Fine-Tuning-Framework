@@ -479,6 +479,10 @@ def train_model(config):
                     "eval_loss": eval_metrics.get("eval_loss"),
                     "perplexity": eval_metrics.get("perplexity"),
                     "accuracy": eval_metrics.get("accuracy"),
+                    "f1": eval_metrics.get("f1"),
+                    "mcc": eval_metrics.get("mcc"),
+                    "kappa": eval_metrics.get("kappa"),
+                    "exact_match": eval_metrics.get("exact_match"),
                     "records_used_total": total_messages_seen,
                 }
             )

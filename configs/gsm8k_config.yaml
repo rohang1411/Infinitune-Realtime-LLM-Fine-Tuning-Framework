@@ -97,3 +97,13 @@ evaluation:
   eval_interval: 50           # evaluate every N optimizer steps
   eval_samples: 20
   answer_regex: "#### (\\d+)" # extracts final numeric answer from GSM8K format
+  # Generative / extractive: keep string metrics; disable structure metrics by default
+  # (many distinct numeric answers would make F1/MCC/kappa meaningless).
+  metrics:
+    compute_loss: true
+    compute_accuracy: true
+    compute_exact_match: true
+    compute_f1: false
+    compute_mcc: false
+    compute_kappa: false
+    max_distinct_labels_for_structure_metrics: 64

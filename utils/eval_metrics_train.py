@@ -1,6 +1,7 @@
 import time
 import math
 import re
+import string
 import torch
 from jinja2 import Template
 from datasets import load_dataset
@@ -11,6 +12,54 @@ def _ts():
 
 def _log(msg):
     print(f"[{_ts()}][EVAL] {msg}", flush=True)
+
+
+def _default_metric_flags(strategy: str):
+    """Strategy-appropriate defaults so generative / open-ended data does not
+    run confusion-matrix metrics unless the user explicitly enables them."""
+    loss = {"compute_loss": True}
+    if strategy == "class_match":
+        return {
+            **loss,
+            "compute_accuracy": True,
+            "compute_exact_match": True,
+            "compute_f1": True,
+            "compute_mcc": True,
+            "compute_kappa": True,
+        }
+    if strategy == "regex_extract":
+        return {
+            **loss,
+            "compute_accuracy": True,
+            "compute_exact_match": True,
+            # F1 / MCC / kappa are usually misleading for free-form or
+            # high-cardinality extracted answers unless labels are discrete.
+            "compute_f1": False,
+            "compute_mcc": False,
+            "compute_kappa": False,
+        }
+    # perplexity-only or unknown strategy: forward-pass metrics only
+    return {
+        **loss,
+        "compute_accuracy": False,
+        "compute_exact_match": False,
+        "compute_f1": False,
+        "compute_mcc": False,
+        "compute_kappa": False,
+    }
+
+
+def _merge_metric_flags(strategy: str, eval_cfg: dict) -> dict:
+    """Merge user `evaluation.metrics` onto strategy defaults (user wins)."""
+    base = _default_metric_flags(strategy)
+    user = eval_cfg.get("metrics") or {}
+    if not isinstance(user, dict):
+        return base
+    for key in base:
+        if key in user and user[key] is not None:
+            base[key] = bool(user[key])
+    return base
+
 
 class Evaluator:
     """Evaluates model performance using configurable strategies.
@@ -40,6 +89,18 @@ class Evaluator:
         self.eval_batch_size = self.eval_cfg.get('eval_batch_size', self.eval_pool_size)
         self.verbose = self.eval_cfg.get('verbose', False)
 
+        # Which metrics to compute (config + strategy defaults; user overrides win)
+        self.metric_flags = _merge_metric_flags(self.strategy, self.eval_cfg)
+        # Skip F1/MCC/kappa when too many distinct labels (open-ended generations)
+        metrics_block = self.eval_cfg.get("metrics") or {}
+        try:
+            self.max_distinct_labels = int(
+                metrics_block.get("max_distinct_labels_for_structure_metrics", 64)
+            )
+        except (TypeError, ValueError):
+            self.max_distinct_labels = 64
+        self.max_distinct_labels = max(2, self.max_distinct_labels)
+
         # Sliding window cursor — tracks position within the eval pool
         self._eval_cursor = 0
 
@@ -51,8 +112,17 @@ class Evaluator:
 
         # Pre-load eval data
         self.eval_data = []
+        self._regex_missing_warned = False
         if self.enabled:
             self._load_eval_data()
+            _log(
+                f"Metric flags: loss={self.metric_flags['compute_loss']}, "
+                f"accuracy={self.metric_flags['compute_accuracy']}, "
+                f"exact_match={self.metric_flags['compute_exact_match']}, "
+                f"f1={self.metric_flags['compute_f1']}, mcc={self.metric_flags['compute_mcc']}, "
+                f"kappa={self.metric_flags['compute_kappa']} "
+                f"(max_distinct_labels={self.max_distinct_labels})"
+            )
 
     def _load_eval_data(self):
         """Load evaluation dataset pool from the configured eval_split."""
@@ -106,7 +176,7 @@ class Evaluator:
         return window, start
 
     def evaluate(self, model, step):
-        """Run evaluation and return a metrics dict."""
+        """Run evaluation and return a metrics dict (keys depend on config flags)."""
         if not self.enabled or not self.eval_data:
             return None
 
@@ -117,160 +187,220 @@ class Evaluator:
         _log(f"--- Eval @ Step {step} | samples [{window_start}..{window_end}] ({len(eval_window)} samples) ---")
         model.eval()
         metrics = {}
+        mf = self.metric_flags
 
-        # --- Perplexity (response-only loss, matching training) ---
-        total_loss = 0.0
-        count = 0
+        # --- Forward loss / perplexity (safe for any causal-LM data) ---
+        if mf.get("compute_loss", True):
+            total_loss = 0.0
+            count = 0
+            for sample in eval_window:
+                try:
+                    prompt_text = self.prompt_template.render(**sample)
+                    response_text = self.response_template.render(**sample)
+                    tok = self.tokenize_fn(
+                        self.tokenizer, prompt_text, response_text, self.max_seq_length
+                    )
+                    batch = self.pad_fn([tok], self.tokenizer.pad_token_id, self.device)
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                        total_loss += outputs.loss.item()
+                        count += 1
+                except Exception as e:
+                    _log(f"  Warning: skipping eval sample in loss pass: {e}")
+            if count > 0:
+                avg_loss = total_loss / count
+                metrics["eval_loss"] = avg_loss
+                metrics["perplexity"] = torch.exp(torch.tensor(avg_loss)).item()
 
-        for sample in eval_window:
-            prompt_text = self.prompt_template.render(**sample)
-            response_text = self.response_template.render(**sample)
-            tok = self.tokenize_fn(
-                self.tokenizer, prompt_text, response_text, self.max_seq_length
+        need_generation = self.strategy in ("class_match", "regex_extract") and any(
+            mf.get(k, False)
+            for k in (
+                "compute_accuracy",
+                "compute_exact_match",
+                "compute_f1",
+                "compute_mcc",
+                "compute_kappa",
             )
-            batch = self.pad_fn([tok], self.tokenizer.pad_token_id, self.device)
-            with torch.no_grad():
-                outputs = model(**batch)
-                total_loss += outputs.loss.item()
-                count += 1
+        )
 
-        avg_loss = total_loss / max(count, 1)
-        metrics['eval_loss'] = avg_loss
-        metrics['perplexity'] = torch.exp(torch.tensor(avg_loss)).item()
-
-        # --- Strategy-specific evaluation (generation-based) ---
-        if self.strategy in ('class_match', 'regex_extract'):
-            cfg_max_new_tokens = self.config['inference'].get('max_new_tokens', 50)
-
-            # For classification, the answer is a few words — cap generation to
-            # avoid wasting compute and to surface repetition problems honestly.
-            if self.strategy == 'class_match':
+        if need_generation:
+            cfg_max_new_tokens = self.config.get("inference", {}).get("max_new_tokens", 50)
+            if self.strategy == "class_match":
                 eval_max_new_tokens = min(cfg_max_new_tokens, 10)
             else:
                 eval_max_new_tokens = cfg_max_new_tokens
 
-            # Collect (gold_label, pred_label) pairs for all samples so we can
-            # compute the full confusion matrix in one pass at the end.
+            if self.strategy == "regex_extract" and not self.answer_regex:
+                if not self._regex_missing_warned:
+                    _log(
+                        "  Warning: strategy=regex_extract but answer_regex is missing; "
+                        "using raw string comparison for generation metrics (consider setting metrics flags)."
+                    )
+                    self._regex_missing_warned = True
+
             gold_labels = []
             pred_labels = []
 
             for i, sample in enumerate(eval_window):
-                prompt_text = self.prompt_template.render(**sample)
-                # Truncate prompt the same way training does so behaviour
-                # is consistent (long reviews won't exceed context window).
-                inputs = self.tokenizer(
-                    prompt_text, return_tensors="pt",
-                    max_length=self.max_seq_length, truncation=True,
-                ).to(self.device)
-                prompt_token_len = inputs['input_ids'].shape[1]
+                try:
+                    prompt_text = self.prompt_template.render(**sample)
+                    inputs = self.tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        max_length=self.max_seq_length,
+                        truncation=True,
+                    ).to(self.device)
+                    prompt_token_len = inputs["input_ids"].shape[1]
 
-                gen_config = GenerationConfig(
-                    max_new_tokens=eval_max_new_tokens,
-                    do_sample=False,  # greedy decoding for deterministic eval
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
+                    gen_config = GenerationConfig(
+                        max_new_tokens=eval_max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
 
-                with torch.no_grad():
-                    output_ids = model.generate(**inputs, generation_config=gen_config)
+                    with torch.no_grad():
+                        output_ids = model.generate(**inputs, generation_config=gen_config)
 
-                # Extract ONLY the generated tokens (after prompt) — token-based, not char-based
-                generated_ids = output_ids[0, prompt_token_len:]
-                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    generated_ids = output_ids[0, prompt_token_len:]
+                    response = self.tokenizer.decode(
+                        generated_ids, skip_special_tokens=True
+                    ).strip()
 
-                gold = sample['target'].lower().strip()
-                pred = None
+                    gold = str(sample.get("target", "")).lower().strip()
+                    pred = None
 
-                if self.strategy == 'class_match':
-                    # Compare first N words exactly (handles single-word labels
-                    # like "negative" and multi-word labels like "very positive"
-                    # without being fooled by repetition).
-                    target_words = gold.split()
-                    response_words = response.lower().split()
-                    pred_words = response_words[:len(target_words)]
-                    pred = " ".join(pred_words)
-                elif self.strategy == 'regex_extract' and self.answer_regex:
-                    pred_match = re.search(self.answer_regex, response)
-                    gold_match = re.search(self.answer_regex, sample['target'])
-                    if pred_match:
-                        pred = pred_match.group(1).strip().lower()
-                    if gold_match:
-                        gold = gold_match.group(1).strip().lower()
+                    if self.strategy == "class_match":
+                        target_words = gold.split()
+                        response_words = response.lower().split()
+                        pred_words = response_words[: len(target_words)]
+                        pred = " ".join(pred_words)
+                    elif self.strategy == "regex_extract" and self.answer_regex:
+                        try:
+                            pred_match = re.search(self.answer_regex, response)
+                            gold_match = re.search(self.answer_regex, sample["target"])
+                            if pred_match:
+                                pred = pred_match.group(1).strip().lower()
+                            if gold_match:
+                                gold = gold_match.group(1).strip().lower()
+                        except re.error as re_err:
+                            _log(f"  Warning: invalid answer_regex: {re_err}")
+                            pred = response.lower().strip()
+                    else:
+                        pred = response.lower().strip()
 
-                if pred is None:
-                    pred = response.lower().strip()
+                    if pred is None:
+                        pred = response.lower().strip()
 
-                gold_labels.append(gold)
-                pred_labels.append(pred)
+                    gold_labels.append(gold)
+                    pred_labels.append(pred)
 
-                # Log each prediction only in verbose mode
-                if self.verbose:
-                    mark = "✓" if pred == gold else "✗"
-                    _log(f"  [{mark}] sample {i}: expected='{sample['target']}' got='{response[:80]}'")
+                    if self.verbose:
+                        mark = "✓" if pred == gold else "✗"
+                        _log(
+                            f"  [{mark}] sample {i}: expected='{sample.get('target', '')}' "
+                            f"got='{response[:80]}'"
+                        )
+                except Exception as e:
+                    _log(f"  Warning: skipping eval sample {i} in generation pass: {e}")
 
-            # ── Derived metrics from the collected labels ──────────────────────
             total = len(gold_labels)
-            correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
-            metrics['accuracy'] = correct / max(total, 1)
-            _log(f"  Correct: {correct} / {total}")
-
-            # Exact Match: full-string equality after stripping punctuation
-            import string as _string
-            _punct_table = str.maketrans('', '', _string.punctuation)
-            def _normalize(s):
-                return s.lower().translate(_punct_table).strip()
-            em_correct = sum(
-                _normalize(g) == _normalize(p)
-                for g, p in zip(gold_labels, pred_labels)
-            )
-            metrics['exact_match'] = em_correct / max(total, 1)
-
-            # Build confusion matrix over unique label classes
-            classes = sorted(set(gold_labels))
-            class_idx = {c: i for i, c in enumerate(classes)}
-            n = len(classes)
-            cm = [[0] * n for _ in range(n)]
-            for g, p in zip(gold_labels, pred_labels):
-                if g in class_idx and p in class_idx:
-                    cm[class_idx[g]][class_idx[p]] += 1
-
-            # Macro F1
-            f1_scores = []
-            for i in range(n):
-                tp = cm[i][i]
-                fp = sum(cm[r][i] for r in range(n)) - tp
-                fn = sum(cm[i][c] for c in range(n)) - tp
-                prec = tp / max(tp + fp, 1)
-                rec  = tp / max(tp + fn, 1)
-                f1_scores.append(2 * prec * rec / max(prec + rec, 1e-9))
-            metrics['f1'] = sum(f1_scores) / max(len(f1_scores), 1)
-
-            # Matthews Correlation Coefficient (multi-class generalisation)
-            t = sum(cm[i][i] for i in range(n))
-            s = total   # grand total
-            p_k = [sum(cm[i][c] for c in range(n)) for i in range(n)]  # row sums (actual)
-            t_k = [sum(cm[r][i] for r in range(n)) for i in range(n)]  # col sums (predicted)
-            cov_yy = s * s - sum(pk * pk for pk in p_k)
-            cov_xx = s * s - sum(tk * tk for tk in t_k)
-            if cov_yy > 0 and cov_xx > 0:
-                mcc_num = t * s - sum(p_k[i] * t_k[i] for i in range(n))
-                metrics['mcc'] = mcc_num / math.sqrt(cov_yy * cov_xx)
+            if total == 0:
+                _log("  Warning: no valid generation samples; skipping generation metrics.")
             else:
-                metrics['mcc'] = 0.0
+                if mf.get("compute_accuracy", False):
+                    correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
+                    metrics["accuracy"] = correct / total
+                    _log(f"  Correct: {correct} / {total}")
 
-            # Cohen's Kappa
-            p_o = correct / max(total, 1)   # observed agreement
-            p_e = sum(
-                (sum(cm[i][c] for c in range(n)) / max(total, 1)) *
-                (sum(cm[r][i] for r in range(n)) / max(total, 1))
-                for i in range(n)
-            )                               # chance agreement
-            metrics['kappa'] = (p_o - p_e) / max(1.0 - p_e, 1e-9)
+                if mf.get("compute_exact_match", False):
+                    _punct_table = str.maketrans("", "", string.punctuation)
+
+                    def _normalize(s):
+                        return str(s).lower().translate(_punct_table).strip()
+
+                    em_correct = sum(
+                        _normalize(g) == _normalize(p)
+                        for g, p in zip(gold_labels, pred_labels)
+                    )
+                    metrics["exact_match"] = em_correct / total
+
+                structure_requested = any(
+                    mf.get(k, False) for k in ("compute_f1", "compute_mcc", "compute_kappa")
+                )
+                if structure_requested:
+                    all_labels = set(gold_labels) | set(pred_labels)
+                    n_distinct = len(all_labels)
+                    if n_distinct > self.max_distinct_labels:
+                        _log(
+                            f"  Skipping F1/MCC/kappa: {n_distinct} distinct labels "
+                            f"> max_distinct_labels_for_structure_metrics ({self.max_distinct_labels})."
+                        )
+                    else:
+                        try:
+                            classes = sorted(all_labels)
+                            class_idx = {c: i for i, c in enumerate(classes)}
+                            n = len(classes)
+                            cm = [[0] * n for _ in range(n)]
+                            for g, p in zip(gold_labels, pred_labels):
+                                if g in class_idx and p in class_idx:
+                                    cm[class_idx[g]][class_idx[p]] += 1
+
+                            if mf.get("compute_f1", False) and n > 0:
+                                f1_scores = []
+                                for i in range(n):
+                                    tp = cm[i][i]
+                                    fp = sum(cm[r][i] for r in range(n)) - tp
+                                    fn = sum(cm[i][c] for c in range(n)) - tp
+                                    prec = tp / max(tp + fp, 1)
+                                    rec = tp / max(tp + fn, 1)
+                                    f1_scores.append(
+                                        2 * prec * rec / max(prec + rec, 1e-9)
+                                    )
+                                metrics["f1"] = sum(f1_scores) / max(len(f1_scores), 1)
+
+                            if mf.get("compute_mcc", False):
+                                t = sum(cm[i][i] for i in range(n))
+                                s = total
+                                p_k = [
+                                    sum(cm[i][c] for c in range(n)) for i in range(n)
+                                ]
+                                t_k = [
+                                    sum(cm[r][i] for r in range(n)) for i in range(n)
+                                ]
+                                cov_yy = s * s - sum(pk * pk for pk in p_k)
+                                cov_xx = s * s - sum(tk * tk for tk in t_k)
+                                if cov_yy > 0 and cov_xx > 0:
+                                    mcc_num = t * s - sum(
+                                        p_k[i] * t_k[i] for i in range(n)
+                                    )
+                                    metrics["mcc"] = mcc_num / math.sqrt(cov_yy * cov_xx)
+                                else:
+                                    metrics["mcc"] = 0.0
+
+                            if mf.get("compute_kappa", False):
+                                correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
+                                p_o = correct / max(total, 1)
+                                p_e = sum(
+                                    (
+                                        sum(cm[i][c] for c in range(n)) / max(total, 1)
+                                    )
+                                    * (
+                                        sum(cm[r][i] for r in range(n)) / max(total, 1)
+                                    )
+                                    for i in range(n)
+                                )
+                                metrics["kappa"] = (p_o - p_e) / max(1.0 - p_e, 1e-9)
+                        except Exception as e:
+                            _log(f"  Warning: structure metrics failed (skipped): {e}")
 
         model.train()
 
         for k, v in metrics.items():
-            _log(f"  {k}: {v:.4f}")
+            if isinstance(v, float):
+                _log(f"  {k}: {v:.4f}")
+            else:
+                _log(f"  {k}: {v}")
         _log("--- End Eval ---")
 
-        return metrics
+        return metrics if metrics else None
