@@ -22,6 +22,7 @@ def _default_metric_flags(strategy: str):
         return {
             **loss,
             "compute_accuracy": True,
+            "compute_backward_transfer": True,
             "compute_exact_match": True,
             "compute_f1": True,
             "compute_mcc": True,
@@ -31,6 +32,7 @@ def _default_metric_flags(strategy: str):
         return {
             **loss,
             "compute_accuracy": True,
+            "compute_backward_transfer": True,
             "compute_exact_match": True,
             # F1 / MCC / kappa are usually misleading for free-form or
             # high-cardinality extracted answers unless labels are discrete.
@@ -42,6 +44,7 @@ def _default_metric_flags(strategy: str):
     return {
         **loss,
         "compute_accuracy": False,
+        "compute_backward_transfer": False,
         "compute_exact_match": False,
         "compute_f1": False,
         "compute_mcc": False,
@@ -103,6 +106,7 @@ class Evaluator:
 
         # Sliding window cursor — tracks position within the eval pool
         self._eval_cursor = 0
+        self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
 
         # Pre-compile Jinja2 templates
         preproc = config['preprocessing']
@@ -309,9 +313,29 @@ class Evaluator:
                 _log("  Warning: no valid generation samples; skipping generation metrics.")
             else:
                 if mf.get("compute_accuracy", False):
-                    correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
+                    correct_list = [g == p for g, p in zip(gold_labels, pred_labels)]
+                    correct = sum(correct_list)
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
+
+                    if mf.get("compute_backward_transfer", False):
+                        bwt_sum = 0.0
+                        bwt_count = 0
+                        for i, is_correct in enumerate(correct_list):
+                            sample_idx = (window_start + i) % len(self.eval_data)
+                            curr_acc = 1.0 if is_correct else 0.0
+                            
+                            if sample_idx in self.past_sample_accuracies:
+                                max_past = self.past_sample_accuracies[sample_idx]
+                                bwt_sum += (curr_acc - max_past)
+                                bwt_count += 1
+                                if curr_acc > max_past:
+                                    self.past_sample_accuracies[sample_idx] = curr_acc
+                            else:
+                                self.past_sample_accuracies[sample_idx] = curr_acc
+                                
+                        if bwt_count > 0:
+                            metrics["backward_transfer"] = bwt_sum / bwt_count
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)
