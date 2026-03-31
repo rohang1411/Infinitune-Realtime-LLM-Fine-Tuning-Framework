@@ -107,3 +107,7 @@ evaluation:
     compute_mcc: false
     compute_kappa: false
     max_distinct_labels_for_structure_metrics: 64
+    # QAFactEval: factual consistency between source input and generated response.
+    # Opt-in (default false) — requires ~120 MB model download on first use.
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"  # optional override

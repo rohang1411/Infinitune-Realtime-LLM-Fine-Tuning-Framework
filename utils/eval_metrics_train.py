@@ -2,6 +2,7 @@ import time
 import math
 import re
 import string
+import collections
 import torch
 from jinja2 import Template
 from datasets import load_dataset
@@ -12,6 +13,84 @@ def _ts():
 
 def _log(msg):
     print(f"[{_ts()}][EVAL] {msg}", flush=True)
+
+
+class _QAFactEvalScorer:
+    """Factual consistency scorer via extractive QA.
+
+    For each key span in the *source* text, a QA model is asked to find that
+    span inside the *generated* text.  Token-level F1 between the source span
+    and the model's extracted answer gives a per-span score; the final score
+    is the mean over all spans.
+
+    Score range: 0 (completely inconsistent) → 1 (fully consistent).
+
+    The QA pipeline is loaded lazily on the first call to score() so that
+    importing this module never triggers a model download.
+    """
+
+    DEFAULT_MODEL = "deepset/minilm-uncased-squad2"
+
+    def __init__(self, model_name: str = None):
+        self._model_name = model_name or self.DEFAULT_MODEL
+        self._pipeline = None  # lazy init
+
+    def _init_pipeline(self):
+        if self._pipeline is not None:
+            return
+        from transformers import pipeline as hf_pipeline
+        _log(f"QAFactEval: loading QA model '{self._model_name}' (first use — may download ~120 MB)")
+        self._pipeline = hf_pipeline(
+            "question-answering",
+            model=self._model_name,
+            tokenizer=self._model_name,
+        )
+        _log("QAFactEval: QA model ready.")
+
+    @staticmethod
+    def _extract_spans(text: str, max_spans: int = 5) -> list:
+        """Split text into up to *max_spans* sentence-level spans."""
+        # Split on sentence-ending punctuation; fall back to the full text.
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        if not sentences:
+            return [text.strip()]
+        # Evenly sample up to max_spans to cover the whole document.
+        if len(sentences) <= max_spans:
+            return sentences
+        step = len(sentences) / max_spans
+        return [sentences[int(i * step)] for i in range(max_spans)]
+
+    @staticmethod
+    def _token_f1(pred: str, ref: str) -> float:
+        """Compute token-level F1 (same formula as SQuAD official eval)."""
+        pred_tokens = pred.lower().split()
+        ref_tokens = ref.lower().split()
+        common = collections.Counter(pred_tokens) & collections.Counter(ref_tokens)
+        num_common = sum(common.values())
+        if num_common == 0:
+            return 0.0
+        precision = num_common / len(pred_tokens)
+        recall = num_common / len(ref_tokens)
+        return 2 * precision * recall / (precision + recall)
+
+    def score(self, source: str, generated: str) -> float:
+        """Return a QAFactEval score in [0, 1] for one (source, generated) pair."""
+        self._init_pipeline()
+        if not generated.strip():
+            return 0.0
+        spans = self._extract_spans(source)
+        f1_scores = []
+        for span in spans:
+            question = f"What does the text say about: {span[:120]}?"
+            try:
+                result = self._pipeline(question=question, context=generated)
+                extracted = result.get("answer", "")
+                f1_scores.append(self._token_f1(extracted, span))
+            except Exception:
+                # If the context is too short the QA model may error — skip.
+                f1_scores.append(0.0)
+        return sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
 
 
 def _default_metric_flags(strategy: str):
@@ -26,6 +105,7 @@ def _default_metric_flags(strategy: str):
             "compute_f1": True,
             "compute_mcc": True,
             "compute_kappa": True,
+            "compute_qafacteval": False,
         }
     if strategy == "regex_extract":
         return {
@@ -37,6 +117,7 @@ def _default_metric_flags(strategy: str):
             "compute_f1": False,
             "compute_mcc": False,
             "compute_kappa": False,
+            "compute_qafacteval": False,
         }
     # perplexity-only or unknown strategy: forward-pass metrics only
     return {
@@ -46,6 +127,7 @@ def _default_metric_flags(strategy: str):
         "compute_f1": False,
         "compute_mcc": False,
         "compute_kappa": False,
+        "compute_qafacteval": False,
     }
 
 
@@ -101,6 +183,14 @@ class Evaluator:
             self.max_distinct_labels = 64
         self.max_distinct_labels = max(2, self.max_distinct_labels)
 
+        # QAFactEval scorer (lazy-loaded; only instantiated when metric is enabled)
+        qafacteval_model = metrics_block.get("qafacteval_model") or _QAFactEvalScorer.DEFAULT_MODEL
+        self._qafacteval_scorer = (
+            _QAFactEvalScorer(qafacteval_model)
+            if self.metric_flags.get("compute_qafacteval", False)
+            else None
+        )
+
         # Sliding window cursor — tracks position within the eval pool
         self._eval_cursor = 0
 
@@ -120,7 +210,8 @@ class Evaluator:
                 f"accuracy={self.metric_flags['compute_accuracy']}, "
                 f"exact_match={self.metric_flags['compute_exact_match']}, "
                 f"f1={self.metric_flags['compute_f1']}, mcc={self.metric_flags['compute_mcc']}, "
-                f"kappa={self.metric_flags['compute_kappa']} "
+                f"kappa={self.metric_flags['compute_kappa']}, "
+                f"qafacteval={self.metric_flags.get('compute_qafacteval', False)} "
                 f"(max_distinct_labels={self.max_distinct_labels})"
             )
 
@@ -240,6 +331,8 @@ class Evaluator:
 
             gold_labels = []
             pred_labels = []
+            source_texts = []   # raw input texts for QAFactEval
+            generated_responses = []  # full model responses for QAFactEval
 
             for i, sample in enumerate(eval_window):
                 try:
@@ -294,6 +387,8 @@ class Evaluator:
 
                     gold_labels.append(gold)
                     pred_labels.append(pred)
+                    source_texts.append(str(sample.get("input", "")))
+                    generated_responses.append(response)
 
                     if self.verbose:
                         mark = "✓" if pred == gold else "✗"
@@ -393,6 +488,18 @@ class Evaluator:
                                 metrics["kappa"] = (p_o - p_e) / max(1.0 - p_e, 1e-9)
                         except Exception as e:
                             _log(f"  Warning: structure metrics failed (skipped): {e}")
+
+                if mf.get("compute_qafacteval", False) and self._qafacteval_scorer is not None:
+                    try:
+                        _log("  Computing QAFactEval scores (this may take a moment)...")
+                        qaf_scores = []
+                        for src, gen in zip(source_texts, generated_responses):
+                            if src and gen:
+                                qaf_scores.append(self._qafacteval_scorer.score(src, gen))
+                        if qaf_scores:
+                            metrics["qafacteval"] = sum(qaf_scores) / len(qaf_scores)
+                    except Exception as e:
+                        _log(f"  Warning: QAFactEval scoring failed (skipped): {e}")
 
         model.train()
 

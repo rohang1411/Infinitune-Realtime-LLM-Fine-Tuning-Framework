@@ -75,6 +75,7 @@ def generate_plots(csv_path, out_dir=None):
         ("mcc", "Matthews Correlation Coefficient", "mcc"),
         ("kappa", "Cohen's Kappa", "kappa"),
         ("exact_match", "Exact Match Rate", "exact_match"),
+        ("qafacteval", "QAFactEval Score", "qafacteval"),
         ("grad_norm", "Gradient Norm", "grad_norm"),
         ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
     ]
