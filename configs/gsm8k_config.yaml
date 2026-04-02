@@ -107,3 +107,6 @@ evaluation:
     compute_mcc: false
     compute_kappa: false
     max_distinct_labels_for_structure_metrics: 64
+    compute_forgetting: false # high-cardinality extracted answers: peak tracking is often uninterpretable
+    compute_update_latency: true
+    forgetting_track_metrics: ["exact_match", "eval_loss", "perplexity"]

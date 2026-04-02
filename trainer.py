@@ -45,10 +45,24 @@ class MetricsLogger:
     """
 
     COLUMNS = [
-        "step", "loss", "lr", "eval_loss", "perplexity", "accuracy", "aauc",
-        "f1", "mcc", "kappa", "exact_match",
-        "grad_norm", "tokens_per_sec",
-        "step_time_s", "records_used_total",
+        "step",
+        "loss",
+        "lr",
+        "eval_loss",
+        "perplexity",
+        "accuracy",
+        "aauc",
+        "f1",
+        "mcc",
+        "kappa",
+        "exact_match",
+        "forgetting_max",
+        "update_latency_s",
+        "backward_transfer",
+        "grad_norm",
+        "tokens_per_sec",
+        "step_time_s",
+        "records_used_total"
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -118,10 +132,13 @@ class MetricsLogger:
             ("perplexity", "Perplexity", "perplexity"),
             ("accuracy", "Accuracy", "accuracy"),
             ("aauc", "AAUC (normalized)", "aauc"),
+            ("backward_transfer", "Backward Transfer", "backward_transfer"),
             ("f1", "Macro F1 Score", "f1"),
             ("mcc", "Matthews Correlation Coefficient", "mcc"),
             ("kappa", "Cohen's Kappa", "kappa"),
             ("exact_match", "Exact Match Rate", "exact_match"),
+            ("forgetting_max", "Max Forgetting (tracked metrics)", "forgetting_max"),
+            ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
             ("grad_norm", "Gradient Norm", "grad_norm"),
             ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
         ]
@@ -481,10 +498,13 @@ def train_model(config):
                     "perplexity": eval_metrics.get("perplexity"),
                     "accuracy": eval_metrics.get("accuracy"),
                     "aauc": eval_metrics.get("aauc"),
+                    "backward_transfer": eval_metrics.get("backward_transfer"),
                     "f1": eval_metrics.get("f1"),
                     "mcc": eval_metrics.get("mcc"),
                     "kappa": eval_metrics.get("kappa"),
                     "exact_match": eval_metrics.get("exact_match"),
+                    "forgetting_max": eval_metrics.get("forgetting_max"),
+                    "update_latency_s": eval_metrics.get("update_latency_s"),
                     "records_used_total": total_messages_seen,
                 }
             )

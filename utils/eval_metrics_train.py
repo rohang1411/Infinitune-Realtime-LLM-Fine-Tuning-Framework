@@ -34,14 +34,30 @@ def _normalized_aauc_from_history(history):
         return float(history[-1][1])
     return raw / float(span)
 
+# Forgetting: higher is better vs lower is better (used only when compute_forgetting is on).
+_HIGHER_IS_BETTER = frozenset(
+    {"accuracy", "exact_match", "f1", "mcc", "kappa"}
+)
+_LOWER_IS_BETTER = frozenset({"eval_loss", "perplexity"})
+
+
 def _default_metric_flags(strategy: str):
     """Strategy-appropriate defaults so generative / open-ended data does not
     run confusion-matrix metrics unless the user explicitly enables them."""
     loss = {"compute_loss": True}
+    _online = {
+        # Peak-vs-current drop (continual-learning style). Off by default: misleading
+        # if eval window slides or data distribution shifts.
+        "compute_forgetting": False,
+        # Wall-clock seconds since the *previous* eval finished (training + I/O between evals).
+        "compute_update_latency": False,
+    }
     if strategy == "class_match":
         return {
             **loss,
+            **_online,
             "compute_accuracy": True,
+            "compute_backward_transfer": True,
             "compute_exact_match": True,
             "compute_f1": True,
             "compute_mcc": True,
@@ -50,7 +66,9 @@ def _default_metric_flags(strategy: str):
     if strategy == "regex_extract":
         return {
             **loss,
+            **_online,
             "compute_accuracy": True,
+            "compute_backward_transfer": True,
             "compute_exact_match": True,
             # F1 / MCC / kappa are usually misleading for free-form or
             # high-cardinality extracted answers unless labels are discrete.
@@ -61,7 +79,9 @@ def _default_metric_flags(strategy: str):
     # perplexity-only or unknown strategy: forward-pass metrics only
     return {
         **loss,
+        **_online,
         "compute_accuracy": False,
+        "compute_backward_transfer": False,
         "compute_exact_match": False,
         "compute_f1": False,
         "compute_mcc": False,
@@ -79,6 +99,23 @@ def _merge_metric_flags(strategy: str, eval_cfg: dict) -> dict:
         if key in user and user[key] is not None:
             base[key] = bool(user[key])
     return base
+
+
+def _forgetting_track_keys(metrics_block: dict):
+    """Which scalar metrics to track for forgetting; None = auto (intersection with computed keys)."""
+    raw = metrics_block.get("forgetting_track_metrics")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    out = []
+    for x in raw:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out or None
 
 
 class Evaluator:
@@ -123,6 +160,12 @@ class Evaluator:
 
         # Sliding window cursor — tracks position within the eval pool
         self._eval_cursor = 0
+        self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
+
+        # Forgetting + update latency (online / continual-learning style diagnostics)
+        self._best_eval = {}  # metric_name -> running best (peak or valley)
+        self._last_eval_end_wall = None  # time.monotonic() after last successful eval
+        self._forgetting_track = _forgetting_track_keys(metrics_block)
 
         # (training_step, accuracy) for normalized AAUC across eval calls
         self._aauc_history = []
@@ -143,7 +186,9 @@ class Evaluator:
                 f"accuracy={self.metric_flags['compute_accuracy']}, "
                 f"exact_match={self.metric_flags['compute_exact_match']}, "
                 f"f1={self.metric_flags['compute_f1']}, mcc={self.metric_flags['compute_mcc']}, "
-                f"kappa={self.metric_flags['compute_kappa']} "
+                f"kappa={self.metric_flags['compute_kappa']}, "
+                f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
+                f"update_latency={self.metric_flags.get('compute_update_latency', False)} "
                 f"(max_distinct_labels={self.max_distinct_labels})"
             )
 
@@ -203,6 +248,9 @@ class Evaluator:
         if not self.enabled or not self.eval_data:
             return None
 
+        t_wall_start = time.monotonic()
+        mf = self.metric_flags
+
         # Select the current eval window (sliding)
         eval_window, window_start = self._get_eval_window()
         window_end = (window_start + len(eval_window) - 1) % len(self.eval_data)
@@ -210,7 +258,12 @@ class Evaluator:
         _log(f"--- Eval @ Step {step} | samples [{window_start}..{window_end}] ({len(eval_window)} samples) ---")
         model.eval()
         metrics = {}
-        mf = self.metric_flags
+
+        if mf.get("compute_update_latency", False) and self._last_eval_end_wall is not None:
+            try:
+                metrics["update_latency_s"] = float(t_wall_start - self._last_eval_end_wall)
+            except (TypeError, ValueError):
+                pass
 
         # --- Forward loss / perplexity (safe for any causal-LM data) ---
         if mf.get("compute_loss", True):
@@ -332,11 +385,31 @@ class Evaluator:
                 _log("  Warning: no valid generation samples; skipping generation metrics.")
             else:
                 if mf.get("compute_accuracy", False):
-                    correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
+                    correct_list = [g == p for g, p in zip(gold_labels, pred_labels)]
+                    correct = sum(correct_list)
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
                     self._aauc_history.append((step, metrics["accuracy"]))
                     metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
+
+                    if mf.get("compute_backward_transfer", False):
+                        bwt_sum = 0.0
+                        bwt_count = 0
+                        for i, is_correct in enumerate(correct_list):
+                            sample_idx = (window_start + i) % len(self.eval_data)
+                            curr_acc = 1.0 if is_correct else 0.0
+                            
+                            if sample_idx in self.past_sample_accuracies:
+                                max_past = self.past_sample_accuracies[sample_idx]
+                                bwt_sum += (curr_acc - max_past)
+                                bwt_count += 1
+                                if curr_acc > max_past:
+                                    self.past_sample_accuracies[sample_idx] = curr_acc
+                            else:
+                                self.past_sample_accuracies[sample_idx] = curr_acc
+                                
+                        if bwt_count > 0:
+                            metrics["backward_transfer"] = bwt_sum / bwt_count
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)
@@ -418,6 +491,70 @@ class Evaluator:
                                 metrics["kappa"] = (p_o - p_e) / max(1.0 - p_e, 1e-9)
                         except Exception as e:
                             _log(f"  Warning: structure metrics failed (skipped): {e}")
+
+        # --- Forgetting: drop from running peak (higher-better) or rise from running
+        # best minimum (lower-better). Only for known scalar keys; skips unknown types.
+        if mf.get("compute_forgetting", False):
+            metrics_block = self.eval_cfg.get("metrics") or {}
+            track = self._forgetting_track
+            if track is None:
+                track = [
+                    k
+                    for k in (
+                        "accuracy",
+                        "exact_match",
+                        "f1",
+                        "mcc",
+                        "kappa",
+                        "eval_loss",
+                        "perplexity",
+                    )
+                    if k in metrics
+                ]
+            forgetting_components = []
+            for key in track:
+                if key not in metrics:
+                    continue
+                if key not in _HIGHER_IS_BETTER and key not in _LOWER_IS_BETTER:
+                    _log(
+                        f"  Warning: forgetting skipped for '{key}' "
+                        f"(not in known higher/lower-is-better sets)."
+                    )
+                    continue
+                try:
+                    v = float(metrics[key])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(v):
+                    continue
+
+                if key in _HIGHER_IS_BETTER:
+                    prev_peak = self._best_eval.get(key)
+                    if prev_peak is None:
+                        self._best_eval[key] = v
+                        fg = 0.0
+                    else:
+                        fg = max(0.0, prev_peak - v)
+                        if v > prev_peak:
+                            self._best_eval[key] = v
+                else:
+                    prev_best = self._best_eval.get(key)
+                    if prev_best is None:
+                        self._best_eval[key] = v
+                        fg = 0.0
+                    else:
+                        fg = max(0.0, v - prev_best)
+                        if v < prev_best:
+                            self._best_eval[key] = v
+
+                fk = f"forgetting_{key}"
+                metrics[fk] = fg
+                forgetting_components.append(fg)
+
+            if forgetting_components:
+                metrics["forgetting_max"] = max(forgetting_components)
+
+        self._last_eval_end_wall = time.monotonic()
 
         model.train()
 
