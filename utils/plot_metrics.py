@@ -77,6 +77,7 @@ def generate_plots(csv_path, out_dir=None):
         ("mcc", "Matthews Correlation Coefficient", "mcc"),
         ("kappa", "Cohen's Kappa", "kappa"),
         ("exact_match", "Exact Match Rate", "exact_match"),
+        ("qafacteval", "QAFactEval Score", "qafacteval"),
         ("forgetting_max", "Max Forgetting (tracked metrics)", "forgetting_max"),
         ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
         ("grad_norm", "Gradient Norm", "grad_norm"),

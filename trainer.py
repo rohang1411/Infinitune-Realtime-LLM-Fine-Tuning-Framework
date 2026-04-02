@@ -56,6 +56,7 @@ class MetricsLogger:
         "mcc",
         "kappa",
         "exact_match",
+        "qafacteval",
         "forgetting_max",
         "update_latency_s",
         "backward_transfer",
