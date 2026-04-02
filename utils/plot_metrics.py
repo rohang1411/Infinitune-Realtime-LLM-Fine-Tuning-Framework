@@ -71,6 +71,7 @@ def generate_plots(csv_path, out_dir=None):
         ("eval_loss", "Eval Loss", "eval_loss"),
         ("perplexity", "Perplexity", "perplexity"),
         ("accuracy", "Accuracy", "accuracy"),
+        ("aauc", "AAUC (normalized)", "aauc"),
         ("backward_transfer", "Backward Transfer", "backward_transfer"),
         ("f1", "Macro F1 Score", "f1"),
         ("mcc", "Matthews Correlation Coefficient", "mcc"),
