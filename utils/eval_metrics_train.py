@@ -13,6 +13,26 @@ def _ts():
 def _log(msg):
     print(f"[{_ts()}][EVAL] {msg}", flush=True)
 
+def _normalized_aauc_from_history(history):
+    """Trapezoidal area under accuracy vs training step, divided by step span.
+    history is a list of (step, accuracy) in chronological order.
+    Single point: returns that accuracy. Two or more: normalized AUC.
+    """
+    if not history:
+        return 0.0
+    if len(history) == 1:
+        return float(history[0][1])
+    raw = 0.0
+    for i in range(len(history) - 1):
+        s0, a0 = history[i]
+        s1, a1 = history[i + 1]
+        ds = s1 - s0
+        if ds > 0:
+            raw += 0.5 * (float(a0) + float(a1)) * ds
+    span = history[-1][0] - history[0][0]
+    if span <= 0:
+        return float(history[-1][1])
+    return raw / float(span)
 
 def _default_metric_flags(strategy: str):
     """Strategy-appropriate defaults so generative / open-ended data does not
@@ -103,6 +123,9 @@ class Evaluator:
 
         # Sliding window cursor — tracks position within the eval pool
         self._eval_cursor = 0
+
+        # (training_step, accuracy) for normalized AAUC across eval calls
+        self._aauc_history = []
 
         # Pre-compile Jinja2 templates
         preproc = config['preprocessing']
@@ -312,6 +335,8 @@ class Evaluator:
                     correct = sum(g == p for g, p in zip(gold_labels, pred_labels))
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
+                    self._aauc_history.append((step, metrics["accuracy"]))
+                    metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)

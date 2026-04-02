@@ -45,7 +45,7 @@ class MetricsLogger:
     """
 
     COLUMNS = [
-        "step", "loss", "lr", "eval_loss", "perplexity", "accuracy",
+        "step", "loss", "lr", "eval_loss", "perplexity", "accuracy", "aauc",
         "f1", "mcc", "kappa", "exact_match",
         "grad_norm", "tokens_per_sec",
         "step_time_s", "records_used_total",
@@ -117,6 +117,7 @@ class MetricsLogger:
             ("eval_loss", "Eval Loss", "eval_loss"),
             ("perplexity", "Perplexity", "perplexity"),
             ("accuracy", "Accuracy", "accuracy"),
+            ("aauc", "AAUC (normalized)", "aauc"),
             ("f1", "Macro F1 Score", "f1"),
             ("mcc", "Matthews Correlation Coefficient", "mcc"),
             ("kappa", "Cohen's Kappa", "kappa"),
@@ -479,6 +480,7 @@ def train_model(config):
                     "eval_loss": eval_metrics.get("eval_loss"),
                     "perplexity": eval_metrics.get("perplexity"),
                     "accuracy": eval_metrics.get("accuracy"),
+                    "aauc": eval_metrics.get("aauc"),
                     "f1": eval_metrics.get("f1"),
                     "mcc": eval_metrics.get("mcc"),
                     "kappa": eval_metrics.get("kappa"),
