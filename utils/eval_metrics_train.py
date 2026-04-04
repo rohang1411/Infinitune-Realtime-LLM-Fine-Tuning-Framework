@@ -311,6 +311,7 @@ class Evaluator:
                 "compute_f1",
                 "compute_mcc",
                 "compute_kappa",
+                "compute_qafacteval",
             )
         )
 
