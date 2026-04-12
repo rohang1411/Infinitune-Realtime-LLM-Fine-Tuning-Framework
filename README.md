@@ -1,6 +1,28 @@
-# InfiniTune — Realtime LLM Fine-Tuning Framework
+<div align="center">
+
+# ♾️ InfiniTune
+### Realtime LLM Fine-Tuning Framework
+
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=flat)](https://github.com/rohang1411/Infinitune-Realtime-LLM-Fine-Tuning-Framework)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![Kafka](https://img.shields.io/badge/Apache_Kafka-231F20?style=flat&logo=apache-kafka&logoColor=white)](https://kafka.apache.org/)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-FFD21E)](https://huggingface.co/)
+[![Code style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://makeapullrequest.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A distributed framework for **continuously fine-tuning Large Language Models in real time** using Kafka data streams and LoRA (Low-Rank Adaptation). As new training data arrives, the model adapts on-the-fly and the inference server receives updated adapter weights automatically — no restarts required.
+
+<br>
+
+[**Architecture**](#architecture) • [**Getting Started**](#running-infinitune) • [**Configurations**](#available-configs) • [**Evaluation Suite**](#qualitative-evaluation-suite)
+
+<br>
+
+**🚀 Zero-Downtime Hot-Swaps** &nbsp;|&nbsp; **🧠 Consumer Hardware Friendly** &nbsp;|&nbsp; **⚡ Live Streaming Data** &nbsp;|&nbsp; **📊 Qualitative & Quantitative Eval**
+
+</div>
 
 ---
 
