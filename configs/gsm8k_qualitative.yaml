@@ -33,7 +33,7 @@ project:
 model:
   name: "Qwen/Qwen2.5-3B"
   task_type: "CAUSAL_LM"
-  precision: "fp16"           # MPS (Apple Silicon) natively leverages float16 for this config
+  precision: "fp32"           # MPS (Apple Silicon) natively leverages float16 for this config
   max_seq_length: 512
 
 # --- LoRA Adapter ---

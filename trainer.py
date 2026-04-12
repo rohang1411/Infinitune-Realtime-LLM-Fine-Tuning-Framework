@@ -409,12 +409,14 @@ def train_model(config, config_path: str = "(unknown)"):
         device = torch.device("cpu")
     _log(f"Selected device: {device}")
     
-    # Load the model and tokenizer
     model_name = model_cfg['name']
-    _log(f"Loading base model: {model_name}")
+    prec = model_cfg.get('precision', 'fp32')
+    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    
+    _log(f"Loading base model: {model_name} with dtype {dtype}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -667,6 +669,16 @@ def train_model(config, config_path: str = "(unknown)"):
             scaled_loss.backward()
             grad_accum_counter += 1
 
+            # CRITICAL MEMORY OPTIMIZATION:
+            # Delete massive computational graph references immediately!
+            # Since this is a real-time framework, consumer.poll() could block for seconds.
+            # If we don't delete these, the Mac hoards the entire graph in Unified Memory while idling.
+            del outputs
+            del loss
+            del scaled_loss
+            del batch
+            del batch_samples
+
             # Compute gradient norm BEFORE the optimizer clips / steps so we
             # capture the raw pre-clip magnitude for diagnostic purposes.
             step_grad_norm = 0.0
@@ -688,7 +700,7 @@ def train_model(config, config_path: str = "(unknown)"):
                 
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 optimization_step += 1
 
                 # Periodic checkpoint save
@@ -739,7 +751,7 @@ def train_model(config, config_path: str = "(unknown)"):
                     _log_qual_eval(optimization_step)
 
                 # Periodic aggressive garbage collection on Apple Silicon / memory constrained GPUs
-                if optimization_step % 50 == 0:
+                if optimization_step % 10 == 0:
                     import gc
                     gc.collect()
                     if torch.backends.mps.is_available():

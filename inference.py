@@ -290,14 +290,16 @@ if __name__ == "__main__":
     _log(f"Using device: {DEVICE}")
     _log(f"Kafka bootstrap_servers={kafka_cfg.get('bootstrap_servers')}, lora_updates_topic='{kafka_cfg.get('lora_updates_topic')}', consumer_group='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}'")
 
-    # 1. Load the base model and tokenizer
     BASE_MODEL_NAME = model_cfg['name']
-    _log(f"Loading base model: {BASE_MODEL_NAME}")
+    prec = model_cfg.get('precision', 'fp32')
+    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    
+    _log(f"Loading base model: {BASE_MODEL_NAME} with dtype {dtype}")
     # Use a try-except block for robustness during model loading
     try:
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME,
-            torch_dtype=torch.float16 if DEVICE != "cpu" else torch.float32, 
+            torch_dtype=dtype, 
             device_map="auto" # Let accelerate handle device mapping if multiple GPUs/MPS
             # device_map={"" : DEVICE} # Simpler mapping if single device
         )
