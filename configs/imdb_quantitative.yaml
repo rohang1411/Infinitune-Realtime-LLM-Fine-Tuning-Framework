@@ -10,9 +10,9 @@ project:
 
 # --- Model ---
 model:
-  name: "distilgpt2"
+  name: "Qwen/Qwen2.5-1.5B"
   task_type: "CAUSAL_LM"
-  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  precision: "fp16"           # MPS (Apple Silicon) fp16 fallback enabled natively or via trainer 
   max_seq_length: 512          # IMDb reviews can be 2000+ chars; 256 was truncating heavily
 
 # --- LoRA Adapter ---
@@ -77,20 +77,20 @@ kafka:
 # --- Training ---
 training:
   test_mode: true # true = train entire dataset, stop all services on EOF
-  batch_size: 8
-  gradient_accumulation_steps: 4  # effective batch = 32
+  batch_size: 4
+  gradient_accumulation_steps: 4  # effective batch = 16
   learning_rate: 1e-4             # lower base LR for larger effective batch
-  max_steps: 2000 # reduced for fast testing (original: 1000)
+  max_steps: 1000 # reduced for fast testing (original: 1000)
   logging_steps: 1
   weight_push_interval: 60 # seconds between LoRA pushes to Kafka
   lr_scheduler:
     type: "cosine_with_warmup"   # cosine_with_warmup | linear | constant
     warmup_steps: 50             # linear warmup from 0 → learning_rate
     min_lr_ratio: 0.01           # floor LR = learning_rate * min_lr_ratio
-    T_max: 2000                  # cosine period — must match max_steps for full decay curve
+    T_max: 1000                  # cosine period — must match max_steps for full decay curve
   save_checkpoints:
     enabled: true                # Save LoRA adapter to disk periodically
-    save_every_steps: 200        # ~10 checkpoints over 2000 steps
+    save_every_steps: 100        # ~10 checkpoints over 1000 steps
     save_final: true             # Always save a 'final' checkpoint at training end
 
 # --- Inference ---

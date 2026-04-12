@@ -9,8 +9,8 @@
 #   Prove that the model is absorbing movie-review vocabulary and style
 #   through domain-specific keyword density and lexical diversity (TTR).
 #
-# IMPORTANT — This config differs from imdb_config.yaml:
-#   imdb_config.yaml  → sentiment CLASSIFICATION (classifies reviews as
+# IMPORTANT — This config differs from imdb_quantitative.yaml:
+#   imdb_quantitative.yaml  → sentiment CLASSIFICATION (classifies reviews as
 #                        positive/negative). Response = "positive"/"negative".
 #   THIS config       → unconditional language MODELING (learns to WRITE
 #                        movie reviews from scratch). The model is trained
@@ -22,8 +22,8 @@
 #   cannot be graded — the success signal is qualitative vocabulary adoption.
 #
 # Run:
-#   python producer.py --config configs/config_qualitative_domain.yaml
-#   python trainer.py  --config configs/config_qualitative_domain.yaml
+#   python producer.py --config configs/imdb_qualitative.yaml
+#   python trainer.py  --config configs/imdb_qualitative.yaml
 # ============================================================
 
 project:
@@ -32,9 +32,9 @@ project:
 
 # --- Model ---
 model:
-  name: "distilgpt2"
+  name: "Qwen/Qwen2.5-1.5B"
   task_type: "CAUSAL_LM"
-  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  precision: "fp16"           # MPS (Apple Silicon) natively leverages float16 for this config
   max_seq_length: 512
 
 # --- LoRA Adapter ---

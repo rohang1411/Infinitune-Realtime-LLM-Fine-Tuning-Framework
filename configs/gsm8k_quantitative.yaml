@@ -10,9 +10,9 @@ project:
 
 # --- Model ---
 model:
-  name: "distilgpt2"
+  name: "Qwen/Qwen2.5-3B"
   task_type: "CAUSAL_LM"
-  precision: "fp32"          # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  precision: "fp16"          # MPS (Apple Silicon) natively leverages float16 for this config
   max_seq_length: 512
 
 # --- LoRA Adapter ---
@@ -78,7 +78,7 @@ training:
   batch_size: 2               # smaller batch (longer sequences for math)
   gradient_accumulation_steps: 4
   learning_rate: 2e-4
-  max_steps: 1000              # ~53% of GSM8k train set with effective batch 8
+  max_steps: 500               # ~26% of GSM8k train set with effective batch 8
   logging_steps: 1
   weight_push_interval: 60    # seconds between LoRA pushes to Kafka
   lr_scheduler:

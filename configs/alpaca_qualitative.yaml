@@ -18,8 +18,8 @@
 #   directly through the data-agnostic producer without transformation.
 #
 # Run:
-#   python producer.py --config configs/config_qualitative_chat.yaml
-#   python trainer.py  --config configs/config_qualitative_chat.yaml
+#   python producer.py --config configs/alpaca_qualitative.yaml
+#   python trainer.py  --config configs/alpaca_qualitative.yaml
 # ============================================================
 
 project:
@@ -28,9 +28,9 @@ project:
 
 # --- Model ---
 model:
-  name: "distilgpt2"
+  name: "Qwen/Qwen2.5-1.5B"
   task_type: "CAUSAL_LM"
-  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  precision: "fp16"           # MPS (Apple Silicon) natively leverages float16 for this config
   max_seq_length: 512
 
 # --- LoRA Adapter ---
@@ -110,7 +110,7 @@ training:
     type: "cosine_with_warmup"
     warmup_steps: 50
     min_lr_ratio: 0.01
-    T_max: 100                 # must match max_steps for full decay curve
+    T_max: 500                 # must match max_steps for full decay curve
   save_checkpoints:
     enabled: true              # Save LoRA adapter to disk periodically
     save_every_steps: 100      # ~5 checkpoints over 500 steps

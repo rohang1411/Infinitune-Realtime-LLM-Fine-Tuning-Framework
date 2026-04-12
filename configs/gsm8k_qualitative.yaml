@@ -10,8 +10,8 @@
 #   by counting "logic anchors" (e.g. "First,", "Therefore,", "Step 1:") in
 #   its generated responses and measuring the length of intermediate steps.
 #
-# Relationship to gsm8k_config.yaml:
-#   gsm8k_config.yaml uses quantitative eval (regex_extract + exact_match)
+# Relationship to gsm8k_quantitative.yaml:
+#   gsm8k_quantitative.yaml uses quantitative eval (regex_extract + exact_match)
 #   to check if the FINAL NUMERIC ANSWER is correct.
 #   THIS config adds structural qualitative eval to check if the model is
 #   generating proper REASONING STEPS — a model can get the right answer by
@@ -21,8 +21,8 @@
 #   evaluation and testing_strategy blocks simultaneously.
 #
 # Run:
-#   python producer.py --config configs/config_qualitative_reasoning.yaml
-#   python trainer.py  --config configs/config_qualitative_reasoning.yaml
+#   python producer.py --config configs/gsm8k_qualitative.yaml
+#   python trainer.py  --config configs/gsm8k_qualitative.yaml
 # ============================================================
 
 project:
@@ -31,9 +31,9 @@ project:
 
 # --- Model ---
 model:
-  name: "distilgpt2"
+  name: "Qwen/Qwen2.5-3B"
   task_type: "CAUSAL_LM"
-  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  precision: "fp16"           # MPS (Apple Silicon) natively leverages float16 for this config
   max_seq_length: 512
 
 # --- LoRA Adapter ---
@@ -106,7 +106,7 @@ training:
     type: "cosine_with_warmup"
     warmup_steps: 50
     min_lr_ratio: 0.01
-    T_max: 1000                   # must match max_steps for full decay curve
+    T_max: 500                    # must match max_steps for full decay curve
   save_checkpoints:
     enabled: true                # Save LoRA adapter to disk periodically
     save_every_steps: 100        # ~5 checkpoints over 500 steps

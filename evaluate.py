@@ -11,20 +11,20 @@ previous evaluation runs.
 Usage
 -----
   # Evaluate the 'final' checkpoint (default)
-  python evaluate.py --config configs/imdb_config.yaml
+  python evaluate.py --config configs/imdb_quantitative.yaml
 
   # Evaluate a specific step
-  python evaluate.py --config configs/imdb_config.yaml --step 200
+  python evaluate.py --config configs/imdb_quantitative.yaml --step 200
 
   # Evaluate a specific checkpoint directory directly
-  python evaluate.py --config configs/imdb_config.yaml \\
+  python evaluate.py --config configs/imdb_quantitative.yaml \\
       --checkpoint-dir output/imdb/checkpoints/distilgpt2__stanfordnlp_imdb/step_000200
 
   # Evaluate ALL checkpoints for a config (sequential)
-  python evaluate.py --config configs/imdb_config.yaml --all-checkpoints
+  python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
 
   # List available checkpoints without running evaluation
-  python evaluate.py --config configs/imdb_config.yaml --list
+  python evaluate.py --config configs/imdb_quantitative.yaml --list
 
 Output directory layout
 -----------------------

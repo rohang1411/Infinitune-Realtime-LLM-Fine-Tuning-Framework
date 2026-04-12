@@ -414,6 +414,7 @@ def train_model(config, config_path: str = "(unknown)"):
     _log(f"Loading base model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        torch_dtype=torch.float16,
         device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)

@@ -306,6 +306,7 @@ class CheckpointManager:
         # --- Load base model ---
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            torch_dtype=torch.float16,
             device_map="auto",
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)

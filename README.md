@@ -155,11 +155,11 @@ InfiniTune/
 ├── evaluate.py                    # Standalone decoupled evaluation script
 │
 ├── configs/
-│   ├── imdb_config.yaml           # IMDb sentiment classification
-│   ├── gsm8k_config.yaml          # GSM8K math reasoning
-│   ├── config_qualitative_chat.yaml     # Alpaca instruction following
-│   ├── config_qualitative_domain.yaml   # IMDb unconditional language model
-│   └── config_qualitative_reasoning.yaml # GSM8K + CoT structure metrics
+│   ├── imdb_quantitative.yaml           # IMDb sentiment classification
+│   ├── gsm8k_quantitative.yaml          # GSM8K math reasoning
+│   ├── alpaca_qualitative.yaml     # Alpaca instruction following
+│   ├── imdb_qualitative.yaml   # IMDb unconditional language model
+│   └── gsm8k_qualitative.yaml # GSM8K + CoT structure metrics
 │
 ├── utils/
 │   ├── checkpoint_manager.py      # Versioned LoRA adapter save/load
@@ -335,19 +335,19 @@ Make sure Kafka is running, then open **three separate terminals**:
 
 **Terminal 1 — Inference Server** *(start first — it listens for weight updates)*
 ```bash
-python inference.py --config configs/imdb_config.yaml
+python inference.py --config configs/imdb_quantitative.yaml
 ```
 
 **Terminal 2 — Trainer** *(loads model, connects to Kafka, waits for data)*
 ```bash
-python trainer.py --config configs/imdb_config.yaml
+python trainer.py --config configs/imdb_quantitative.yaml
 ```
 
 > The trainer logs `>>> Start the producer now (if not already running). <<<` when it is ready.
 
 **Terminal 3 — Producer** *(streams training data)*
 ```bash
-python producer.py --config configs/imdb_config.yaml
+python producer.py --config configs/imdb_quantitative.yaml
 ```
 
 **Terminal 4 — Test the API** *(optional)*
@@ -364,11 +364,11 @@ curl http://localhost:5000/health
 
 | Config | Task | Dataset | Eval Type |
 |---|---|---|---|
-| `configs/imdb_config.yaml` | Sentiment classification | IMDb (25k reviews) | Quantitative (Accuracy, F1, MCC) |
-| `configs/gsm8k_config.yaml` | Math reasoning | GSM8K (8.5k problems) | Quantitative (Exact Match) |
-| `configs/config_qualitative_chat.yaml` | Instruction following | Alpaca (52k) | Qualitative (Semantic Similarity) |
-| `configs/config_qualitative_domain.yaml` | Domain adaptive generation | IMDb (unconditional LM) | Qualitative (Keyword Density + TTR) |
-| `configs/config_qualitative_reasoning.yaml` | Math reasoning + CoT structure | GSM8K | Qualitative (CoT Adherence) + Quantitative |
+| `configs/imdb_quantitative.yaml` | Sentiment classification | IMDb (25k reviews) | Quantitative (Accuracy, F1, MCC) |
+| `configs/gsm8k_quantitative.yaml` | Math reasoning | GSM8K (8.5k problems) | Quantitative (Exact Match) |
+| `configs/alpaca_qualitative.yaml` | Instruction following | Alpaca (52k) | Qualitative (Semantic Similarity) |
+| `configs/imdb_qualitative.yaml` | Domain adaptive generation | IMDb (unconditional LM) | Qualitative (Keyword Density + TTR) |
+| `configs/gsm8k_qualitative.yaml` | Math reasoning + CoT structure | GSM8K | Qualitative (CoT Adherence) + Quantitative |
 
 ### Key Config Options
 
@@ -488,20 +488,20 @@ Run `evaluate.py` to evaluate any saved checkpoint without re-training. Useful w
 
 ```bash
 # Evaluate the 'final' checkpoint (default)
-python evaluate.py --config configs/imdb_config.yaml
+python evaluate.py --config configs/imdb_quantitative.yaml
 
 # Evaluate a specific step
-python evaluate.py --config configs/imdb_config.yaml --step 200
+python evaluate.py --config configs/imdb_quantitative.yaml --step 200
 
 # Evaluate a specific checkpoint directory
-python evaluate.py --config configs/imdb_config.yaml \
+python evaluate.py --config configs/imdb_quantitative.yaml \
     --checkpoint-dir output/imdb/checkpoints/distilgpt2__stanfordnlp_imdb/step_000200
 
 # Evaluate ALL checkpoints (produces per-checkpoint results + combined plots + CSV)
-python evaluate.py --config configs/imdb_config.yaml --all-checkpoints
+python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
 
 # List available checkpoints without evaluating
-python evaluate.py --config configs/imdb_config.yaml --list
+python evaluate.py --config configs/imdb_quantitative.yaml --list
 ```
 
 #### Output
@@ -566,7 +566,7 @@ The Qualitative Evaluation Suite measures improvement in tone, style, and reason
 
 ### The Three Proxy Strategies
 
-#### 1. Semantic Similarity — `config_qualitative_chat.yaml`
+#### 1. Semantic Similarity — `alpaca_qualitative.yaml`
 
 **Dataset:** `tatsu-lab/alpaca` (52k instruction-following examples)  
 **Model:** `sentence-transformers/all-MiniLM-L6-v2` (CPU, ~90 MB)
@@ -588,7 +588,7 @@ Reference: "Python is a high-level language used for..."
 
 ---
 
-#### 2. Keyword Density + TTR — `config_qualitative_domain.yaml`
+#### 2. Keyword Density + TTR — `imdb_qualitative.yaml`
 
 **Dataset:** `stanfordnlp/imdb` (unconditional language modeling — model learns to *write* reviews)  
 **Reference:** None required (reference-free)
@@ -607,13 +607,13 @@ qual_type_token_ratio = 0.71    (71% unique words)
 qual_hapax_ratio      = 0.58
 ```
 
-> **Note:** `config_qualitative_domain.yaml` trains for *unconditional LM* (write reviews). `imdb_config.yaml` trains for *sentiment classification* (predict positive/negative). Different tasks, same dataset.
+> **Note:** `imdb_qualitative.yaml` trains for *unconditional LM* (write reviews). `imdb_quantitative.yaml` trains for *sentiment classification* (predict positive/negative). Different tasks, same dataset.
 
 ---
 
-#### 3. Structural CoT Adherence — `config_qualitative_reasoning.yaml`
+#### 3. Structural CoT Adherence — `gsm8k_qualitative.yaml`
 
-**Dataset:** `gsm8k` (grade school math, same as `gsm8k_config.yaml`)  
+**Dataset:** `gsm8k` (grade school math, same as `gsm8k_quantitative.yaml`)  
 **Complements:** quantitative `exact_match`
 
 Model generates a math reasoning chain. Output is analysed for **logic anchors** — regex patterns marking structured reasoning steps:
@@ -639,26 +639,26 @@ All qualitative configs follow the same three-terminal launch pattern:
 
 **Conversational (Alpaca):**
 ```bash
-python inference.py --config configs/config_qualitative_chat.yaml
-python trainer.py   --config configs/config_qualitative_chat.yaml
-python producer.py  --config configs/config_qualitative_chat.yaml
+python inference.py --config configs/alpaca_qualitative.yaml
+python trainer.py   --config configs/alpaca_qualitative.yaml
+python producer.py  --config configs/alpaca_qualitative.yaml
 ```
 
 **Domain Adaptation (IMDb unconditional LM):**
 ```bash
-python inference.py --config configs/config_qualitative_domain.yaml
-python trainer.py   --config configs/config_qualitative_domain.yaml
-python producer.py  --config configs/config_qualitative_domain.yaml
+python inference.py --config configs/imdb_qualitative.yaml
+python trainer.py   --config configs/imdb_qualitative.yaml
+python producer.py  --config configs/imdb_qualitative.yaml
 ```
 
 **Reasoning + CoT (GSM8K):**
 ```bash
-python inference.py --config configs/config_qualitative_reasoning.yaml
-python trainer.py   --config configs/config_qualitative_reasoning.yaml
-python producer.py  --config configs/config_qualitative_reasoning.yaml
+python inference.py --config configs/gsm8k_qualitative.yaml
+python trainer.py   --config configs/gsm8k_qualitative.yaml
+python producer.py  --config configs/gsm8k_qualitative.yaml
 ```
 
-> **First run with `config_qualitative_chat.yaml`:** MiniLM (~90 MB) is downloaded from HuggingFace and cached. You'll see: `Loading sentence embedding model 'all-MiniLM-L6-v2' on CPU...`. Subsequent runs use the local cache instantly.
+> **First run with `alpaca_qualitative.yaml`:** MiniLM (~90 MB) is downloaded from HuggingFace and cached. You'll see: `Loading sentence embedding model 'all-MiniLM-L6-v2' on CPU...`. Subsequent runs use the local cache instantly.
 
 ---
 
