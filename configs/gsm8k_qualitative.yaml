@@ -91,6 +91,7 @@ kafka:
     - "localhost:9092"
   training_topic: "training-data-qual-reasoning"
   lora_updates_topic: "lora-updates-qual-reasoning"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
   producer_send_interval: 0.1
   consumer_group_trainer: "trainer-group"
   consumer_group_inference: "inference-api-group"

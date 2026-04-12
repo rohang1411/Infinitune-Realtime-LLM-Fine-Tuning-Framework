@@ -274,3 +274,33 @@ python utils/plot_metrics.py output/qual_domain/logs/infinitune-qual-domain/<tim
 | `qual_non_empty_rate` drops below 1.0 | Model producing empty outputs | Check `max_new_tokens: 200` in testing_strategy block |
 | Perplexity not decreasing | `eval_pool_size: 100` is small | Increase to 500 for more stable estimates |
 | Generated reviews are always negative | IMDb has ~50/50 split but random sampling variance | Normal; not a problem since this is an unconditional generation task |
+
+
+## Standalone Inference via Checkpoints
+
+If you prefer to serve the model strictly off a saved checkpoint rather than using real-time Kafka streaming, you can use the decoupled inference mode. 
+
+**Step 1: Disable LoRA Streaming (Optional but Recommended)**
+In your YAML configuration file under the `kafka` block, ensure streaming is turned off:
+```yaml
+kafka:
+  enable_lora_streaming: false
+```
+This reduces networking overhead and focuses the trainer entirely on saving local checkpoints.
+
+**Step 2: Locate your Checkpoint**
+After training is complete, your adapter weights are saved under the project's `output_dir`.
+- Locate the final checkpoint: `output/infinitune-qual-domain/checkpoint-final`
+
+**Step 3: Run Inference Server**
+Launch `inference.py` and pass the mapped checkpoint using the `--checkpoint` flag. This natively bypasses Kafka and locks the adapter statically:
+```bash
+python inference.py --config configs/imdb_qualitative.yaml --checkpoint output/infinitune-qual-domain/checkpoint-final
+```
+
+**Step 4: Test the Endpoint**
+```bash
+curl -X POST http://localhost:5000/generate \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "Your test prompt here"}'
+```

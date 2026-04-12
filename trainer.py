@@ -683,6 +683,9 @@ def train_model(config, config_path: str = "(unknown)"):
 
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
+                # Crucial step: Clip gradients to prevent fp16 explosions causing NaN loss
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -735,10 +738,20 @@ def train_model(config, config_path: str = "(unknown)"):
                 if qual_evaluator.enabled and optimization_step % qual_evaluator.eval_interval == 0:
                     _log_qual_eval(optimization_step)
 
+                # Periodic aggressive garbage collection on Apple Silicon / memory constrained GPUs
+                if optimization_step % 50 == 0:
+                    import gc
+                    gc.collect()
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                    elif torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
             # Every weight_push_interval seconds, send the current LoRA adapter weights.
             if time.time() - last_send_time >= weight_push_interval:
-                _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
-                lora_producer.send_weights(get_peft_model_state_dict(model))
+                if kafka_cfg.get('enable_lora_streaming', True):
+                    _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
+                    lora_producer.send_weights(get_peft_model_state_dict(model))
                 last_send_time = time.time()
 
     except KeyboardInterrupt:
@@ -774,11 +787,14 @@ def train_model(config, config_path: str = "(unknown)"):
         except Exception as e:
             _log(f"Warning: Failed to save final checkpoint: {e}")
 
-    # 2. Send final LoRA weights + done signal to inference server via Kafka.
+    # 2. Send final LoRA weights + done signal to inference server via Kafka (if enabled).
     try:
-        _log("Training complete. Sending final adapter weights.")
-        lora_producer.send_weights(get_peft_model_state_dict(model))
-        lora_producer.send_done_signal()
+        if kafka_cfg.get('enable_lora_streaming', True):
+            _log("Training complete. Sending final adapter weights.")
+            lora_producer.send_weights(get_peft_model_state_dict(model))
+            lora_producer.send_done_signal()
+        else:
+            _log("Training complete. LoRA streaming disabled, skipping final Kafka push.")
     except Exception as e:
         _log(f"Warning: Failed to send final weights / done signal: {e}")
 

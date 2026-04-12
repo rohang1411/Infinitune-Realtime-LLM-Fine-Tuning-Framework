@@ -673,4 +673,12 @@ class Evaluator:
                 _log(f"  {k}: {v}")
         _log("--- End Eval ---")
 
+        # Aggressive memory cleanup after generation passes
+        import gc
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return metrics if metrics else None

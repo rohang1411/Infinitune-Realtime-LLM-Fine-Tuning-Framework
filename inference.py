@@ -254,6 +254,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Inference Server")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to a saved LoRA adapter checkpoint (bypasses Kafka inference)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -305,15 +307,19 @@ if __name__ == "__main__":
         _log(f"FATAL: Failed to load base model or tokenizer: {e}")
         exit(1) # Exit if model loading fails
 
-    # 2. Apply the initial LoRA configuration to the base model
+    # 2. Apply the initial LoRA configuration to the base model (or load from checkpoint)
     _log("Applying initial LoRA configuration...")
     try:
-        model = get_peft_model(base_model, LORA_CONFIG)
+        if args.checkpoint:
+            _log(f"Loading standalone checkpoint from disk: {args.checkpoint}")
+            model = PeftModel.from_pretrained(base_model, args.checkpoint)
+            _log("Model checkpoint loaded successfully.")
+        else:
+            model = get_peft_model(base_model, LORA_CONFIG)
+            model.print_trainable_parameters() 
         model.eval() # Set the model to evaluation mode
-        _log("Model loaded and LoRA configured.")
-        model.print_trainable_parameters() 
     except Exception as e:
-        _log(f"FATAL: Failed to apply LoRA config: {e}")
+        _log(f"FATAL: Failed to apply LoRA config / checkpoint: {e}")
         exit(1)
 
     # Assign to global variables for access by Flask routes
@@ -326,19 +332,22 @@ if __name__ == "__main__":
     model_lock_global = model_lock
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
-    #    These threads stop automatically when the trainer sends a '__done__' signal.
-    consumer_thread = threading.Thread(
-        target=kafka_consumer_thread,
-        args=(update_queue, config),
-        daemon=True
-    )
-    applier_thread = threading.Thread(
-        target=weight_application_thread,
-        args=(model_global, update_queue, model_lock_global, DEVICE),
-        daemon=True
-    )
-    consumer_thread.start()
-    applier_thread.start()
+    #    We skip this entirely if a standalone --checkpoint was provided.
+    if args.checkpoint:
+        _log("Standalone mode (--checkpoint provided). Skipping Kafka consumer threads.")
+    else:
+        consumer_thread = threading.Thread(
+            target=kafka_consumer_thread,
+            args=(update_queue, config),
+            daemon=True
+        )
+        applier_thread = threading.Thread(
+            target=weight_application_thread,
+            args=(model_global, update_queue, model_lock_global, DEVICE),
+            daemon=True
+        )
+        consumer_thread.start()
+        applier_thread.start()
 
     FLASK_HOST = inference_cfg.get('host', 'localhost')
     FLASK_PORT = inference_cfg.get('port', 5000)

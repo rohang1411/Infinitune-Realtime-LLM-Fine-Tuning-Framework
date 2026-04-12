@@ -70,6 +70,7 @@ kafka:
     - "localhost:9092"
   training_topic: "training-data-gsm8k"
   lora_updates_topic: "lora-updates-gsm8k"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
   producer_send_interval: 0.1
   consumer_group_trainer: "trainer-group"
   consumer_group_inference: "inference-api-group"

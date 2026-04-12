@@ -312,3 +312,33 @@ python utils/plot_metrics.py output/qual_reasoning/logs/infinitune-qual-reasonin
 | Exact match plateau at ~5% | Model learns format but not arithmetic | More training steps needed; consider `max_steps: 750` |
 | OOM during qualitative eval | 3B model + 250-token generation is heavy | Reduce `eval_samples: 10` in `testing_strategy` block |
 | Both evals running simultaneously cause slowdowns | Quant and qual eval windows interleave | Set `testing_strategy.eval_interval: 100` to stagger them |
+
+
+## Standalone Inference via Checkpoints
+
+If you prefer to serve the model strictly off a saved checkpoint rather than using real-time Kafka streaming, you can use the decoupled inference mode. 
+
+**Step 1: Disable LoRA Streaming (Optional but Recommended)**
+In your YAML configuration file under the `kafka` block, ensure streaming is turned off:
+```yaml
+kafka:
+  enable_lora_streaming: false
+```
+This reduces networking overhead and focuses the trainer entirely on saving local checkpoints.
+
+**Step 2: Locate your Checkpoint**
+After training is complete, your adapter weights are saved under the project's `output_dir`.
+- Locate the final checkpoint: `output/infinitune-qual-reasoning/checkpoint-final`
+
+**Step 3: Run Inference Server**
+Launch `inference.py` and pass the mapped checkpoint using the `--checkpoint` flag. This natively bypasses Kafka and locks the adapter statically:
+```bash
+python inference.py --config configs/gsm8k_qualitative.yaml --checkpoint output/infinitune-qual-reasoning/checkpoint-final
+```
+
+**Step 4: Test the Endpoint**
+```bash
+curl -X POST http://localhost:5000/generate \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "Your test prompt here"}'
+```
