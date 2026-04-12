@@ -130,6 +130,7 @@ inference:
 # meaningless for open-ended instruction following.
 evaluation:
   enabled: true
+  decoupled: false             # If true, disables inline eval during training (run evaluate.py later)
   strategy: "perplexity"       # Forward-pass loss only; no generation needed
   eval_interval: 50
   eval_pool_size: 50

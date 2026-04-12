@@ -488,11 +488,19 @@ def train_model(config, config_path: str = "(unknown)"):
     response_template = Template(preproc_cfg.get('response_template', ' {{ target }}'))
     _log("Jinja2 templates compiled (prompt_template + response_template).")
 
+    is_decoupled = config.get("evaluation", {}).get("decoupled", False)
+    if is_decoupled:
+        _log("Decoupled evaluation flag is TRUE. All inline evaluation during training will be skipped.")
+
     # Initialize quantitative evaluator
     evaluator = Evaluator(config, tokenizer, device, tokenize_with_label_masking, pad_batch)
+    if is_decoupled:
+        evaluator.enabled = False
 
     # Initialize qualitative evaluator (no-op if testing_strategy block absent or disabled)
     qual_evaluator = QualitativeEvaluator(config, tokenizer, device)
+    if is_decoupled:
+        qual_evaluator.enabled = False
 
     # Initialize CheckpointManager — saves LoRA adapters every N steps.
     # Enabled by default (save_checkpoints.enabled: true); disable explicitly

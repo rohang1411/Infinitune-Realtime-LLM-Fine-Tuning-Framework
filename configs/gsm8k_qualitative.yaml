@@ -127,6 +127,7 @@ inference:
 # qualitative reasoning quality signals.
 evaluation:
   enabled: true
+  decoupled: false             # If true, disables inline eval during training (run evaluate.py later)
   strategy: "regex_extract"    # Extract and match the final numeric answer
   eval_interval: 50
   eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)

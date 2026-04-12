@@ -105,6 +105,7 @@ inference:
 # --- Evaluation (Polymorphic) ---
 evaluation:
   enabled: true
+  decoupled: false # If true, disables inline eval during training (run evaluate.py later)
   strategy: "class_match" # class_match | regex_extract | perplexity
   eval_interval: 50 # evaluate every N optimizer steps
   eval_pool_size: 5000 # total samples loaded from eval split (shuffled)
