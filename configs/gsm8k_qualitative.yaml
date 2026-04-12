@@ -43,8 +43,10 @@ lora:
   dropout: 0.05
   bias: "none"
   target_modules:
-    - "c_attn"                # GPT-2 combined QKV projection
-    - "c_proj"                # GPT-2 output projection
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
 
 # --- Dataset ---
 dataset:
