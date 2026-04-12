@@ -106,7 +106,11 @@ training:
     type: "cosine_with_warmup"
     warmup_steps: 50
     min_lr_ratio: 0.01
-    T_max: 500                   # must match max_steps for full decay curve
+    T_max: 1000                   # must match max_steps for full decay curve
+  save_checkpoints:
+    enabled: true                # Save LoRA adapter to disk periodically
+    save_every_steps: 100        # ~5 checkpoints over 500 steps
+    save_final: true             # Always save a 'final' checkpoint at training end
 
 # --- Inference ---
 inference:

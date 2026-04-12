@@ -1,6 +1,6 @@
 # InfiniTune — Realtime LLM Fine-Tuning Framework
 
-A distributed framework for **continuously fine-tuning Large Language Models in real time** using Kafka data streams and QLoRA (Quantized Low-Rank Adaptation). As new training data arrives, the model adapts on-the-fly and the inference server receives updated adapter weights automatically — no restarts required.
+A distributed framework for **continuously fine-tuning Large Language Models in real time** using Kafka data streams and LoRA (Low-Rank Adaptation). As new training data arrives, the model adapts on-the-fly and the inference server receives updated adapter weights automatically — no restarts required.
 
 ---
 
@@ -8,18 +8,26 @@ A distributed framework for **continuously fine-tuning Large Language Models in 
 
 1. [What is InfiniTune?](#what-is-infinitune)
 2. [Architecture](#architecture)
-3. [Dependencies](#dependencies)
-4. [Kafka Setup](#kafka-setup)
-   - [macOS (KRaft mode — No Zookeeper)](#macos-kraft-mode--no-zookeeper)
-   - [Windows (KRaft mode — No Zookeeper)](#windows-kraft-mode--no-zookeeper)
+3. [Project Structure](#project-structure)
+4. [Dependencies](#dependencies)
+5. [Kafka Setup](#kafka-setup)
+   - [macOS (KRaft mode)](#macos-kraft-mode--no-zookeeper)
+   - [Windows (KRaft mode)](#windows-kraft-mode--no-zookeeper)
    - [Windows (Legacy — with Zookeeper)](#windows-legacy--with-zookeeper)
-5. [Running InfiniTune](#running-infinitune)
-6. [Qualitative Evaluation Suite](#qualitative-evaluation-suite)
-   - [Overview](#overview)
+6. [Running InfiniTune](#running-infinitune)
+   - [Quick Start](#quick-start)
+   - [Available Configs](#available-configs)
+   - [Key Config Options](#key-config-options)
+7. [Checkpoint Saving](#checkpoint-saving)
+8. [Evaluation Modes](#evaluation-modes)
+   - [Inline Evaluation (during training)](#inline-evaluation-during-training)
+   - [Decoupled Evaluation (after training)](#decoupled-evaluation-after-training)
+9. [Qualitative Evaluation Suite](#qualitative-evaluation-suite)
    - [The Three Proxy Strategies](#the-three-proxy-strategies)
    - [Running the Qualitative Configs](#running-the-qualitative-configs)
    - [Interpreting the Metrics](#interpreting-the-metrics)
-   - [Reading the CSV and Plots](#reading-the-csv-and-plots)
+10. [Output Directory Structure](#output-directory-structure)
+11. [Regenerating Plots](#regenerating-plots)
 
 ---
 
@@ -32,46 +40,120 @@ It is built around three decoupled services that communicate over Kafka:
 | Service | Script | Role |
 |---|---|---|
 | **Producer** | `producer.py` | Streams training samples from a HuggingFace dataset to a Kafka topic |
-| **Trainer** | `trainer.py` | Consumes data from Kafka, fine-tunes the model with QLoRA, and pushes updated LoRA adapter weights back to Kafka |
+| **Trainer** | `trainer.py` | Consumes data from Kafka, fine-tunes the model with LoRA, saves checkpoints, and pushes updated LoRA adapter weights back to Kafka |
 | **Inference Server** | `inference.py` | Loads the base model + LoRA adapter, serves a REST API, and hot-swaps adapter weights in real time as the trainer pushes updates |
+
+A fourth standalone script handles post-training evaluation:
+
+| Script | Role |
+|---|---|
+| `evaluate.py` | Loads any saved checkpoint and runs the full evaluation suite (quantitative + qualitative) without re-training |
 
 Key properties:
 - **Online (streaming) learning** — the model improves continuously as data flows in
-- **Memory-efficient** — uses LoRA adapters (only a fraction of model params are trained)
-- **Config-driven** — all hyperparameters, dataset settings, and topology are defined in a single YAML file
-- **Multi-task** — pre-built configs for IMDb, GSM8K, UltraChat, and qualitative evaluation variants
-- **Dual evaluation** — quantitative metrics (Accuracy, Perplexity, Exact Match) AND qualitative proxy metrics (Semantic Similarity, Keyword Density, CoT Structure)
+- **Memory-efficient** — uses LoRA adapters (only a fraction of model parameters are trained)
+- **Config-driven** — all hyperparameters, dataset settings, and evaluation logic are defined in a single YAML file
+- **Multi-task** — pre-built configs for IMDb, GSM8K, Alpaca, and qualitative evaluation variants
+- **Dual evaluation modes** — inline (during training) and decoupled (after training via `evaluate.py`)
+- **Versioned outputs** — training logs, checkpoints, and evaluation results are all versioned and never overwrite previous runs
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐   training data    ┌───────────────────┐   LoRA weights    ┌───────────────────┐
-│  Producer   │ ─────────────────► │  Kafka Broker     │ ────────────────► │  Inference Server │
+┌─────────────┐   training data    ┌────────────────────┐   LoRA weights    ┌───────────────────┐
+│  Producer   │ ─────────────────► │   Kafka Broker     │ ────────────────► │  Inference Server │
 │ producer.py │                    │  (localhost:9092)  │                   │  inference.py     │
-└─────────────┘                    └────────┬──────────┘                   └───────────────────┘
-                                            │ training data
-                                            ▼
-                                   ┌─────────────────┐
-                                   │    Trainer       │
-                                   │   trainer.py     │
-                                   │  (QLoRA + AdamW) │
-                                   │                  │
-                                   │  ┌────────────┐  │
-                                   │  │ Quant.Eval │  │  ← eval_metrics_train.py
-                                   │  └────────────┘  │
-                                   │  ┌────────────┐  │
-                                   │  │ Qual. Eval │  │  ← eval_qualitative.py
-                                   │  └────────────┘  │
-                                   └─────────────────┘
+└─────────────┘                    └──────────┬─────────┘                   └───────────────────┘
+                                              │ training data
+                                              ▼
+                                   ┌───────────────────────────┐
+                                   │        Trainer             │
+                                   │       trainer.py           │
+                                   │      (LoRA + AdamW)        │
+                                   │                            │
+                                   │  ┌─────────────────────┐  │
+                                   │  │  Inline: Quant.Eval  │  │  ← eval_metrics_train.py
+                                   │  └─────────────────────┘  │
+                                   │  ┌─────────────────────┐  │
+                                   │  │  Inline: Qual. Eval  │  │  ← eval_qualitative.py
+                                   │  └─────────────────────┘  │
+                                   │  ┌─────────────────────┐  │
+                                   │  │  CheckpointManager   │  │  ← utils/checkpoint_manager.py
+                                   │  └──────────┬──────────┘  │
+                                   └─────────────┼─────────────┘
+                                                 │ saves LoRA adapter
+                                                 ▼
+                                      output/<project>/checkpoints/
+                                         step_000100/
+                                         step_000200/
+                                         final/
+                                                 │
+                                    ┌────────────┘
+                                    │  loads checkpoint
+                                    ▼
+                           ┌─────────────────┐
+                           │   evaluate.py    │
+                           │  (no Kafka, no  │
+                           │   re-training)  │
+                           │                 │
+                           │  Quant. + Qual. │
+                           │  full-pool eval  │
+                           └─────────────────┘
+                                    │ saves results
+                                    ▼
+                           output/<project>/eval_results/
+                               step_000200/
+                                 eval_20260412-150230_a3f2/
+                                   eval_results.json
+                                   plots/*.png
 ```
 
-**Data flow:**
-1. `producer.py` reads a dataset, applies filtering/templating, and publishes samples to the `training-data` Kafka topic.
-2. `trainer.py` consumes samples from Kafka, runs a forward+backward pass, and every N seconds pushes updated LoRA adapter weights to the `lora-updates` Kafka topic.
-3. `inference.py` listens to the `lora-updates` topic in a background thread and hot-applies weight updates to the live model, while serving generation requests on a Flask REST API at `http://localhost:5000`.
+**Data flow during training:**
+1. `producer.py` reads a HuggingFace dataset, applies filtering and templating, and publishes samples to the `training-data` Kafka topic.
+2. `trainer.py` consumes samples from Kafka, runs a forward+backward pass, and every N steps:
+   - Saves the LoRA adapter checkpoint to `output/<project>/checkpoints/`
+   - Pushes updated LoRA adapter weights to the `lora-updates` Kafka topic
+3. `inference.py` hot-applies weight updates to the live model while serving generation requests on a Flask REST API at `http://localhost:5000`.
 4. Both quantitative and qualitative evaluation run **inside the trainer** on configurable intervals, writing results to a unified CSV log.
+
+**After training:**
+5. `evaluate.py` loads any saved checkpoint, runs the full evaluation suite, and saves versioned results to `output/<project>/eval_results/`.
+
+---
+
+## Project Structure
+
+```
+InfiniTune/
+├── producer.py                    # Data streaming service
+├── trainer.py                     # Training + inline eval + checkpoint saving
+├── inference.py                   # REST API + live LoRA weight updates
+├── evaluate.py                    # Standalone decoupled evaluation script
+│
+├── configs/
+│   ├── imdb_config.yaml           # IMDb sentiment classification
+│   ├── gsm8k_config.yaml          # GSM8K math reasoning
+│   ├── config_qualitative_chat.yaml     # Alpaca instruction following
+│   ├── config_qualitative_domain.yaml   # IMDb unconditional language model
+│   └── config_qualitative_reasoning.yaml # GSM8K + CoT structure metrics
+│
+├── utils/
+│   ├── checkpoint_manager.py      # Versioned LoRA adapter save/load
+│   ├── eval_metrics_train.py      # Quantitative evaluation (Evaluator class)
+│   ├── eval_qualitative.py        # Qualitative evaluation (strategies + orchestrator)
+│   ├── plot_metrics.py            # Standalone plot regeneration utility
+│   └── stream_filter.py           # Kafka data quality filtering
+│
+├── output/                        # All generated artefacts (git-ignored)
+│   └── <project>/
+│       ├── checkpoints/           # Saved LoRA adapters
+│       ├── logs/                  # Training metrics CSVs + plots
+│       └── eval_results/          # Decoupled evaluation results
+│
+└── requirements.txt
+```
 
 ---
 
@@ -91,8 +173,6 @@ Install all Python dependencies with:
 pip install -r requirements.txt
 ```
 
-`requirements.txt` includes:
-
 | Package | Purpose |
 |---|---|
 | `torch` | Model training and inference |
@@ -105,16 +185,17 @@ pip install -r requirements.txt
 | `trl` | Trainer utilities |
 | `matplotlib` | Training metrics plots |
 | `sentence-transformers` | Semantic similarity evaluation (MiniLM, CPU-only) |
+| `jinja2` | Prompt and response templating |
 
-> **`sentence-transformers`** is only required for the `semantic_similarity` qualitative strategy (`config_qualitative_chat.yaml`). The other qualitative configs (`keyword_density`, `structural_cot`) use pure string operations with zero extra dependencies. The import is guarded — if the package is absent, only the semantic similarity strategy will fail at runtime.
+> **`sentence-transformers`** is only needed for the `semantic_similarity` qualitative strategy. The other two strategies use pure string operations. The import is guarded — if the package is absent, only the semantic similarity strategy will fail at runtime.
 
-> **macOS (Apple Silicon):** PyTorch MPS backend is used automatically when CUDA is unavailable. No extra steps needed.
+> **macOS (Apple Silicon):** PyTorch MPS backend is used automatically when CUDA is unavailable. All qualitative metrics are CPU-only and do not compete with training for MPS memory.
 
 ---
 
 ## Kafka Setup
 
-InfiniTune uses Kafka as the data backbone. Kafka 3.3+ supports **KRaft mode** (no Zookeeper required), which is the recommended approach.
+InfiniTune uses Kafka as the data backbone. Kafka 3.3+ supports **KRaft mode** (no Zookeeper required).
 
 ### macOS (KRaft mode — No Zookeeper)
 
@@ -126,13 +207,11 @@ brew install kafka
 
 #### 2. Add Kafka to PATH
 
-Add this line to your `~/.zshrc` (or `~/.bashrc`):
+Add to your `~/.zshrc`:
 
 ```bash
 export PATH="/opt/homebrew/opt/kafka/bin:$PATH"
 ```
-
-Then apply it:
 
 ```bash
 source ~/.zshrc
@@ -140,30 +219,22 @@ source ~/.zshrc
 
 #### 3. Format Storage (One-time only)
 
-This initialises the KRaft metadata log. Only needed on first use.
-
 ```bash
-# Generate a unique cluster ID
 KAFKA_CLUSTER_ID="$(kafka-storage random-uuid)"
-
-# Format the storage directory
 kafka-storage format -t $KAFKA_CLUSTER_ID -c /opt/homebrew/etc/kafka/server.properties
 ```
 
-> **Note:** If you get `"Log directory is already formatted"`, you can skip this step — the storage is already initialised.
+> If you get `"Log directory is already formatted"`, skip this step.
 
 #### 4. Start Kafka
 
-**Option A — Background service (recommended):**
+**Background service (recommended):**
 ```bash
-# Stop Zookeeper if it was previously started
-brew services stop zookeeper
-
-# Start Kafka as a background service
+brew services stop zookeeper  # ensure zookeeper is off
 brew services start kafka
 ```
 
-**Option B — Foreground (useful for debugging, see live logs):**
+**Foreground (for debugging):**
 ```bash
 kafka-server-start /opt/homebrew/etc/kafka/server.properties
 ```
@@ -173,8 +244,6 @@ kafka-server-start /opt/homebrew/etc/kafka/server.properties
 ```bash
 kafka-topics --bootstrap-server localhost:9092 --list
 ```
-
-If Kafka is running, you'll see a (possibly empty) list of topics with no errors.
 
 #### Stop Kafka
 
@@ -186,33 +255,22 @@ brew services stop kafka
 
 ### Windows (KRaft mode — No Zookeeper)
 
-Kafka 3.3+ on Windows also supports KRaft mode. This is the recommended approach.
-
 #### 1. Install Java
 
-Download and install **JDK 11+** from [adoptium.net](https://adoptium.net/) or [Oracle](https://www.oracle.com/java/technologies/downloads/).
-
-Set the environment variable:
-```
-JAVA_HOME = C:\Program Files\Eclipse Adoptium\jdk-21.x.x  (or your JDK path)
-```
+Download **JDK 11+** from [adoptium.net](https://adoptium.net/) and set `JAVA_HOME`.
 
 #### 2. Download Kafka
 
-1. Go to [kafka.apache.org/downloads](https://kafka.apache.org/downloads)
-2. Download the latest binary (`.tgz`) and extract it to `C:\kafka`
+Download the latest binary from [kafka.apache.org/downloads](https://kafka.apache.org/downloads) and extract to `C:\kafka`.
 
 #### 3. Format Storage (One-time only)
 
-Open a Command Prompt and run:
-
 ```bat
 cd C:\kafka
-
 .\bin\windows\kafka-storage.bat random-uuid
 ```
 
-Copy the UUID printed, then format the storage:
+Copy the UUID, then:
 
 ```bat
 .\bin\windows\kafka-storage.bat format -t <YOUR_UUID_HERE> -c .\config\server.properties
@@ -220,21 +278,14 @@ Copy the UUID printed, then format the storage:
 
 #### 4. Start Kafka
 
-Open a Command Prompt:
-
 ```bat
 cd C:\kafka
 .\bin\windows\kafka-server-start.bat .\config\server.properties
 ```
 
-Keep this window open while using InfiniTune.
-
 #### 5. Verify
 
-Open a new Command Prompt:
-
 ```bat
-cd C:\kafka
 .\bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
 ```
 
@@ -242,107 +293,236 @@ cd C:\kafka
 
 ### Windows (Legacy — with Zookeeper)
 
-> Use this only if you are on Kafka < 3.3 or require Zookeeper for another reason.
-
-#### 1. Start Zookeeper
+> Use only for Kafka < 3.3.
 
 ```bat
-cd C:\kafka
+# Terminal 1
 .\bin\windows\zookeeper-server-start.bat .\config\zookeeper.properties
-```
 
-#### 2. Start Kafka (in a new terminal)
-
-```bat
-cd C:\kafka
+# Terminal 2
 .\bin\windows\kafka-server-start.bat .\config\server.properties
 ```
-
-> **Troubleshooting:** If you encounter issues with `wmic` on Windows 11, consider using **WSL 2** or **Docker** for better compatibility.
 
 ---
 
 ## Running InfiniTune
 
-### 1. Prerequisites
+### Quick Start
 
-Make sure:
-- Kafka is running on `localhost:9092`
-- Python dependencies are installed (`pip install -r requirements.txt`)
-- You have chosen a config file from `configs/` (e.g., `configs/imdb_config.yaml`)
+Make sure Kafka is running, then open **three separate terminals**:
 
-### 2. Launch the Services
-
-Open **three separate terminals** and run each command in order:
-
-**Terminal 1 — Start the Inference Server first** *(starts listening for weight updates)*
+**Terminal 1 — Inference Server** *(start first — it listens for weight updates)*
 ```bash
 python inference.py --config configs/imdb_config.yaml
 ```
 
-**Terminal 2 — Start the Trainer** *(loads model, waits for data from Kafka)*
+**Terminal 2 — Trainer** *(loads model, connects to Kafka, waits for data)*
 ```bash
 python trainer.py --config configs/imdb_config.yaml
 ```
 
-**Terminal 3 — Start the Producer** *(streams training data into Kafka)*
+> The trainer logs `>>> Start the producer now (if not already running). <<<` when it is ready.
+
+**Terminal 3 — Producer** *(streams training data)*
 ```bash
 python producer.py --config configs/imdb_config.yaml
 ```
 
-> The trainer logs `>>> Start the producer now (if not already running). <<<` when it is ready. Start the producer after you see this.
-
-### 3. Test the Inference API
-
-**Terminal 4 — Send a generation request:**
+**Terminal 4 — Test the API** *(optional)*
 ```bash
 curl -X POST http://localhost:5000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Review: This movie was absolutely terrible.\nSentiment:"}'
-```
 
-**Health check:**
-```bash
 curl http://localhost:5000/health
+# Expected: {"status": "ok"}
 ```
-
-Expected response: `{"status": "ok"}`
 
 ### Available Configs
 
 | Config | Task | Dataset | Eval Type |
 |---|---|---|---|
-| `configs/imdb_config.yaml` | Sentiment classification | IMDb (25k reviews) | Quantitative (Accuracy, F1) |
-| `configs/gsm8k_config.yaml` | Math reasoning | GSM8K (grade school math) | Quantitative (Exact Match) |
-| `configs/config_qualitative_chat.yaml` | Instruction following | Alpaca (52k) | Qualitative (Semantic Similarity) + Perplexity |
-| `configs/config_qualitative_domain.yaml` | Domain adaptive generation | IMDb (unconditional LM) | Qualitative (Keyword Density + TTR) + Perplexity |
-| `configs/config_qualitative_reasoning.yaml` | Math reasoning + CoT structure | GSM8K | Qualitative (CoT Adherence) + Quantitative (Exact Match) |
+| `configs/imdb_config.yaml` | Sentiment classification | IMDb (25k reviews) | Quantitative (Accuracy, F1, MCC) |
+| `configs/gsm8k_config.yaml` | Math reasoning | GSM8K (8.5k problems) | Quantitative (Exact Match) |
+| `configs/config_qualitative_chat.yaml` | Instruction following | Alpaca (52k) | Qualitative (Semantic Similarity) |
+| `configs/config_qualitative_domain.yaml` | Domain adaptive generation | IMDb (unconditional LM) | Qualitative (Keyword Density + TTR) |
+| `configs/config_qualitative_reasoning.yaml` | Math reasoning + CoT structure | GSM8K | Qualitative (CoT Adherence) + Quantitative |
 
 ### Key Config Options
 
-Edit the config YAML to tune the framework. The most useful fields:
-
 ```yaml
+project:
+  name: "my-run"
+  output_dir: "./output/my-run"    # All logs, checkpoints, and eval results go here
+
+model:
+  name: "distilgpt2"               # Any HuggingFace CausalLM model
+  max_seq_length: 512
+
+lora:
+  r: 8                             # Adapter rank (higher = more capacity, more memory)
+  alpha: 64                        # Scaling factor (effective LR = alpha/r × learning_rate)
+  target_modules: [c_attn, c_proj] # Which linear layers to adapt
+
 training:
-  batch_size: 8                    # mini-batch size
-  gradient_accumulation_steps: 4   # effective batch = batch_size x grad_accum
+  batch_size: 8
+  gradient_accumulation_steps: 4   # Effective batch = batch_size × grad_accum
   learning_rate: 1e-4
   max_steps: 2000
+  test_mode: true                  # true = train on entire dataset, stop on EOF
   lr_scheduler:
     type: "cosine_with_warmup"     # cosine_with_warmup | linear | constant
     warmup_steps: 50
-    T_max: 1000
+    T_max: 2000                    # Must match max_steps for full cosine decay
+  save_checkpoints:
+    enabled: true                  # Save LoRA adapter periodically (default: true)
+    save_every_steps: 200          # Checkpoint every N optimizer steps
+    save_final: true               # Always save a 'final' checkpoint at training end
 
-lora:
-  r: 8                             # adapter rank (higher = more capacity, more memory)
-  alpha: 64                        # scaling factor (effective LR multiplier = alpha/r)
-  target_modules: [c_attn, c_proj] # which layers to adapt
+evaluation:                        # Inline quantitative eval during training
+  enabled: true
+  strategy: "class_match"          # class_match | regex_extract | perplexity
+  eval_interval: 50
+  eval_pool_size: 5000
+  eval_batch_size: 100
+```
 
+---
+
+## Checkpoint Saving
+
+During training, the **LoRA adapter** (not the full base model) is saved to disk automatically. Adapter files are tiny (~5–20 MB) compared to the full model (~500 MB for distilgpt2).
+
+**What is saved at each checkpoint:**
+- `adapter_model.safetensors` — LoRA adapter weights
+- `adapter_config.json` — PEFT adapter configuration
+- `checkpoint_meta.json` — step number, timestamp, model name, dataset name, and loss
+
+**Directory layout:**
+```
+output/<project>/checkpoints/<model>__<dataset>/
+    step_000100/         ← saved at step 100
+    step_000200/         ← saved at step 200
+    ...
+    final/               ← always saved at training end (overwrites previous 'final')
+```
+
+**No-overwrite policy:**
+- Step directories (`step_000100/`, etc.) are **never overwritten**. If a checkpoint already exists for a step from a previous run, the current run skips it and logs a message.
+- The `final/` checkpoint is the only exception — it always reflects the latest training endpoint.
+
+**Config:**
+```yaml
+training:
+  save_checkpoints:
+    enabled: true           # Set to false to skip all checkpoint saving
+    save_every_steps: 100   # How often to save
+    save_final: true        # Whether to save 'final' at the end
+```
+
+---
+
+## Evaluation Modes
+
+InfiniTune supports two evaluation modes that are **fully independent** — you can use one or both.
+
+### Inline Evaluation (during training)
+
+Runs automatically inside `trainer.py` on a configurable interval. Useful for monitoring training progress in real time.
+
+- **Quantitative** (`evaluation` block): every `eval_interval` steps, evaluates loss, perplexity, accuracy, F1, exact match, etc.
+- **Qualitative** (`testing_strategy` block): every `testing_strategy.eval_interval` steps, generates responses and computes proxy metrics.
+- Results are written to `output/<project>/logs/.../metrics.csv` after each eval event.
+- Plots are generated automatically at the end of the training run.
+
+**To disable inline evaluation** (for maximum training speed):
+```yaml
 evaluation:
-  eval_interval: 50                # evaluate every N steps
-  eval_pool_size: 5000             # total eval samples loaded at startup
-  eval_batch_size: 100             # samples evaluated per step (sliding window)
-  verbose: false                   # set to true to print per-sample predictions
+  enabled: false
+
+testing_strategy:
+  enabled: false
+```
+
+---
+
+### Decoupled Evaluation (after training)
+
+Run `evaluate.py` to evaluate any saved checkpoint without re-training. Useful when:
+- You want to evaluate with updated metrics logic
+- You want to compare multiple checkpoints
+- You want definitive full-pool scores (not windowed)
+
+**Key differences from inline evaluation:**
+| Feature | Inline | Decoupled |
+|---|---|---|
+| When it runs | During training | After training |
+| Eval pool coverage | Sliding window (eval_batch_size samples) | Full pool (all samples) |
+| Kafka required | Yes | No |
+| Results location | `logs/.../metrics.csv` | `eval_results/.../eval_results.json` |
+| Re-runnable | No (runs once per step) | Yes (each run creates a new versioned directory) |
+
+#### Usage
+
+```bash
+# Evaluate the 'final' checkpoint (default)
+python evaluate.py --config configs/imdb_config.yaml
+
+# Evaluate a specific step
+python evaluate.py --config configs/imdb_config.yaml --step 200
+
+# Evaluate a specific checkpoint directory
+python evaluate.py --config configs/imdb_config.yaml \
+    --checkpoint-dir output/imdb/checkpoints/distilgpt2__stanfordnlp_imdb/step_000200
+
+# Evaluate ALL checkpoints (produces per-checkpoint results + combined plots + CSV)
+python evaluate.py --config configs/imdb_config.yaml --all-checkpoints
+
+# List available checkpoints without evaluating
+python evaluate.py --config configs/imdb_config.yaml --list
+```
+
+#### Output
+
+Each evaluation run creates a **new versioned directory** — never overwriting previous runs:
+
+```
+output/<project>/eval_results/<model>__<dataset>/
+    step_000200/
+        eval_20260412-150230_a3f2/      ← timestamp + random suffix
+            eval_results.json           ← all metric values
+            eval_config.json            ← config used for this eval
+            plots/
+                accuracy.png
+                perplexity.png
+                qual_semantic_similarity.png
+                ...
+    final/
+        eval_20260412-160010_b7e1/
+            ...
+    all_checkpoints/                    ← only with --all-checkpoints
+        eval_20260412-161500_c2d9/
+            all_checkpoints_results.csv ← one row per checkpoint
+            plots/
+                accuracy.png            ← accuracy vs step across all checkpoints
+                ...
+```
+
+#### Reading `eval_results.json`
+
+```json
+{
+  "checkpoint_path": "output/imdb/checkpoints/distilgpt2__stanfordnlp_imdb/step_000200",
+  "eval_timestamp": "2026-04-12T15:02:30",
+  "metrics": {
+    "eval_loss": 1.2456,
+    "perplexity": 3.472,
+    "accuracy": 0.73,
+    "f1": 0.724,
+    "mcc": 0.467,
+    "exact_match": 0.71
+  }
+}
 ```
 
 ---
@@ -351,16 +531,14 @@ evaluation:
 
 ### Overview
 
-InfiniTune includes a **Qualitative Evaluation Suite** that measures improvement in tone, style, and reasoning structure — without any LLM API calls and with minimal RAM overhead. This is particularly useful when the model is learning to *write* rather than *classify*, where traditional accuracy metrics are meaningless.
+The Qualitative Evaluation Suite measures improvement in tone, style, and reasoning structure — without LLM API calls and with minimal RAM overhead.
 
-**Design constraints met:**
+**Design constraints:**
 - Zero LLM API calls (no GPT-4, no Claude)
-- All proxy metrics run entirely on CPU
-- The SentenceTransformers model (for semantic similarity) is explicitly pinned to `device="cpu"` — it never touches GPU VRAM
-- Total extra RAM for qualitative eval: ~90 MB (MiniLM model) for semantic similarity only; 0 extra MB for the other two strategies
-- Non-blocking: qualitative eval runs at its own `testing_strategy.eval_interval` cadence, fully independent from the quantitative eval loop
-
-The implementation follows the **Strategy Pattern**: `utils/eval_qualitative.py` contains an abstract base class (`QualitativeMetric`) and three concrete strategy classes. A `QualitativeEvaluator` factory reads the `testing_strategy.method` field from the YAML config and instantiates the correct class at startup.
+- All proxy metrics run on CPU — no VRAM competition with training
+- SentenceTransformers (MiniLM) is explicitly pinned to `device="cpu"` (~90 MB RAM)
+- 0 extra MB for keyword density and CoT structure strategies
+- Independent eval interval from quantitative eval
 
 ---
 
@@ -368,68 +546,68 @@ The implementation follows the **Strategy Pattern**: `utils/eval_qualitative.py`
 
 #### 1. Semantic Similarity — `config_qualitative_chat.yaml`
 
-**Dataset:** `tatsu-lab/alpaca` (52k instruction-following examples)
+**Dataset:** `tatsu-lab/alpaca` (52k instruction-following examples)  
 **Model:** `sentence-transformers/all-MiniLM-L6-v2` (CPU, ~90 MB)
 
-The model generates a response to an instruction prompt. That response is compared to the golden ground-truth output from the dataset using **cosine similarity of sentence embeddings**.
+The model generates a response to an instruction. That response is compared to the golden output using **cosine similarity of sentence embeddings**.
 
 ```
 Instruction ─► model generates response
-                        |
+                        │
 Generated: "Python is a programming language..."
 Reference: "Python is a high-level language used for..."
-                        |
-         Cosine similarity = 0.73
+                        │
+         Cosine similarity = 0.73   ← qual_semantic_similarity
 ```
 
-A higher similarity score over training steps proves the model is learning to produce semantically aligned instruction-following responses.
+**Rising similarity over training = model learning aligned instruction-following responses.**
 
-**Blind spots:** Does not measure fluency or grammar. A semantically similar but grammatically broken answer scores the same as a polished one.
+**Blind spots:** Does not measure fluency or grammar.
 
 ---
 
 #### 2. Keyword Density + TTR — `config_qualitative_domain.yaml`
 
-**Dataset:** `imdb` (unconditional language modeling — model learns to *write* reviews)
+**Dataset:** `stanfordnlp/imdb` (unconditional language modeling — model learns to *write* reviews)  
 **Reference:** None required (reference-free)
 
-The model is prompted with `"Write a movie review:\n"` and generates freely. The output is analysed for:
-- **Keyword Density**: fraction of words that are domain-specific film criticism vocabulary (e.g., "cinematography", "screenplay", "pacing")
-- **Type-Token Ratio (TTR)**: unique words / total words — measures lexical diversity
-- **Hapax Ratio**: fraction of words used exactly once — a finer diversity measure for longer texts
+Model is prompted with `"Write a movie review:\n"` and generates freely. Output is analysed for:
+- **Keyword Density** — fraction of words from domain vocabulary (cinematography, screenplay, pacing, …)
+- **Type-Token Ratio (TTR)** — unique words / total words (lexical diversity)
+- **Hapax Ratio** — fraction of words used exactly once per response
 
 ```
 Generated: "The cinematography was stunning. The pacing felt off
             though the screenplay had some brilliant moments..."
-                              |
-keyword_density  = 0.068   (6.8% domain keywords)
-type_token_ratio = 0.71    (71% unique words)
-hapax_ratio      = 0.58
+                              │
+qual_keyword_density  = 0.068   (6.8% domain keywords)
+qual_type_token_ratio = 0.71    (71% unique words)
+qual_hapax_ratio      = 0.58
 ```
 
-**Note on this config vs `imdb_config.yaml`:** `imdb_config.yaml` trains for *sentiment classification* (predicts "positive"/"negative"). `config_qualitative_domain.yaml` trains the model for *unconditional language modeling* — it learns to write movie reviews from scratch. These are fundamentally different tasks.
+> **Note:** `config_qualitative_domain.yaml` trains for *unconditional LM* (write reviews). `imdb_config.yaml` trains for *sentiment classification* (predict positive/negative). Different tasks, same dataset.
 
 ---
 
 #### 3. Structural CoT Adherence — `config_qualitative_reasoning.yaml`
 
-**Dataset:** `gsm8k` (same task as `gsm8k_config.yaml`)
-**Complements:** quantitative `exact_match` from the `evaluation` block
+**Dataset:** `gsm8k` (grade school math, same as `gsm8k_config.yaml`)  
+**Complements:** quantitative `exact_match`
 
-The model generates a math reasoning chain. The output is analysed for **"logic anchors"** — regex patterns that mark structured reasoning steps:
+Model generates a math reasoning chain. Output is analysed for **logic anchors** — regex patterns marking structured reasoning steps:
 
 ```
-Generated: "First, we need to find the total apples.
-            Step 1: There are 5 apples per basket, and 3 baskets.
-            Therefore, 5 x 3 = 15 apples total.
-            The answer is #### 15"
-                     |
-cot_anchor_count_mean = 4.0    (4 anchors found)
-cot_step_length_mean  = 38.5   (avg 38.5 chars between anchors)
-cot_coverage_rate     = 1.0    (100% of responses had at least 1 anchor)
+Generated: "First, we find the total apples.
+            Step 1: 5 apples × 3 baskets = 15 apples
+            Therefore, the answer is 15.
+            #### 15"
+                     │
+qual_cot_anchor_count_mean = 4.0     (4 anchors found)
+qual_cot_step_length_mean  = 38.5    (avg 38.5 chars between anchors)
+qual_cot_coverage_rate     = 1.0     (100% of responses had ≥1 anchor)
 ```
 
-This metric is **additive** to quantitative evaluation — `exact_match` tells you if the final answer is right; structural CoT tells you if the reasoning process is structured. A model achieving both is genuinely learning chain-of-thought reasoning, not just pattern-matching the final number.
+`exact_match` tells you if the final answer is right. Structural CoT tells you if the reasoning *process* is structured. **Both rising together = genuine CoT learning.**
 
 ---
 
@@ -437,117 +615,134 @@ This metric is **additive** to quantitative evaluation — `exact_match` tells y
 
 All qualitative configs follow the same three-terminal launch pattern:
 
-**Conversational (UltraChat):**
+**Conversational (Alpaca):**
 ```bash
-# Terminal 1
 python inference.py --config configs/config_qualitative_chat.yaml
-
-# Terminal 2
-python trainer.py --config configs/config_qualitative_chat.yaml
-
-# Terminal 3
-python producer.py --config configs/config_qualitative_chat.yaml
+python trainer.py   --config configs/config_qualitative_chat.yaml
+python producer.py  --config configs/config_qualitative_chat.yaml
 ```
 
 **Domain Adaptation (IMDb unconditional LM):**
 ```bash
 python inference.py --config configs/config_qualitative_domain.yaml
-python trainer.py  --config configs/config_qualitative_domain.yaml
-python producer.py --config configs/config_qualitative_domain.yaml
+python trainer.py   --config configs/config_qualitative_domain.yaml
+python producer.py  --config configs/config_qualitative_domain.yaml
 ```
 
-**Reasoning + CoT (GSM8k):**
+**Reasoning + CoT (GSM8K):**
 ```bash
 python inference.py --config configs/config_qualitative_reasoning.yaml
-python trainer.py  --config configs/config_qualitative_reasoning.yaml
-python producer.py --config configs/config_qualitative_reasoning.yaml
+python trainer.py   --config configs/config_qualitative_reasoning.yaml
+python producer.py  --config configs/config_qualitative_reasoning.yaml
 ```
 
-> **First run with `config_qualitative_chat.yaml`:** The MiniLM model (~90 MB) will be downloaded from HuggingFace and cached locally on the first qualitative eval call. You will see: `[QUAL_EVAL] Loading sentence embedding model 'sentence-transformers/all-MiniLM-L6-v2' on CPU...`. Subsequent runs use the local cache instantly.
+> **First run with `config_qualitative_chat.yaml`:** MiniLM (~90 MB) is downloaded from HuggingFace and cached. You'll see: `Loading sentence embedding model 'all-MiniLM-L6-v2' on CPU...`. Subsequent runs use the local cache instantly.
 
 ---
 
 ### Interpreting the Metrics
 
-All qualitative metrics in the CSV and log output are prefixed with `qual_` to distinguish them from quantitative metrics at a glance.
+All qualitative metrics in the CSV are prefixed with `qual_` to distinguish them from quantitative metrics.
 
-#### Universal Metrics (present for all three strategies)
+#### Universal Metrics (all three strategies)
 
-| Metric | Range | What it means | Healthy value |
-|---|---|---|---|
-| `qual_non_empty_rate` | 0.0 – 1.0 | Fraction of eval prompts where the model generated at least one token | Should stay at 1.0; drops indicate training instability or mode collapse |
-| `qual_mean_response_length` | words | Average word count of generated responses | Should increase or stay stable; sharp drops indicate collapse |
-| `qual_repetition_rate` | 0.0 – 1.0 | Fraction of bigrams that repeat within a single response | Should stay below 0.10; spikes indicate degenerate "the the the" patterns |
+| Metric | Range | Healthy value |
+|---|---|---|
+| `qual_non_empty_rate` | 0.0–1.0 | Should stay at 1.0; drops → training instability or mode collapse |
+| `qual_mean_response_length` | words | Should increase or stay stable; sharp drops → collapse |
+| `qual_repetition_rate` | 0.0–1.0 | Should stay below 0.10; spikes → "the the the" degeneration |
 
-#### Semantic Similarity (chat config only)
+#### Semantic Similarity (chat config)
 
-| Metric | Range | What it means | Healthy value |
-|---|---|---|---|
-| `qual_semantic_similarity` | 0.0 – 1.0 | Mean cosine similarity between generated and golden responses | Rising trend. Raw distilgpt2 baseline ~0.1–0.2; well-trained model should reach 0.5+ |
+| Metric | Range | Healthy value |
+|---|---|---|
+| `qual_semantic_similarity` | 0.0–1.0 | Rising trend. Untrained baseline ~0.1–0.2; well-trained model should reach 0.5+ |
 
-**Reading the trend:** If `qual_semantic_similarity` plateaus early, the model may be learning the response format but not the content. Check `qual_mean_response_length` — if both plateau together, consider increasing `lora.r` to add capacity.
+#### Keyword Density (domain config)
 
-#### Keyword Density (domain config only)
+| Metric | Range | Healthy value |
+|---|---|---|
+| `qual_keyword_density` | 0.0–1.0 | Rising. Untrained ~0.005–0.01; adapted model should reach 0.05+ |
+| `qual_type_token_ratio` | 0.0–1.0 | Should stay above 0.5; drops → repeated generation |
+| `qual_hapax_ratio` | 0.0–1.0 | For rich writing: 0.5–0.8 |
 
-| Metric | Range | What it means | Healthy value |
-|---|---|---|---|
-| `qual_keyword_density` | 0.0 – 1.0 | Fraction of output words that are domain keywords | Rising trend; untrained baseline ~0.005–0.01, well-adapted model should reach 0.05+ |
-| `qual_type_token_ratio` | 0.0 – 1.0 | Unique words / total words | Should stay above 0.5; drops indicate repeated generation |
-| `qual_hapax_ratio` | 0.0 – 1.0 | Fraction of words used exactly once per response | For rich writing, expect 0.5–0.8 |
+#### Structural CoT (reasoning config)
 
-**Reading the trend:** Rising `qual_keyword_density` without falling `qual_type_token_ratio` is the ideal signal — domain vocabulary is being added while maintaining lexical diversity.
-
-#### Structural CoT (reasoning config only)
-
-| Metric | Range | What it means | Healthy value |
-|---|---|---|---|
-| `qual_cot_anchor_count_mean` | 0 – unbounded | Mean logic anchors per response | Rising trend; untrained ~0, well-trained CoT model should reach 3–6 |
-| `qual_cot_step_length_mean` | chars | Mean characters between anchors | Rising trend; short values (<20 chars) mean anchors without actual reasoning |
-| `qual_cot_coverage_rate` | 0.0 – 1.0 | Fraction of responses with at least one anchor | Should approach 1.0 as training progresses |
-
-**Reading the trend:** `qual_cot_anchor_count_mean` rising in lock-step with `qual_cot_step_length_mean` is the key signal — structural adoption with actual reasoning content. Combined with rising `exact_match` from the quantitative block, this is proof of genuine CoT learning.
+| Metric | Range | Healthy value |
+|---|---|---|
+| `qual_cot_anchor_count_mean` | 0–unbounded | Rising trend; untrained ~0, well-trained CoT model should reach 3–6 |
+| `qual_cot_step_length_mean` | chars | Rising; short values (<20 chars) = anchors without reasoning content |
+| `qual_cot_coverage_rate` | 0.0–1.0 | Should approach 1.0 as training progresses |
 
 ---
 
-### Reading the CSV and Plots
+## Output Directory Structure
 
-#### CSV Location
-
-After a training run, metrics are saved to:
+After a training run, the `output/` directory looks like this:
 
 ```
-output/<run_name>/logs/<run_name>/<timestamp>/metrics.csv
+output/<project_output_dir>/
+│
+├── checkpoints/                              ← LoRA adapter snapshots
+│   └── <model>__<dataset>/                  ← e.g., distilgpt2__stanfordnlp_imdb
+│       ├── step_000100/
+│       │   ├── adapter_model.safetensors
+│       │   ├── adapter_config.json
+│       │   └── checkpoint_meta.json         ← step, timestamp, model, loss
+│       ├── step_000200/
+│       └── final/                           ← always present after training
+│
+├── logs/                                     ← Inline training metrics
+│   └── <project-name>/
+│       └── 20260412-143500_a3f2/            ← timestamp + UUID suffix (never collides)
+│           ├── metrics.csv                  ← all metrics, one row per eval event
+│           ├── run_params.json              ← config snapshot
+│           └── *.png                        ← auto-generated plots
+│
+└── eval_results/                             ← Decoupled evaluation results
+    └── <model>__<dataset>/
+        └── final/                           ← or step_000200/, etc.
+            └── eval_20260412-150230_a3f2/   ← timestamp + UUID (never overwrites)
+                ├── eval_results.json
+                ├── eval_config.json
+                └── plots/
+                    └── *.png
 ```
 
-The CSV has one row per evaluation event. Quantitative and qualitative evaluations each write their own rows (columns that don't apply to that eval type are left empty). Example:
+**No-overwrite guarantees:**
+- **Training logs:** Each run gets a unique `<timestamp>_<uuid4[:4]>` directory
+- **Step checkpoints:** Existing directories are skipped (never overwritten)
+- **Final checkpoint:** Always overwrites (represents latest training endpoint)
+- **Eval results:** Each `evaluate.py` run creates a new timestamped+UUID directory
 
-```
-step | eval_loss | accuracy | ... | qual_cot_anchor_count_mean | qual_cot_step_length_mean
-50   | 3.21      | 0.54     | ... |                            |
-50   |           |          | ... | 1.2                        | 18.4
-100  | 3.05      | 0.58     | ... |                            |
-100  |           |          | ... | 2.8                        | 24.1
-```
+---
 
-#### Regenerating Plots
+## Regenerating Plots
 
 Plots are automatically generated at the end of every training run. To regenerate from an existing CSV:
 
 ```bash
-python utils/plot_metrics.py "output/infinitune-qual-reasoning/logs/.../metrics.csv"
+python utils/plot_metrics.py "output/imdb/logs/infinitune-imdb-sentiment/20260412-143500_a3f2/metrics.csv"
 
-# Save to a specific directory
+# Save plots to a different directory
 python utils/plot_metrics.py path/to/metrics.csv --out-dir ./my_plots
 ```
 
-Qualitative plots are automatically included when the CSV contains the corresponding columns. The following qualitative plot files will be generated:
+Available plot files (generated if the corresponding data column is non-empty):
 
 | Plot file | What it shows |
 |---|---|
-| `qual_semantic_similarity.png` | Semantic similarity trend (chat) |
+| `train_loss.png` | Training loss over steps |
+| `eval_loss.png` | Evaluation loss |
+| `perplexity.png` | Model perplexity |
+| `accuracy.png` | Classification accuracy |
+| `f1.png` | Macro F1 score |
+| `mcc.png` | Matthews Correlation Coefficient |
+| `kappa.png` | Cohen's Kappa |
+| `exact_match.png` | Exact match rate (generative tasks) |
+| `qual_semantic_similarity.png` | Semantic similarity (chat) |
 | `qual_keyword_density.png` | Domain keyword adoption (domain) |
 | `qual_type_token_ratio.png` | Lexical diversity (domain) |
-| `qual_hapax_ratio.png` | Word uniqueness (domain) |
 | `qual_cot_anchor_count.png` | CoT anchor count (reasoning) |
 | `qual_cot_step_length.png` | Reasoning step length (reasoning) |
 | `qual_cot_coverage.png` | Fraction of responses with anchors (reasoning) |
@@ -555,23 +750,27 @@ Qualitative plots are automatically included when the CSV contains the correspon
 | `qual_repetition_rate.png` | Bigram repetition — degeneration detector (all) |
 | `qual_non_empty_rate.png` | Training stability indicator (all) |
 
-#### The `testing_strategy` Config Block
+---
 
-Add the `testing_strategy` block to any config to enable qualitative evaluation. All three method-specific fields must be present; set unused ones to `null`:
+## `testing_strategy` Config Block Reference
+
+Add this block to any config to enable qualitative evaluation. All method-specific fields must be present in the YAML; set unused ones to `null`:
 
 ```yaml
 testing_strategy:
   enabled: true                         # Master switch (false = zero overhead)
   method: "structural_cot"              # semantic_similarity | keyword_density | structural_cot
   eval_interval: 50                     # Qualitative eval every N optimizer steps
-  eval_samples: 20                      # Samples per eval window (sliding)
+  eval_samples: 20                      # Samples evaluated per window (sliding)
+  eval_pool_size: 100                   # Total eval samples loaded at startup (≥ eval_samples)
   max_new_tokens: 250                   # Max tokens generated per eval sample
 
-  # Superset schema: null out fields that don't apply
-  sentence_model: null                  # For semantic_similarity: HuggingFace model ID
-  keywords: null                        # For keyword_density: list of domain keywords
-  logic_anchors:                        # For structural_cot: list of regex strings
+  # Superset schema: null out fields that don't apply to your chosen method
+  sentence_model: null                  # semantic_similarity: HuggingFace model ID
+  keywords: null                        # keyword_density: list of domain keywords
+  logic_anchors:                        # structural_cot: list of regex strings
     - "First[,\\s]"
     - "Therefore[,\\s]"
     - "Step\\s*\\d+[:\\.]"
+    - "####\\s*\\d+"
 ```

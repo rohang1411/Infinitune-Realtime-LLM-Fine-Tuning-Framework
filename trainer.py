@@ -3,6 +3,7 @@ import io
 import re
 import json
 import sys
+import uuid
 import argparse
 import torch
 import math
@@ -22,6 +23,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
+from utils.checkpoint_manager import CheckpointManager
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -80,8 +82,13 @@ class MetricsLogger:
 
     def __init__(self, output_dir: str, run_name: str):
         ts = time.strftime("%Y%m%d-%H%M%S")
+        # Append a short random suffix so rapid restarts never collide on the
+        # same second, which would cause the new run to silently append to the
+        # old metrics.csv instead of starting a fresh file.
+        suffix = uuid.uuid4().hex[:4]
         safe_run = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in run_name)
-        self.dir = os.path.join(output_dir, "logs", safe_run, ts)
+        run_dir_name = f"{ts}_{suffix}"
+        self.dir = os.path.join(output_dir, "logs", safe_run, run_dir_name)
         os.makedirs(self.dir, exist_ok=True)
 
         self.metrics_path = os.path.join(self.dir, "metrics.csv")
@@ -349,7 +356,7 @@ def build_lr_scheduler(optimizer, config):
 # --------------------------------------------------
 # Manual training loop function
 # --------------------------------------------------
-def train_model(config):
+def train_model(config, config_path: str = "(unknown)"):
     _log("Starting preparation for training")
 
     model_cfg = config['model']
@@ -485,6 +492,25 @@ def train_model(config):
 
     # Initialize qualitative evaluator (no-op if testing_strategy block absent or disabled)
     qual_evaluator = QualitativeEvaluator(config, tokenizer, device)
+
+    # Initialize CheckpointManager — saves LoRA adapters every N steps.
+    # Enabled by default (save_checkpoints.enabled: true); disable explicitly
+    # in config if not needed.  Checkpoints are always useful for decoupled
+    # evaluation via evaluate.py, regardless of inline eval settings.
+    ckpt_cfg = training_cfg.get("save_checkpoints", {})
+    ckpt_manager = None
+    save_every_steps = 100
+    save_final_ckpt  = True
+    if ckpt_cfg.get("enabled", True):
+        ckpt_manager      = CheckpointManager(config, config_path=config_path)
+        save_every_steps  = int(ckpt_cfg.get("save_every_steps", 100))
+        save_final_ckpt   = bool(ckpt_cfg.get("save_final", True))
+        _log(
+            f"Checkpoint saving enabled: every {save_every_steps} steps, "
+            f"save_final={save_final_ckpt}, root={ckpt_manager.checkpoint_root}"
+        )
+    else:
+        _log("Checkpoint saving disabled (save_checkpoints.enabled: false).")
     
     # Set up timing for sending weights
     last_send_time = time.time()
@@ -653,6 +679,13 @@ def train_model(config):
                 optimizer.zero_grad()
                 optimization_step += 1
 
+                # Periodic checkpoint save
+                if ckpt_manager and optimization_step % save_every_steps == 0:
+                    ckpt_manager.save(
+                        model, tokenizer, optimization_step,
+                        loss=accumulated_loss / training_args.gradient_accumulation_steps,
+                    )
+
                 avg_step_loss = accumulated_loss / training_args.gradient_accumulation_steps
                 avg_grad_norm = train_model._acc_grad_norm / training_args.gradient_accumulation_steps
                 current_lr = scheduler.get_last_lr()[0]
@@ -725,7 +758,14 @@ def train_model(config):
         except Exception as e:
             _log(f"Warning: Partial gradient flush failed: {e}")
 
-    # 1. Send final LoRA weights + done signal to inference.
+    # 1. Save final checkpoint to disk (always, regardless of inline eval settings).
+    if ckpt_manager and save_final_ckpt:
+        try:
+            ckpt_manager.save(model, tokenizer, "final", force=True)
+        except Exception as e:
+            _log(f"Warning: Failed to save final checkpoint: {e}")
+
+    # 2. Send final LoRA weights + done signal to inference server via Kafka.
     try:
         _log("Training complete. Sending final adapter weights.")
         lora_producer.send_weights(get_peft_model_state_dict(model))
@@ -733,7 +773,7 @@ def train_model(config):
     except Exception as e:
         _log(f"Warning: Failed to send final weights / done signal: {e}")
 
-    # 2. Final evaluation — skip if the user already pressed Ctrl-C (they
+    # 3. Final evaluation — skip if the user already pressed Ctrl-C (they
     #    want to exit, not wait for a slow model.generate() pass).
     if evaluator.enabled and not interrupted:
         try:
@@ -743,7 +783,7 @@ def train_model(config):
         except Exception as e:
             _log(f"Warning: Final evaluation failed: {e}")
 
-    # 2b. Final qualitative evaluation (independent of quantitative eval)
+    # 3b. Final qualitative evaluation (independent of quantitative eval)
     if qual_evaluator.enabled and not interrupted:
         try:
             _log_qual_eval(optimization_step)
@@ -752,13 +792,16 @@ def train_model(config):
         except Exception as e:
             _log(f"Warning: Final qualitative evaluation failed: {e}")
 
-    # 3. Always print the CSV location and generate plots.
+    # 4. Always print the CSV location and generate plots.
     _log(f"Metrics CSV saved to: {metrics_logger.metrics_path}")
     try:
         metrics_logger.generate_plots()
     except Exception as e:
         _log(f"Warning: Plot generation failed: {e}")
     _log(f"To regenerate plots later: python utils/plot_metrics.py \"{metrics_logger.metrics_path}\"")
+    if ckpt_manager:
+        _log(f"Checkpoints saved to: {ckpt_manager.checkpoint_root}")
+        _log("To run decoupled evaluation: python evaluate.py --config <config> [--step N | --all-checkpoints]")
 
 # --------------------------------------------------
 # Main entry point
@@ -771,4 +814,4 @@ if __name__ == "__main__":
 
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
-    train_model(config)
+    train_model(config, config_path=args.config)
