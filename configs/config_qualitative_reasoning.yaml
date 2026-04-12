@@ -1,0 +1,207 @@
+# ============================================================
+# InfiniTune Configuration — Qualitative: Reasoning (GSM8k)
+# Task Type   : Causal LM / Math Reasoning (Chain-of-Thought)
+# Dataset     : gsm8k (main)
+# Model       : distilgpt2 (82M params) — fast testing baseline
+# Eval Method : Structural CoT Adherence (logic anchor counting, CPU only)
+#
+# Objective:
+#   Prove that the model is adopting Chain-of-Thought reasoning structure
+#   by counting "logic anchors" (e.g. "First,", "Therefore,", "Step 1:") in
+#   its generated responses and measuring the length of intermediate steps.
+#
+# Relationship to gsm8k_config.yaml:
+#   gsm8k_config.yaml uses quantitative eval (regex_extract + exact_match)
+#   to check if the FINAL NUMERIC ANSWER is correct.
+#   THIS config adds structural qualitative eval to check if the model is
+#   generating proper REASONING STEPS — a model can get the right answer by
+#   luck; structured reasoning proves genuine CoT adoption.
+#
+#   Both configs can be run independently or combined by enabling both
+#   evaluation and testing_strategy blocks simultaneously.
+#
+# Run:
+#   python producer.py --config configs/config_qualitative_reasoning.yaml
+#   python trainer.py  --config configs/config_qualitative_reasoning.yaml
+# ============================================================
+
+project:
+  name: "infinitune-qual-reasoning"
+  output_dir: "./output/qual_reasoning"
+
+# --- Model ---
+model:
+  name: "distilgpt2"
+  task_type: "CAUSAL_LM"
+  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  max_seq_length: 512
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "c_attn"                # GPT-2 combined QKV projection
+    - "c_proj"                # GPT-2 output projection
+
+# --- Dataset ---
+dataset:
+  name: "gsm8k"
+  config_name: "main"         # gsm8k requires explicit config name
+  split: "train"
+  eval_split: "test"
+  column_mapping:
+    input_col: "question"     # The math problem
+    target_col: "answer"      # The full chain-of-thought answer (including #### N)
+  label_map: null             # No label remapping (generative task)
+  shuffle: true
+  shuffle_seed: 42
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "Question: {{ input }}\nAnswer: Let's solve this step by step."
+  response_template: " {{ target }}"
+  hash_column: "input"
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 15
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5
+      max_repetition_ratio: 0.2
+    domain_specific:
+      require_numeric_content: true   # Math problems must contain numbers
+      custom_regex_must_match: null
+      custom_regex_must_not_match: null
+      chat_structure:
+        min_turns: null
+        require_assistant_final: null
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-qual-reasoning"
+  lora_updates_topic: "lora-updates-qual-reasoning"
+  producer_send_interval: 0.1
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  test_mode: true              # Train on full dataset, stop on EOF
+  batch_size: 2                # Smaller batch — math problems have longer sequences
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_steps: 500
+  logging_steps: 1
+  weight_push_interval: 60
+  lr_scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 500                   # must match max_steps for full decay curve
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 250          # Long output for multi-step reasoning chains
+  do_sample: true
+  temperature: 0.5             # Lower temp for more deterministic math reasoning
+  top_p: 0.9
+
+# --- Quantitative Evaluation ---
+# Also enabled: regex_extract checks the final numeric answer for correctness.
+# Together with structural_cot below, we get both quantitative accuracy AND
+# qualitative reasoning quality signals.
+evaluation:
+  enabled: true
+  strategy: "regex_extract"    # Extract and match the final numeric answer
+  eval_interval: 50
+  eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)
+  eval_batch_size: 20          # samples evaluated per sliding window
+  answer_regex: "#### (\\d+)"  # Extracts final numeric answer from GSM8K format
+  metrics:
+    compute_loss: true
+    compute_accuracy: true
+    compute_exact_match: true
+    compute_f1: false          # Too many distinct numeric answers
+    compute_mcc: false
+    compute_kappa: false
+    compute_forgetting: false
+    compute_update_latency: true
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"
+    max_distinct_labels_for_structure_metrics: 64
+    forgetting_track_metrics: ["exact_match", "eval_loss", "perplexity"]
+
+# --- Qualitative Evaluation (Superset Schema) ---
+# method: structural_cot
+#   Zero extra RAM — pure regex and string analysis on generated text.
+#   Logic anchors are compiled as regex patterns (IGNORECASE).
+#   A rising qual_cot_anchor_count_mean over training steps proves CoT
+#   structure adoption. Rising qual_cot_step_length_mean proves the model is
+#   generating actual reasoning content between anchors, not just inserting
+#   them as prefixes.
+#
+# Complementary signal:
+#   quantitative eval (above) shows if the ANSWER is correct.
+#   qualitative eval (below) shows if the REASONING PROCESS is structured.
+#   A model achieving both is genuinely learning CoT, not pattern matching.
+#
+# Superset fields (set irrelevant fields to null):
+#   sentence_model : null (unused for structural_cot)
+#   keywords       : null (unused for structural_cot)
+#   logic_anchors  : active (regex patterns for reasoning step markers)
+testing_strategy:
+  enabled: true
+  method: "structural_cot"
+  eval_interval: 50            # Every 50 optimizer steps
+  eval_samples: 20             # Samples per eval window
+  eval_pool_size: 100          # Pool to slide over (5× eval_samples)
+  max_new_tokens: 250          # Must be long enough to capture full reasoning chain
+
+  # Method-specific fields (superset: null the unused ones)
+  sentence_model: null
+  keywords: null
+  logic_anchors:
+    # Sequential markers
+    - "First[,\\s]"
+    - "Second[,\\s]"
+    - "Third[,\\s]"
+    - "Next[,\\s]"
+    - "Then[,\\s]"
+    - "Finally[,\\s]"
+    - "Last[,\\s]"
+    # Logical connectives
+    - "Therefore[,\\s]"
+    - "Thus[,\\s]"
+    - "So[,\\s]"
+    - "Hence[,\\s]"
+    - "This means"
+    - "In other words"
+    - "It follows"
+    # Problem decomposition
+    - "Step\\s*\\d+[:\\.]"
+    - "Let(?:'s| us)\\s"
+    - "We (?:know|have|can|need|get)"
+    - "We (?:first|then|also|must)"
+    # Math-specific reasoning markers
+    - "If \\w+ is"
+    - "Since \\w+"
+    - "Because \\w+"
+    - "Given that"
+    - "Adding (?:this|these|them)"
+    - "Subtracting (?:this|these)"
+    - "Multiplying (?:by|this|these)"
+    - "Dividing (?:by|this|these)"
+    - "The total"
+    - "The answer is"
+    - "####"                   # GSM8k final answer marker (proves answer was reached)

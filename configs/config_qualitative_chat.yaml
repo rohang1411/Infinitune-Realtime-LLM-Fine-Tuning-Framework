@@ -1,0 +1,173 @@
+# ============================================================
+# InfiniTune Configuration — Qualitative: Conversational (Alpaca)
+# Task Type   : Causal LM / Instruction Following
+# Dataset     : tatsu-lab/alpaca (52k instruction-following examples)
+# Model       : distilgpt2 (82M params) — fast testing baseline
+# Eval Method : Semantic Similarity (all-MiniLM-L6-v2 on CPU)
+#
+# Objective:
+#   Prove that the model's instruction-following responses are semantically
+#   converging toward golden ground-truth answers over training steps.
+#   Cosine similarity between generated and golden responses is measured
+#   using a lightweight sentence-embedding model (~90 MB CPU footprint).
+#
+# Why Alpaca instead of UltraChat:
+#   UltraChat's target column ("messages") is a list of dicts, which the
+#   producer would stringify via str() into garbage like "[{'role': ...}]".
+#   Alpaca's columns (instruction, output) are clean strings that flow
+#   directly through the data-agnostic producer without transformation.
+#
+# Run:
+#   python producer.py --config configs/config_qualitative_chat.yaml
+#   python trainer.py  --config configs/config_qualitative_chat.yaml
+# ============================================================
+
+project:
+  name: "infinitune-qual-chat"
+  output_dir: "./output/qual_chat"
+
+# --- Model ---
+model:
+  name: "distilgpt2"
+  task_type: "CAUSAL_LM"
+  precision: "fp32"           # MPS (Apple Silicon) does not support fp16 training; fp32 is used
+  max_seq_length: 512
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "c_attn"                 # GPT-2 combined QKV projection
+    - "c_proj"                 # GPT-2 output projection
+
+# --- Dataset ---
+# tatsu-lab/alpaca has 52k instruction-following examples.
+# Columns: instruction (str), input (str, optional context), output (str).
+# We map instruction → input_col and output → target_col.
+# ~40% of examples have a non-empty "input" field providing additional context;
+# the prompt_template handles this gracefully via the {{ input }} variable.
+dataset:
+  name: "tatsu-lab/alpaca"
+  config_name: null
+  split: "train"
+  eval_split: "train"         # Alpaca has no test split; eval uses shuffled train subset
+  column_mapping:
+    input_col: "instruction"   # The instruction to follow
+    target_col: "output"       # The golden response (clean string)
+  label_map: null              # No label remapping (generative task)
+  shuffle: true
+  shuffle_seed: 42
+
+# --- Preprocessing / Templating ---
+# Renders the instruction as a user prompt; the model learns to generate
+# the output as an assistant response.
+preprocessing:
+  prompt_template: "### Instruction:\n{{ input }}\n\n### Response:"
+  response_template: " {{ target }}"
+  hash_column: "input"
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 10             # Instructions can be short
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5
+      max_repetition_ratio: 0.2
+    domain_specific:
+      require_numeric_content: null
+      custom_regex_must_match: null
+      custom_regex_must_not_match: null
+      chat_structure:
+        min_turns: null
+        require_assistant_final: null
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-qual-chat"
+  lora_updates_topic: "lora-updates-qual-chat"
+  producer_send_interval: 0.05
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  test_mode: true              # Train on full dataset, stop on EOF
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_steps: 500
+  logging_steps: 1
+  weight_push_interval: 60
+  lr_scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 500                 # must match max_steps for full decay curve
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 200          # Longer output for conversational responses
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Quantitative Evaluation ---
+# Perplexity-only as a baseline sanity check. Accuracy/exact_match are
+# meaningless for open-ended instruction following.
+evaluation:
+  enabled: true
+  strategy: "perplexity"       # Forward-pass loss only; no generation needed
+  eval_interval: 50
+  eval_pool_size: 50
+  eval_batch_size: 10
+  verbose: false
+  answer_regex: null
+  metrics:
+    compute_loss: true
+    compute_accuracy: false
+    compute_exact_match: false
+    compute_f1: false
+    compute_mcc: false
+    compute_kappa: false
+    compute_forgetting: false
+    compute_update_latency: true
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"
+    forgetting_track_metrics: ["eval_loss", "perplexity"]
+
+# --- Qualitative Evaluation (Superset Schema) ---
+# method: semantic_similarity
+#   Requires sentence-transformers: pip install sentence-transformers
+#   The sentence embedding model loads on CPU (~90 MB RAM) and never
+#   touches GPU VRAM, so it is safe to run alongside MPS training.
+#
+# The qualitative evaluator uses the same dataset (tatsu-lab/alpaca) and
+# compares the model's generated response to the golden "output" column
+# via cosine similarity of sentence embeddings.
+#
+# Superset fields (set irrelevant fields to null):
+#   sentence_model : active (MiniLM model name)
+#   keywords       : null (unused for semantic_similarity)
+#   logic_anchors  : null (unused for semantic_similarity)
+testing_strategy:
+  enabled: true
+  method: "semantic_similarity"
+  eval_interval: 50            # Every 50 optimizer steps
+  eval_samples: 20             # Samples per eval window
+  eval_pool_size: 100          # Pool to slide over (5× eval_samples)
+  max_new_tokens: 150          # Max generation length for qualitative eval
+
+  # Method-specific fields (superset: null the unused ones)
+  sentence_model: "sentence-transformers/all-MiniLM-L6-v2"
+  keywords: null
+  logic_anchors: null

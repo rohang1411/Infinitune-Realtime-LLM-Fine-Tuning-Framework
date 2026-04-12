@@ -12,7 +12,7 @@ project:
 model:
   name: "distilgpt2"
   task_type: "CAUSAL_LM"
-  precision: "fp16"          # fp16 | fp32 | 4bit
+  precision: "fp32"          # MPS (Apple Silicon) does not support fp16 training; fp32 is used
   max_seq_length: 512
 
 # --- LoRA Adapter ---
@@ -23,6 +23,7 @@ lora:
   bias: "none"
   target_modules:
     - "c_attn"               # GPT-2 combined QKV projection
+    - "c_proj"               # GPT-2 output projection
 
 # --- Dataset ---
 dataset:
@@ -77,9 +78,14 @@ training:
   batch_size: 2               # smaller batch (longer sequences for math)
   gradient_accumulation_steps: 4
   learning_rate: 2e-4
-  max_steps: 100              # reduced for fast testing (original: 1000)
+  max_steps: 1000              # ~53% of GSM8k train set with effective batch 8
   logging_steps: 1
   weight_push_interval: 60    # seconds between LoRA pushes to Kafka
+  lr_scheduler:
+    type: "cosine_with_warmup"   # cosine_with_warmup | linear | constant
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 500                   # must match max_steps for full decay curve
 
 # --- Inference ---
 inference:
@@ -95,7 +101,8 @@ evaluation:
   enabled: true
   strategy: "regex_extract"   # class_match | regex_extract | perplexity
   eval_interval: 50           # evaluate every N optimizer steps
-  eval_samples: 20
+  eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)
+  eval_batch_size: 20          # samples evaluated per sliding window
   answer_regex: "#### (\\d+)" # extracts final numeric answer from GSM8K format
   # Generative / extractive: keep string metrics; disable structure metrics by default
   # (many distinct numeric answers would make F1/MCC/kappa meaningless).

@@ -378,7 +378,7 @@ class Evaluator:
             if count > 0:
                 avg_loss = total_loss / count
                 metrics["eval_loss"] = avg_loss
-                metrics["perplexity"] = torch.exp(torch.tensor(avg_loss)).item()
+                metrics["perplexity"] = min(torch.exp(torch.tensor(avg_loss)).item(), 1e6)
 
         need_generation = self.strategy in ("class_match", "regex_extract") and any(
             mf.get(k, False)

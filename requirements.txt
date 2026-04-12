@@ -8,3 +8,4 @@ trl
 wandb
 accelerate
 matplotlib
+sentence-transformers

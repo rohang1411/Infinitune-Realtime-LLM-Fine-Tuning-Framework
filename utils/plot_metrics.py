@@ -67,6 +67,7 @@ def generate_plots(csv_path, out_dir=None):
     os.makedirs(out_dir, exist_ok=True)
 
     plot_defs = [
+        # ── Quantitative metrics ──────────────────────────────────────────────
         ("train_loss", "Training Loss", "loss"),
         ("eval_loss", "Eval Loss", "eval_loss"),
         ("perplexity", "Perplexity", "perplexity"),
@@ -82,6 +83,17 @@ def generate_plots(csv_path, out_dir=None):
         ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
         ("grad_norm", "Gradient Norm", "grad_norm"),
         ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
+        # ── Qualitative metrics (populated when testing_strategy is enabled) ──
+        ("qual_semantic_similarity", "Semantic Similarity (MiniLM)", "qual_semantic_similarity"),
+        ("qual_keyword_density", "Domain Keyword Density", "qual_keyword_density"),
+        ("qual_type_token_ratio", "Type-Token Ratio (Lexical Diversity)", "qual_type_token_ratio"),
+        ("qual_hapax_ratio", "Hapax Ratio (Word Uniqueness)", "qual_hapax_ratio"),
+        ("qual_cot_anchor_count", "CoT Logic Anchor Count (mean)", "qual_cot_anchor_count_mean"),
+        ("qual_cot_step_length", "CoT Step Length — chars between anchors (mean)", "qual_cot_step_length_mean"),
+        ("qual_cot_coverage", "CoT Coverage Rate — responses with ≥1 anchor", "qual_cot_coverage_rate"),
+        ("qual_mean_response_length", "Mean Response Length (words)", "qual_mean_response_length"),
+        ("qual_repetition_rate", "Bigram Repetition Rate", "qual_repetition_rate"),
+        ("qual_non_empty_rate", "Non-Empty Response Rate", "qual_non_empty_rate"),
     ]
 
     generated = 0

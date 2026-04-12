@@ -21,6 +21,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from utils.eval_metrics_train import Evaluator
+from utils.eval_qualitative import QualitativeEvaluator
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -63,7 +64,18 @@ class MetricsLogger:
         "grad_norm",
         "tokens_per_sec",
         "step_time_s",
-        "records_used_total"
+        "records_used_total",
+        # ── Qualitative metrics (populated when testing_strategy is enabled) ──
+        "qual_semantic_similarity",
+        "qual_keyword_density",
+        "qual_type_token_ratio",
+        "qual_hapax_ratio",
+        "qual_cot_anchor_count_mean",
+        "qual_cot_step_length_mean",
+        "qual_cot_coverage_rate",
+        "qual_mean_response_length",
+        "qual_repetition_rate",
+        "qual_non_empty_rate",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -128,6 +140,7 @@ class MetricsLogger:
             return xs, ys
 
         plots = [
+            # ── Quantitative metrics ──────────────────────────────────────────
             ("train_loss", "Training Loss", "loss"),
             ("eval_loss", "Eval Loss", "eval_loss"),
             ("perplexity", "Perplexity", "perplexity"),
@@ -142,6 +155,17 @@ class MetricsLogger:
             ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
             ("grad_norm", "Gradient Norm", "grad_norm"),
             ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
+            # ── Qualitative metrics (populated when testing_strategy is enabled) ──
+            ("qual_semantic_similarity", "Semantic Similarity (MiniLM)", "qual_semantic_similarity"),
+            ("qual_keyword_density", "Domain Keyword Density", "qual_keyword_density"),
+            ("qual_type_token_ratio", "Type-Token Ratio (Lexical Diversity)", "qual_type_token_ratio"),
+            ("qual_hapax_ratio", "Hapax Ratio (Word Uniqueness)", "qual_hapax_ratio"),
+            ("qual_cot_anchor_count", "CoT Logic Anchor Count (mean)", "qual_cot_anchor_count_mean"),
+            ("qual_cot_step_length", "CoT Step Length - chars between anchors (mean)", "qual_cot_step_length_mean"),
+            ("qual_cot_coverage", "CoT Coverage Rate", "qual_cot_coverage_rate"),
+            ("qual_mean_response_length", "Mean Response Length (words)", "qual_mean_response_length"),
+            ("qual_repetition_rate", "Bigram Repetition Rate", "qual_repetition_rate"),
+            ("qual_non_empty_rate", "Non-Empty Response Rate", "qual_non_empty_rate"),
         ]
 
         generated = 0
@@ -456,8 +480,11 @@ def train_model(config):
     response_template = Template(preproc_cfg.get('response_template', ' {{ target }}'))
     _log("Jinja2 templates compiled (prompt_template + response_template).")
 
-    # Initialize evaluator
+    # Initialize quantitative evaluator
     evaluator = Evaluator(config, tokenizer, device, tokenize_with_label_masking, pad_batch)
+
+    # Initialize qualitative evaluator (no-op if testing_strategy block absent or disabled)
+    qual_evaluator = QualitativeEvaluator(config, tokenizer, device)
     
     # Set up timing for sending weights
     last_send_time = time.time()
@@ -490,6 +517,8 @@ def train_model(config):
         _log(f"Normal mode: will train up to {training_args.max_steps} steps.")
 
     def _log_eval(step):
+        """Run quantitative evaluation and write its metrics to the CSV.
+        Returns the quantitative metrics dict (may be empty)."""
         eval_metrics = evaluator.evaluate(model, step) or {}
         if eval_metrics:
             metrics_logger.log(
@@ -510,6 +539,22 @@ def train_model(config):
                 }
             )
         return eval_metrics
+
+    def _log_qual_eval(step):
+        """Run qualitative evaluation and write its metrics to the CSV.
+        Independent from _log_eval — qualitative eval has its own interval
+        and runs even when quantitative eval is disabled.
+        Returns the qualitative metrics dict (may be empty)."""
+        qual_metrics = qual_evaluator.run(model, step) or {}
+        if qual_metrics:
+            metrics_logger.log(
+                {
+                    "step": step,
+                    "records_used_total": total_messages_seen,
+                    **qual_metrics,
+                }
+            )
+        return qual_metrics
 
     _log(f"Metrics will be saved to: {metrics_logger.metrics_path}")
     _log(f"  (To regenerate plots later: python utils/plot_metrics.py \"{metrics_logger.metrics_path}\")")
@@ -640,9 +685,13 @@ def train_model(config):
                 accumulated_loss = 0.0
                 step_start = time.time()
 
-                # Periodic evaluation
+                # Periodic quantitative evaluation
                 if evaluator.enabled and optimization_step % evaluator.eval_interval == 0:
                     _log_eval(optimization_step)
+
+                # Periodic qualitative evaluation (independent cadence)
+                if qual_evaluator.enabled and optimization_step % qual_evaluator.eval_interval == 0:
+                    _log_qual_eval(optimization_step)
 
             # Every weight_push_interval seconds, send the current LoRA adapter weights.
             if time.time() - last_send_time >= weight_push_interval:
@@ -663,6 +712,19 @@ def train_model(config):
     #  being generated.
     # =====================================================================
 
+    # 0. Flush any pending partial gradient accumulation so the last few
+    #    micro-batches at EOF don't silently lose their gradient signal.
+    if not interrupted and grad_accum_counter % training_args.gradient_accumulation_steps != 0:
+        try:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            optimization_step += 1
+            _log(f"Flushed partial gradient accumulation at step {optimization_step} "
+                 f"({grad_accum_counter % training_args.gradient_accumulation_steps} pending micro-batches).")
+        except Exception as e:
+            _log(f"Warning: Partial gradient flush failed: {e}")
+
     # 1. Send final LoRA weights + done signal to inference.
     try:
         _log("Training complete. Sending final adapter weights.")
@@ -680,6 +742,15 @@ def train_model(config):
             _log("Final evaluation interrupted — skipping. Metrics already saved.")
         except Exception as e:
             _log(f"Warning: Final evaluation failed: {e}")
+
+    # 2b. Final qualitative evaluation (independent of quantitative eval)
+    if qual_evaluator.enabled and not interrupted:
+        try:
+            _log_qual_eval(optimization_step)
+        except KeyboardInterrupt:
+            _log("Final qualitative evaluation interrupted — skipping.")
+        except Exception as e:
+            _log(f"Warning: Final qualitative evaluation failed: {e}")
 
     # 3. Always print the CSV location and generate plots.
     _log(f"Metrics CSV saved to: {metrics_logger.metrics_path}")
