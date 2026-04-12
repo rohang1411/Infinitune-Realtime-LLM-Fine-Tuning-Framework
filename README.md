@@ -351,13 +351,19 @@ InfiniTune has two independent evaluation modes:
 
 Runs automatically inside `trainer.py` at configurable step intervals. Writes results to `output/<project>/logs/.../metrics.csv`. Plots auto-generated at training end.
 
-**To disable for maximum speed:**
+**Config control:**
 ```yaml
 evaluation:
-  enabled: false
-testing_strategy:
-  enabled: false
+  enabled: true
+  decoupled: false   # false = run inline during training, true = skip inline
 ```
+
+**To disable inline evaluation entirely for maximum speed:**
+```yaml
+evaluation:
+  decoupled: true
+```
+*(Alternatively, you can set `enabled: false` to disable evaluation completely in both modes.)*
 
 ### Decoupled Evaluation (after training)
 

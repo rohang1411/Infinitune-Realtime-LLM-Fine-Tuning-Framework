@@ -266,6 +266,15 @@ anchors
 
 ## Decoupled Evaluation (Post-Training)
 
+By default, the framework evaluates the model inline during training. If you want maximum training speed (or prefer to evaluate later), you can disable inline evaluation natively in your config:
+
+```yaml
+evaluation:
+  decoupled: true   # true = skip inline evaluation during training
+```
+
+After training completes (whether you trained with `decoupled: true` or not), you can run evaluation on any checkpoint without re-training:
+
 ```bash
 # Evaluate final checkpoint
 python evaluate.py --config configs/gsm8k_qualitative.yaml
