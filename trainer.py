@@ -60,6 +60,7 @@ class MetricsLogger:
         "kappa",
         "exact_match",
         "qafacteval",
+        "answer_overlap_f1",
         "forgetting_max",
         "update_latency_s",
         "backward_transfer",
@@ -78,6 +79,9 @@ class MetricsLogger:
         "qual_mean_response_length",
         "qual_repetition_rate",
         "qual_non_empty_rate",
+        # ── E2E NLG metrics (populated when strategy=perplexity + e2e config) ──
+        "qual_slot_coverage_mean",
+        "qual_consistency_score_mean",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -118,6 +122,56 @@ class MetricsLogger:
             for r in reader:
                 rows.append(r)
         return rows
+
+    def finalize_csv(self):
+        """Write metrics_clean.csv with only columns that have at least one
+        non-empty value. The original metrics.csv is preserved unchanged."""
+        rows = self._read_csv()
+        if not rows:
+            return
+        all_keys = list(rows[0].keys())
+        populated = [
+            k for k in all_keys
+            if any(r.get(k, "") not in ("", None) for r in rows)
+        ]
+        clean_path = os.path.join(self.dir, "metrics_clean.csv")
+        with open(clean_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=populated, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in populated})
+        _log(f"Clean metrics CSV (populated columns only) saved to: {clean_path}")
+
+    def save_verbose_samples(self, step: int, samples: list, source: str = "quantitative"):
+        """Append verbose evaluation samples as a Markdown table to verbose_samples.md.
+
+        Parameters
+        ----------
+        step    : Optimization step at which eval ran.
+        samples : List of dicts with keys: sample_idx, input, target,
+                  prediction, correct (bool or None).
+        source  : 'quantitative' or 'qualitative' — used as the section heading.
+        """
+        if not samples:
+            return
+        path = os.path.join(self.dir, "verbose_samples.md")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## {source.title()} Eval @ Step {step}\n\n")
+            f.write("| # | Input (truncated) | Target | Prediction | Match |\n")
+            f.write("|---|---|---|---|---|\n")
+            for s in samples:
+                correct = s.get("correct")
+                if correct is True:
+                    mark = "\u2713"
+                elif correct is False:
+                    mark = "\u2717"
+                else:
+                    mark = "—"  # no comparison available (perplexity path)
+                inp  = str(s.get("input",      "")).replace("|", "\u00a6")
+                tgt  = str(s.get("target",     "")).replace("|", "\u00a6")
+                pred = str(s.get("prediction", "")).replace("|", "\u00a6")
+                f.write(f"| {s.get('sample_idx', '')} | {inp} | {tgt} | {pred} | {mark} |\n")
+            f.write("\n---\n")
 
     def generate_plots(self):
         try:
@@ -173,6 +227,10 @@ class MetricsLogger:
             ("qual_mean_response_length", "Mean Response Length (words)", "qual_mean_response_length"),
             ("qual_repetition_rate", "Bigram Repetition Rate", "qual_repetition_rate"),
             ("qual_non_empty_rate", "Non-Empty Response Rate", "qual_non_empty_rate"),
+            # ── E2E NLG metrics ──
+            ("qual_slot_coverage_mean", "Slot Coverage (mean)", "qual_slot_coverage_mean"),
+            ("qual_consistency_score_mean", "Consistency Score (mean)", "qual_consistency_score_mean"),
+            ("answer_overlap_f1", "Answer Overlap F1 (token-level)", "answer_overlap_f1"),
         ]
 
         generated = 0
@@ -445,6 +503,14 @@ def train_model(config, config_path: str = "(unknown)"):
     # Set up Kafka consumer to stream training data.
     poll_timeout_ms = int(kafka_cfg.get('poll_timeout_ms', 1000))
     consumer_group = kafka_cfg.get('consumer_group_trainer', 'trainer-group')
+    # In test_mode, use a unique consumer group per run so there are no stale
+    # committed offsets from previous runs. Combined with auto_offset_reset='earliest'
+    # this ensures ALL messages in the topic are consumed regardless of producer
+    # start order (fixes the seek_to_end() data-loss bug).
+    if test_mode:
+        unique_suffix = uuid.uuid4().hex[:8]
+        consumer_group = f"{consumer_group}-{unique_suffix}"
+        _log(f"Test mode: unique consumer group '{consumer_group}' (no stale offset risk)")
     _log(f"Connecting Kafka consumer: topic='{kafka_cfg['training_topic']}', consumer_group='{consumer_group}', poll_timeout_ms={poll_timeout_ms}")
     consumer = KafkaConsumer(
         kafka_cfg['training_topic'],
@@ -452,6 +518,13 @@ def train_model(config, config_path: str = "(unknown)"):
         value_deserializer=lambda x: json.loads(x.decode("utf-8")),
         group_id=consumer_group,
         auto_offset_reset="earliest",
+        # max_poll_interval_ms: how long poll() can be absent before the broker
+        # evicts this consumer from the group. Training pauses during eval
+        # (especially qualitative eval with consistency_runs), so we set this
+        # generously. Default is 300,000 ms (5 min) which is too short.
+        max_poll_interval_ms=int(kafka_cfg.get('max_poll_interval_ms', 1800000)),   # 30 min
+        session_timeout_ms=int(kafka_cfg.get('session_timeout_ms', 30000)),          # 30 sec
+        heartbeat_interval_ms=int(kafka_cfg.get('heartbeat_interval_ms', 10000)),    # 10 sec
     )
 
     # Force partition assignment and log it (otherwise first poll() does it silently)
@@ -460,15 +533,13 @@ def train_model(config, config_path: str = "(unknown)"):
     assigned = consumer.assignment()
     _log(f"Partition assignment: {assigned if assigned else '(none yet — will assign on next poll)'}")
 
-    if test_mode and assigned:
-        # In test_mode, skip ALL stale data from previous producer runs.
-        # Seek to the very end of the topic so the trainer only consumes
-        # records sent AFTER this point (i.e. the current producer run).
-        consumer.seek_to_end()
+    if test_mode:
+        # Consuming earliest offsets with a unique group — no seek needed.
+        # The producer can start before or after the trainer; all data is consumed.
         for tp in assigned:
-            pos = consumer.position(tp)
-            _log(f"  {tp}: seeked to end, position={pos}")
-        _log("Test mode: Positioned at end of topic — only NEW records from this producer run will be consumed.")
+            pos = consumer.position(tp) if assigned else 0
+            _log(f"  {tp}: starting at position={pos}")
+        _log("Test mode: consuming from earliest offset. Producer can start in any order.")
         _log(">>> Start the producer now (if not already running). <<<")
     else:
         for tp in assigned:
@@ -559,6 +630,8 @@ def train_model(config, config_path: str = "(unknown)"):
 
     eof_received = False
     stop_requested = False
+    consecutive_empty_polls_after_eof = 0
+    max_consecutive_empty_polls = 100  # 100 x 1s = ~100s of true silence after offsets caught up
 
     # In test_mode we train on the ENTIRE dataset (stop on EOF, not max_steps).
     # max_steps still serves as a safety cap in normal mode.
@@ -585,11 +658,16 @@ def train_model(config, config_path: str = "(unknown)"):
                     "mcc": eval_metrics.get("mcc"),
                     "kappa": eval_metrics.get("kappa"),
                     "exact_match": eval_metrics.get("exact_match"),
+                    "answer_overlap_f1": eval_metrics.get("answer_overlap_f1"),
                     "forgetting_max": eval_metrics.get("forgetting_max"),
                     "update_latency_s": eval_metrics.get("update_latency_s"),
                     "records_used_total": total_messages_seen,
                 }
             )
+            # Persist verbose samples to Markdown if present
+            verbose = eval_metrics.get("_verbose_samples")
+            if verbose:
+                metrics_logger.save_verbose_samples(step, verbose, source="quantitative")
         return eval_metrics
 
     def _log_qual_eval(step):
@@ -620,17 +698,48 @@ def train_model(config, config_path: str = "(unknown)"):
             while len(batch_samples) < training_args.per_device_train_batch_size:
                 messages = consumer.poll(timeout_ms=poll_timeout_ms)
                 if not messages:
+                    # After EOF is received, use Kafka offset metadata to verify
+                    # the topic is truly drained before starting the countdown.
+                    # This prevents false-positive termination from transient empty
+                    # polls caused by consumer group rebalancing or fetch timing.
+                    if eof_received:
+                        all_caught_up = False
+                        try:
+                            end_offsets = consumer.end_offsets(list(consumer.assignment()))
+                            all_caught_up = all(
+                                consumer.position(tp) >= end_offsets.get(tp, 0)
+                                for tp in consumer.assignment()
+                            )
+                        except Exception:
+                            pass  # be conservative: don't count if check fails
+
+                        if all_caught_up:
+                            consecutive_empty_polls_after_eof += 1
+                            if consecutive_empty_polls_after_eof >= max_consecutive_empty_polls:
+                                _log(
+                                    f"End-of-stream reached: all offsets consumed, "
+                                    f"{consecutive_empty_polls_after_eof} consecutive empty polls. "
+                                    f"Exiting training loop. (total_messages_seen={total_messages_seen})"
+                                )
+                                stop_requested = True
+                                break
+                        # else: offsets show more data exists — keep polling, don't count
+                    
                     # Heartbeat so it never looks "stuck" while waiting for producer data.
                     now = time.time()
-                    if eof_received and (now - last_data_time) >= 2.0:
-                        _log("End-of-stream: no more data from producer. Exiting training loop.")
-                        stop_requested = True
-                        break
                     if now - last_heartbeat_time >= heartbeat_every_s:
-                        _log(f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s")
+                        _log(
+                            f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, "
+                            f"total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s"
+                            + (f", consecutive_empty_polls_after_eof={consecutive_empty_polls_after_eof}/{max_consecutive_empty_polls}" if eof_received else "")
+                        )
                         last_heartbeat_time = now
                     time.sleep(0.1)
                     continue
+
+                # Reset counter whenever we get data after EOF
+                if eof_received:
+                    consecutive_empty_polls_after_eof = 0
 
                 for tp, records in messages.items():
                     for message in records:
@@ -642,6 +751,7 @@ def train_model(config, config_path: str = "(unknown)"):
                         if isinstance(sample_data, dict) and ("_eof" in sample_data or "_verify" in sample_data):
                             if sample_data.get("_eof"):
                                 eof_received = True
+                                consecutive_empty_polls_after_eof = 0  # Reset on EOF marker
                                 _log("Received end-of-stream marker from producer.")
                             continue
 
@@ -847,12 +957,16 @@ def train_model(config, config_path: str = "(unknown)"):
     # 4. Always print the CSV location and generate plots.
     _log(f"Metrics CSV saved to: {metrics_logger.metrics_path}")
     try:
+        metrics_logger.finalize_csv()
+    except Exception as e:
+        _log(f"Warning: Clean CSV generation failed: {e}")
+    try:
         metrics_logger.generate_plots()
     except Exception as e:
         _log(f"Warning: Plot generation failed: {e}")
     _log(f"To regenerate plots later: python utils/plot_metrics.py \"{metrics_logger.metrics_path}\"")
     if ckpt_manager:
-        _log(f"Checkpoints saved to: {ckpt_manager.checkpoint_root}")
+        _log(f"Checkpoints saved to: {ckpt_manager.checkpoint_root} (run: {ckpt_manager._run_dir})")
         _log("To run decoupled evaluation: python evaluate.py --config <config> [--step N | --all-checkpoints]")
 
 # --------------------------------------------------

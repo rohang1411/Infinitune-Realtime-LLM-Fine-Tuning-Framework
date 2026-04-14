@@ -92,6 +92,47 @@ def generate_training_examples(config):
             "target": target_val,
         }
 
+def clear_kafka_topic(kafka_cfg, topic):
+    """
+    Delete all existing messages in the topic up to the latest offset.
+    This ensures that restarted runs do not consume stale data left in the topic
+    by previous interrupted runs.
+    """
+    from kafka import KafkaAdminClient, KafkaConsumer, TopicPartition
+    try:
+        # Import RecordsToDelete locally to avoid issues on older kafka-python versions if any
+        from kafka.admin import RecordsToDelete
+    except ImportError:
+        _log(f"Warning: Installed kafka-python version does not support delete_records. Skipping topic clear.")
+        return
+
+    try:
+        _log(f"Checking for stale messages in topic '{topic}' to clear...")
+        consumer = KafkaConsumer(bootstrap_servers=kafka_cfg['bootstrap_servers'])
+        partitions = consumer.partitions_for_topic(topic)
+        if not partitions:
+            _log("Topic does not exist yet; nothing to clear.")
+            return
+
+        tps = [TopicPartition(topic, p) for p in partitions]
+        end_offsets = consumer.end_offsets(tps)
+
+        records_to_delete = {}
+        total_cleared = 0
+        for tp, offset in end_offsets.items():
+            if offset > 0:
+                records_to_delete[tp] = RecordsToDelete(offset)
+                total_cleared += offset
+
+        if records_to_delete:
+            admin = KafkaAdminClient(bootstrap_servers=kafka_cfg['bootstrap_servers'])
+            admin.delete_records(records_to_delete)
+            _log(f"Successfully truncated topic. Cleared {total_cleared} stale messages.")
+        else:
+            _log("Topic is already empty.")
+    except Exception as e:
+        _log(f"Warning: Failed to clear old messages from topic: {e}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Data Producer")
     parser.add_argument("--config", type=str, default="config.yaml",
@@ -101,8 +142,12 @@ if __name__ == "__main__":
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
     stream_filter = StreamFilter(config, log_fn=_log)
-    producer = create_producer(config)
+    
     topic_name = config['kafka']['training_topic']
+    # Clear old messages from previous interrupted runs so we start fresh
+    clear_kafka_topic(config['kafka'], topic_name)
+
+    producer = create_producer(config)
     send_interval = config['kafka'].get('producer_send_interval', 0.1)
     hash_column = config['preprocessing'].get('hash_column', 'input')
 

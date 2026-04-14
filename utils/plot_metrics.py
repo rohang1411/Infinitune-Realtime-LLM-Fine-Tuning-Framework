@@ -94,6 +94,10 @@ def generate_plots(csv_path, out_dir=None):
         ("qual_mean_response_length", "Mean Response Length (words)", "qual_mean_response_length"),
         ("qual_repetition_rate", "Bigram Repetition Rate", "qual_repetition_rate"),
         ("qual_non_empty_rate", "Non-Empty Response Rate", "qual_non_empty_rate"),
+        # ── E2E NLG metrics (populated when strategy=perplexity + e2e config) ──
+        ("qual_slot_coverage_mean", "Slot Coverage (mean)", "qual_slot_coverage_mean"),
+        ("qual_consistency_score_mean", "Consistency Score (mean)", "qual_consistency_score_mean"),
+        ("answer_overlap_f1", "Answer Overlap F1 (token-level)", "answer_overlap_f1"),
     ]
 
     generated = 0
