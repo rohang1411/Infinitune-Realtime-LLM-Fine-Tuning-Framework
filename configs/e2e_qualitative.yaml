@@ -34,7 +34,7 @@ lora:
   alpha: 32
   dropout: 0.05
   bias: "none"
-  target_modules: ["c_attn"]
+  target_modules: ["c_attn", "c_proj"]
 
 # --- Dataset ---
 dataset:
@@ -114,7 +114,7 @@ inference:
 # on the full validation pool.
 evaluation:
   enabled: true
-  decoupled: false
+  decoupled: true
   strategy: "perplexity"
   eval_interval: 50
   eval_pool_size: 500
