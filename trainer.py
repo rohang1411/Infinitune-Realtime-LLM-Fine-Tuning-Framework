@@ -250,21 +250,21 @@ def tokenize_with_label_masking(tokenizer, prompt_text, response_text, max_seq_l
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
     response_ids = tokenizer.encode(response_text, add_special_tokens=False)
 
-    # Append EOS so the model learns to stop after the response
-    if eos_id is not None:
-        response_ids = response_ids + [eos_id]
-
-    # Truncate prompt to leave room for the response (+ EOS already included)
-    max_prompt_len = max_seq_length - len(response_ids)
-    if max_prompt_len <= 0:
-        # Edge case: response itself exceeds limit — truncate but keep EOS
+    if len(prompt_ids) >= max_seq_length:
+        prompt_ids = prompt_ids[:max_seq_length - 1]
+        response_ids = []
         if eos_id is not None:
-            response_ids = response_ids[:max_seq_length - 1] + [eos_id]
-        else:
-            response_ids = response_ids[:max_seq_length]
-        prompt_ids = []
+            prompt_ids.append(eos_id)
     else:
-        prompt_ids = prompt_ids[:max_prompt_len]
+        max_response_len = max_seq_length - len(prompt_ids)
+        if len(response_ids) > max_response_len:
+            if eos_id is not None:
+                response_ids = response_ids[:max_response_len - 1] + [eos_id]
+            else:
+                response_ids = response_ids[:max_response_len]
+        else:
+            if eos_id is not None:
+                response_ids = response_ids + [eos_id]
 
     input_ids = prompt_ids + response_ids
     attention_mask = [1] * len(input_ids)
@@ -428,6 +428,17 @@ def train_model(config, config_path: str = "(unknown)"):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
+    
+    # Enable gradient checkpointing — trades ~30% extra compute for ~60% less
+    # activation memory.  Critical on memory-constrained GPUs (Colab T4/A10G).
+    if training_cfg.get('gradient_checkpointing', True):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        _log("Gradient checkpointing enabled (use_reentrant=False).")
+    else:
+        _log("Gradient checkpointing disabled.")
+
     # Set the model to training mode.
     model.train()
     
@@ -476,8 +487,12 @@ def train_model(config, config_path: str = "(unknown)"):
     )
     _log(f"TrainingArguments: per_device_train_batch_size={training_args.per_device_train_batch_size}, grad_accum={training_args.gradient_accumulation_steps}, fp16={training_args.fp16}")
     
-    # Create an optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+    # Create an optimizer — only pass trainable (LoRA) parameters.
+    # Passing all params works but wastes time iterating 1.5B frozen params
+    # during every step/zero_grad call.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    _log(f"Optimizer will track {len(trainable_params)} trainable parameter tensors.")
+    optimizer = torch.optim.AdamW(trainable_params, lr=training_args.learning_rate)
 
     # Create LR scheduler
     scheduler = build_lr_scheduler(optimizer, config)
@@ -750,14 +765,14 @@ def train_model(config, config_path: str = "(unknown)"):
                 if qual_evaluator.enabled and optimization_step % qual_evaluator.eval_interval == 0:
                     _log_qual_eval(optimization_step)
 
-                # Periodic aggressive garbage collection on Apple Silicon / memory constrained GPUs
-                if optimization_step % 10 == 0:
-                    import gc
-                    gc.collect()
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-                    elif torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                # Aggressive garbage collection EVERY step to prevent VRAM
+                # fragmentation from accumulating across optimization steps.
+                import gc
+                gc.collect()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                elif torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Every weight_push_interval seconds, send the current LoRA adapter weights.
             if time.time() - last_send_time >= weight_push_interval:

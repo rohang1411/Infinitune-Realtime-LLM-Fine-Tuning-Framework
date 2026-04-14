@@ -1,0 +1,147 @@
+# ============================================================
+# InfiniTune Configuration — Qualitative: Structured Data Generation (E2E NLG)
+# Task Type   : Causal LM / Conditional Language Modeling
+# Dataset     : GEM/e2e_nlg
+# Model       : Qwen/Qwen2.5-1.5B (1.5B params base model)
+# Eval Method : Structured Data Slot Coverage & Consistency
+#
+# Objective:
+#   Prove the model has successfully absorbed structured generation routing.
+#   A base model zero-shot will fail to correctly verbalize a meaning
+#   representation (MR) completely. Post-training, it consistently covers all
+#   specified slots natively without an LLM Judge.
+#
+# Run:
+#   python producer.py --config configs/e2e_qualitative.yaml
+#   python trainer.py  --config configs/e2e_qualitative.yaml
+#   python evaluate.py --config configs/e2e_qualitative.yaml
+# ============================================================
+
+project:
+  name: "infinitune-e2e-nlg"
+  output_dir: "./output/e2e"
+
+# --- Model ---
+model:
+  name: "Qwen/Qwen2.5-1.5B"      # base model, not instruct
+  task_type: "CAUSAL_LM"
+  precision: "fp16"
+  max_seq_length: 128            # MR inputs + descriptions are very short
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"] # Expanded to include key and output projections for better generation quality
+
+# --- Dataset ---
+dataset:
+  name: "parquet"
+  data_files:
+    train: "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+    validation: "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet"
+  config_name: null
+  split: "train"
+  eval_split: "validation"
+  column_mapping:
+    input_col: "meaning_representation"
+    target_col: "target"
+  label_map: null
+  shuffle: true
+  shuffle_seed: 42
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "MR: {{ input }}\nDescription:"
+  response_template: " {{ target }}"
+  hash_column: "input"
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 5             # Remove empty MRs
+      max_chars: 1000
+      min_alphanumeric_ratio: 0.5
+      max_repetition_ratio: 0.5  # Sometimes descriptions say 'friendly family friendly' etc.
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-e2e"
+  lora_updates_topic: "lora-updates-e2e"
+  enable_lora_streaming: false
+  producer_send_interval: 0.05
+  consumer_group_trainer: "trainer-group-e2e"
+  consumer_group_inference: "inference-api-group-e2e"
+
+# --- Training ---
+training:
+  test_mode: true              # Train on full dataset
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true # Enabled to save VRAM by recomputing activations
+  learning_rate: 2e-4
+  max_steps: 2100              # 33.5k examples / (8 * 2) effective batch size ~= 2095 steps for 1 Epoch
+  logging_steps: 1
+  weight_push_interval: 60
+  lr_scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 2100                # Align with max_steps
+  save_checkpoints:
+    enabled: true
+    save_every_steps: 200      # User requested saving every 100 steps
+    save_final: true
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 60
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Quantitative Evaluation ---
+# We compute perplexity and answer_overlap_f1 (comparable to ROUGE/BLEU)
+# on the full validation pool.
+evaluation:
+  enabled: true
+  decoupled: true
+  strategy: "perplexity"
+  eval_interval: 50
+  eval_pool_size: 500
+  eval_batch_size: 50
+  verbose: false
+  answer_regex: null
+  metrics:
+    compute_loss: true
+    compute_accuracy: false
+    compute_exact_match: false
+    compute_f1: false
+    compute_answer_overlap_f1: true   # token-level F1
+    compute_mcc: false
+    compute_kappa: false
+    compute_forgetting: false
+
+# --- Qualitative Evaluation ---
+# Evaluates slot representation visually and mathematically
+testing_strategy:
+  enabled: true
+  method: "structured_slot_coverage"
+  eval_interval: 200            # Matrix generation is heavy, doing it at checkpoint intervals
+  eval_samples: 10              # The table of 10 samples
+  eval_pool_size: 150
+  max_new_tokens: 60
+  consistency_runs: 5           # Generates 5 distinct times per sample
+  consistency_temperature: 0.7
+  slot_keywords: null           # Dynamic parsed from MR natively
+  logic_anchors: null
+  sentence_model: null

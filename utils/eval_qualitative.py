@@ -127,16 +127,31 @@ class QualitativeMetric(ABC):
     """
 
     @abstractmethod
-    def compute(self, predictions: list, references: list) -> dict:
+    def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
         """
         Args:
             predictions : List of model-generated text strings.
             references  : List of golden reference strings, or list of None
                           for reference-free strategies.
+            inputs      : List of input strings used for generation.
         Returns:
             dict[str, float] — all keys prefixed with "qual_".
         """
         ...
+        
+    def compute_consistency(self, predictions_matrix: list, references: list, inputs: list = None) -> dict:
+        """
+        Base default: Returns an empty dict.
+        Subclasses can override this to evaluate consistency over multiple generation runs for the same input.
+        
+        Args:
+            predictions_matrix: List of Lists of strings. Shape: [len(window), consistency_runs].
+            references: List of reference strings.
+            inputs: List of input strings.
+        Returns:
+            dict[str, float] with consistency metrics.
+        """
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,7 +198,7 @@ class SemanticSimilarityMetric(QualitativeMetric):
             self._model = self._SentenceTransformer(self._model_name, device="cpu")
             _log("Sentence embedding model ready.")
 
-    def compute(self, predictions: list, references: list) -> dict:
+    def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
         """
         Returns qual_semantic_similarity: mean cosine similarity across pairs.
         Pairs where either prediction or reference is empty score 0.0.
@@ -258,7 +273,7 @@ class KeywordDensityMetric(QualitativeMetric):
         self._keywords = [str(k).lower().strip() for k in keywords if k]
         _log(f"KeywordDensityMetric initialized with {len(self._keywords)} keywords.")
 
-    def compute(self, predictions: list, references: list) -> dict:
+    def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
         """
         references is ignored — this is a reference-free metric.
         """
@@ -399,7 +414,7 @@ class StructuralCoTMetric(QualitativeMetric):
         mean_step_length = sum(step_lengths) / len(step_lengths) if step_lengths else None
         return anchor_count, mean_step_length
 
-    def compute(self, predictions: list, references: list) -> dict:
+    def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
         """
         references is used only to log comparison info; the structural metrics
         are computed solely on the generated text.
@@ -434,6 +449,100 @@ class StructuralCoTMetric(QualitativeMetric):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Strategy 4: Structured Slot Coverage (E2E NLG / Consistency Validation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StructuredSlotCoverageMetric(QualitativeMetric):
+    """
+    Evaluates whether the model successfully verbalizes all attributes specified
+    in a structured Meaning Representation (MR).
+    
+    Parses slots shaped exactly like: `name[The Punter] | food[Indian]`
+    and simply checks if the target value string was included in the generation.
+    """
+
+    def __init__(self, slot_keywords: dict = None):
+        # We don't strictly require keywords dict since we parse them directly from the MR string.
+        # But we accept it to maintain a shared interface signature if needed.
+        self._pattern = re.compile(r"(\w+)\[([^\]]+)\]")
+
+    def _parse_mr(self, mr_string: str) -> dict:
+        slots = {}
+        for match in self._pattern.finditer(mr_string):
+            attr, val = match.groups()
+            slots[attr] = val.strip()
+        return slots
+
+    def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
+        if not predictions or not inputs:
+            return {}
+
+        coverage_scores = []
+        for pred, inp in zip(predictions, inputs):
+            text = (pred or "").strip().lower()
+            mr_string = (inp or "")
+            slots = self._parse_mr(mr_string)
+            
+            if not slots:
+                coverage_scores.append(0.0)
+                continue
+
+            hits = sum(1 for _, val in slots.items() if val.lower() in text)
+            coverage_scores.append(hits / len(slots))
+
+        if not coverage_scores:
+            return {}
+        return {"qual_slot_coverage_mean": sum(coverage_scores) / len(coverage_scores)}
+
+    def compute_consistency(self, predictions_matrix: list, references: list, inputs: list = None) -> dict:
+        if not predictions_matrix or not inputs:
+            return {}
+            
+        full_coverage_counts = []
+        n_runs = len(predictions_matrix[0]) if predictions_matrix else 1
+        
+        # Log table header
+        _log("")
+        _log("| MR Input | Generated Output (Sample Run) | Coverage |")
+        _log("|---|---|---|")
+        
+        for i, (pred_runs, inp) in enumerate(zip(predictions_matrix, inputs)):
+            mr_string = (inp or "")
+            slots = self._parse_mr(mr_string)
+            if not slots:
+                full_coverage_counts.append(0.0)
+                continue
+                
+            runs_with_full_coverage = 0
+            sample_run_text = ""
+            sample_coverage = 0.0
+            
+            for text in pred_runs:
+                clean_text = (text or "").strip().lower()
+                hits = sum(1 for _, val in slots.items() if val.lower() in clean_text)
+                coverage = hits / len(slots)
+                
+                # Keep the first run for logging exactly
+                if not sample_run_text:
+                    sample_run_text = text.strip().replace("\n", " ")
+                    sample_coverage = coverage
+                    
+                if coverage >= 0.85: # Almost full coverage
+                    runs_with_full_coverage += 1
+                    
+            full_coverage_counts.append(runs_with_full_coverage / n_runs)
+            
+            # Log this row into the visually readable markdown table!
+            _log(f"| {mr_string} | {sample_run_text} | {sample_coverage*100:.0f}% |")
+            
+        _log("")
+
+        if not full_coverage_counts:
+            return {}
+        return {"qual_consistency_score_mean": sum(full_coverage_counts) / len(full_coverage_counts)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Factory Helper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -465,9 +574,13 @@ def _build_metric(ts_cfg: dict) -> QualitativeMetric:
         raw_anchors = ts_cfg.get("logic_anchors")  # None → use defaults
         return StructuralCoTMetric(logic_anchors=raw_anchors)
 
+    if method == "structured_slot_coverage":
+        slot_keywords = ts_cfg.get("slot_keywords")
+        return StructuredSlotCoverageMetric(slot_keywords=slot_keywords)
+
     raise ValueError(
         f"Unknown testing_strategy.method: '{method}'. "
-        f"Supported values: semantic_similarity | keyword_density | structural_cot"
+        f"Supported values: semantic_similarity | keyword_density | structural_cot | structured_slot_coverage"
     )
 
 
@@ -520,6 +633,10 @@ class QualitativeEvaluator:
         self._eval_samples: int = int(ts_cfg.get("eval_samples", 20))
         self._max_new_tokens: int = int(ts_cfg.get("max_new_tokens", 150))
 
+        # --- Consistency loops ---
+        self._consistency_runs: int = int(ts_cfg.get("consistency_runs", 1))
+        self._consistency_temperature: float = float(ts_cfg.get("consistency_temperature", 0.7))
+
         # --- Jinja2 templates (for prompt construction during generation) ---
         preproc = config.get("preprocessing", {})
         self._prompt_template = Template(preproc.get("prompt_template", "{{ input }}"))
@@ -563,6 +680,8 @@ class QualitativeEvaluator:
         target_col = col_map.get("target_col", "target")
 
         ds_kwargs = {"path": dataset_cfg.get("name", ""), "split": eval_split}
+        if dataset_cfg.get("data_files"):
+            ds_kwargs["data_files"] = dataset_cfg["data_files"]
         if dataset_cfg.get("config_name"):
             ds_kwargs["name"] = dataset_cfg["config_name"]
 
@@ -638,7 +757,7 @@ class QualitativeEvaluator:
     # Generation
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _generate_responses(self, model, window: list) -> tuple:
+    def _generate_responses(self, model, window: list, do_sample: bool = False, temperature: float = 1.0) -> tuple:
         """
         Generate model responses for the eval window.
 
@@ -649,12 +768,16 @@ class QualitativeEvaluator:
         predictions = []
         references = []
 
-        gen_config = GenerationConfig(
-            max_new_tokens=self._max_new_tokens,
-            do_sample=False,  # Deterministic for reproducible evals
-            pad_token_id=self.tokenizer.eos_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-        )
+        gen_config_kwargs = {
+            "max_new_tokens": self._max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.eos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_config_kwargs["temperature"] = temperature
+            
+        gen_config = GenerationConfig(**gen_config_kwargs)
 
         max_seq_length = self.config.get("model", {}).get("max_seq_length", 512)
 
@@ -681,6 +804,11 @@ class QualitativeEvaluator:
                 predictions.append(response)
                 references.append(sample.get("reference"))
 
+                # Intelligently clean boundary matrices immediately preserving PyTorch native graphs safely intrinsically beautifully securely effectively
+                del inputs
+                del output_ids
+                del generated_ids
+                
             except Exception as exc:
                 _log(f"  Warning: generation failed for eval sample {i}: {exc}")
                 predictions.append("")
@@ -713,7 +841,27 @@ class QualitativeEvaluator:
         t_start = time.monotonic()
 
         window = self._get_eval_window()
-        predictions, references = self._generate_responses(model, window)
+        inputs = [sample.get("input", "") for sample in window]
+        
+        # Generalized Consistency Generation
+        if self._consistency_runs > 1:
+            _log(f"  Running matrix generation: {self._consistency_runs} runs per sample (temp={self._consistency_temperature})")
+            predictions_matrix = [[] for _ in range(len(window))]
+            final_references = []
+            
+            for run_idx in range(self._consistency_runs):
+                preds, refs = self._generate_responses(
+                    model, window, do_sample=True, temperature=self._consistency_temperature
+                )
+                if run_idx == 0:
+                    final_references = refs
+                for i, p in enumerate(preds):
+                    predictions_matrix[i].append(p)
+                    
+            predictions = [runs[0] for runs in predictions_matrix] # fallback to standard 1D stats for compatibility
+            references = final_references
+        else:
+            predictions, references = self._generate_responses(model, window, do_sample=False)
 
         if not any(p.strip() for p in predictions):
             _log("  Warning: all qualitative eval generations were empty — skipping metrics.")
@@ -722,7 +870,10 @@ class QualitativeEvaluator:
         # Run the selected strategy metric
         strategy_metrics = {}
         try:
-            strategy_metrics = self._metric.compute(predictions, references)
+            strategy_metrics = self._metric.compute(predictions, references, inputs=inputs)
+            if self._consistency_runs > 1:
+                consistency_metrics = self._metric.compute_consistency(predictions_matrix, references, inputs=inputs)
+                strategy_metrics.update(consistency_metrics)
         except Exception as exc:
             _log(f"  Warning: strategy metric ({self._method}) failed: {exc}")
 

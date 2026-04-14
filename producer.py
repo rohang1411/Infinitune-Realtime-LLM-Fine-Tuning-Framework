@@ -59,6 +59,8 @@ def generate_training_examples(config):
     ds_kwargs = {"path": dataset_cfg['name'], "split": dataset_cfg['split']}
     if dataset_cfg.get('config_name'):
         ds_kwargs["name"] = dataset_cfg['config_name']
+    if dataset_cfg.get('data_files'):
+        ds_kwargs["data_files"] = dataset_cfg.get('data_files')
 
     dataset = load_dataset(**ds_kwargs)
 

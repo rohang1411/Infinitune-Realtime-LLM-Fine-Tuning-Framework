@@ -137,6 +137,7 @@ def _default_metric_flags(strategy: str):
             **_online,
             "compute_accuracy": True,
             "compute_backward_transfer": True,
+            "compute_backward_transfer": True,
             "compute_exact_match": True,
             "compute_f1": True,
             "compute_mcc": True,
@@ -148,6 +149,7 @@ def _default_metric_flags(strategy: str):
             **loss,
             **_online,
             "compute_accuracy": True,
+            "compute_backward_transfer": True,
             "compute_backward_transfer": True,
             "compute_exact_match": True,
             # F1 / MCC / kappa are usually misleading for free-form or
@@ -162,6 +164,7 @@ def _default_metric_flags(strategy: str):
         **loss,
         **_online,
         "compute_accuracy": False,
+        "compute_backward_transfer": False,
         "compute_backward_transfer": False,
         "compute_exact_match": False,
         "compute_f1": False,
@@ -248,8 +251,9 @@ class Evaluator:
             else None
         )
 
-        # Sliding window cursor — tracks position within the eval pool
+        # Sliding window cursor � tracks position within the eval pool
         self._eval_cursor = 0
+        self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
 
         # Forgetting + update latency (online / continual-learning style diagnostics)
@@ -292,6 +296,8 @@ class Evaluator:
         label_map = dataset_cfg.get('label_map')
 
         ds_kwargs = {"path": dataset_cfg['name'], "split": eval_split}
+        if dataset_cfg.get("data_files"):
+            ds_kwargs["data_files"] = dataset_cfg["data_files"]
         if dataset_cfg.get('config_name'):
             ds_kwargs["name"] = dataset_cfg['config_name']
 
@@ -467,6 +473,11 @@ class Evaluator:
                     source_texts.append(str(sample.get("input", "")))
                     generated_responses.append(response)
 
+                    # Intelligently clean boundary matrices immediately preserving PyTorch native graphs safely intrinsically beautifully securely effectively
+                    del inputs
+                    del output_ids
+                    del generated_ids
+
                     if self.verbose:
                         mark = "✓" if pred == gold else "✗"
                         _log(
@@ -485,6 +496,25 @@ class Evaluator:
                     correct = sum(correct_list)
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
+
+                    if mf.get("compute_backward_transfer", False):
+                        bwt_sum = 0.0
+                        bwt_count = 0
+                        for i, is_correct in enumerate(correct_list):
+                            sample_idx = (window_start + i) % len(self.eval_data)
+                            curr_acc = 1.0 if is_correct else 0.0
+                            
+                            if sample_idx in self.past_sample_accuracies:
+                                max_past = self.past_sample_accuracies[sample_idx]
+                                bwt_sum += (curr_acc - max_past)
+                                bwt_count += 1
+                                if curr_acc > max_past:
+                                    self.past_sample_accuracies[sample_idx] = curr_acc
+                            else:
+                                self.past_sample_accuracies[sample_idx] = curr_acc
+                                
+                        if bwt_count > 0:
+                            metrics["backward_transfer"] = bwt_sum / bwt_count
                     self._aauc_history.append((step, metrics["accuracy"]))
                     metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
 
@@ -661,6 +691,49 @@ class Evaluator:
 
             if forgetting_components:
                 metrics["forgetting_max"] = max(forgetting_components)
+
+
+        # --- Verbose Manual Verification (Sample Generation) ---
+        if self.verbose and not need_generation:
+            _log("  Verbose mode: generating sample records for manual verification...")
+            cfg_max_new_tokens = self.config.get("inference", {}).get("max_new_tokens", 50)
+            
+            # Use a small subset of the current window for verbosity
+            sample_subset = eval_window[:5] 
+            for idx, sample in enumerate(sample_subset):
+                try:
+                    prompt_text = self.prompt_template.render(**sample)
+                    inputs = self.tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        max_length=self.max_seq_length,
+                        truncation=True,
+                    ).to(self.device)
+                    prompt_token_len = inputs["input_ids"].shape[1]
+
+                    gen_config = GenerationConfig(
+                        max_new_tokens=cfg_max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                    with torch.no_grad():
+                        output_ids = model.generate(**inputs, generation_config=gen_config)
+
+                    response = self.tokenizer.decode(
+                        output_ids[0, prompt_token_len:], skip_special_tokens=True
+                    ).strip()
+
+                    _log(f"  [SAMPLE {idx}]")
+                    _log(f"    Input  : {prompt_text[:150].replace('\\n', ' ')}")
+                    _log(f"    Target : {str(sample.get('target', ''))[:150].replace('\\n', ' ')}")
+                    _log(f"    Model  : {response}")
+                    
+                    del inputs
+                    del output_ids
+                except Exception as e:
+                    _log(f"    Warning: skip verbose sample {idx}: {e}")
 
         self._last_eval_end_wall = time.monotonic()
 
