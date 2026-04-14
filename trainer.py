@@ -68,7 +68,7 @@ class MetricsLogger:
         "tokens_per_sec",
         "step_time_s",
         "records_used_total",
-        # ── Qualitative metrics (populated when testing_strategy is enabled) ──
+        # ── Qualitative metrics — universal ──────────────────────────────────
         "qual_semantic_similarity",
         "qual_keyword_density",
         "qual_type_token_ratio",
@@ -79,9 +79,15 @@ class MetricsLogger:
         "qual_mean_response_length",
         "qual_repetition_rate",
         "qual_non_empty_rate",
-        # ── E2E NLG metrics (populated when strategy=perplexity + e2e config) ──
+        # ── E2E NLG — slot coverage summary ──────────────────────────────────
         "qual_slot_coverage_mean",
         "qual_consistency_score_mean",
+        "qual_perfect_coverage_rate",
+        "qual_slot_familyFriendly_inversion_rate",
+        # ── E2E NLG — pinned anchor metrics ──────────────────────────────────
+        "qual_pinned_slot_coverage_mean",
+        "qual_pinned_perfect_coverage_rate",
+        "qual_pinned_consistency_score",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -104,14 +110,27 @@ class MetricsLogger:
             json.dump(params, f, indent=2, sort_keys=True)
 
     def log(self, row: dict):
+        # Dynamic columns: anything in row not in COLUMNS is appended.
+        # This handles per-slot columns like qual_slot_food_coverage which
+        # are dataset-specific and not known at class definition time.
+        extra_keys = [k for k in row if k not in self.COLUMNS]
+        fieldnames = self.COLUMNS + extra_keys
+
         mode = "a" if self._header_written else "w"
         with open(self.metrics_path, mode, newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.COLUMNS, extrasaction="ignore")
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             if not self._header_written:
                 writer.writeheader()
                 self._header_written = True
-            out = {k: row.get(k, "") for k in self.COLUMNS}
+                self._fieldnames = fieldnames  # cache for later reads
+            out = {k: row.get(k, "") for k in fieldnames}
             writer.writerow(out)
+
+        # If new extra keys arrived on a subsequent log() call, we need to
+        # re-write the header. Instead of rewriting the whole file (expensive),
+        # we mark the flag so the DictWriter picks up the expanded set next time.
+        if extra_keys and not hasattr(self, '_fieldnames'):
+            self._fieldnames = fieldnames
 
     def _read_csv(self):
         rows = []
@@ -173,83 +192,32 @@ class MetricsLogger:
                 f.write(f"| {s.get('sample_idx', '')} | {inp} | {tgt} | {pred} | {mark} |\n")
             f.write("\n---\n")
 
-    def generate_plots(self):
+    def generate_plots(self, config: dict = None):
+        """Generate individual metric PNGs and the unified dashboard.
+
+        Delegates to utils/plot_metrics.generate_plots() which handles both
+        individual plots and the multi-panel dashboard with config header.
+
+        Parameters
+        ----------
+        config : Full YAML config dict. When provided, the dashboard header
+                 shows model, LR, LoRA parameters, and evaluation settings.
+        """
+        if not os.path.exists(self.metrics_path):
+            _log("Plotting skipped (no metrics CSV found).")
+            return
+
+        # Use metrics_clean.csv if present (fewer empty columns = cleaner plots)
+        clean_path = os.path.join(self.dir, "metrics_clean.csv")
+        csv_to_plot = clean_path if os.path.exists(clean_path) else self.metrics_path
+
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-        except Exception as e:
-            _log(f"Plotting skipped (matplotlib not available): {e}")
-            return
+            from utils.plot_metrics import generate_plots
+            generate_plots(csv_to_plot, out_dir=self.dir, config=config)
+        except Exception as exc:
+            _log(f"Plotting failed: {exc}")
+            import traceback; traceback.print_exc()
 
-        rows = self._read_csv()
-        if not rows:
-            _log("Plotting skipped (no metrics rows in CSV).")
-            return
-
-        def _series(key):
-            xs, ys = [], []
-            for r in rows:
-                val = r.get(key, "")
-                if val in ("", None):
-                    continue
-                try:
-                    xs.append(int(r.get("step", 0)))
-                    ys.append(float(val))
-                except Exception:
-                    continue
-            return xs, ys
-
-        plots = [
-            # ── Quantitative metrics ──────────────────────────────────────────
-            ("train_loss", "Training Loss", "loss"),
-            ("eval_loss", "Eval Loss", "eval_loss"),
-            ("perplexity", "Perplexity", "perplexity"),
-            ("accuracy", "Accuracy", "accuracy"),
-            ("aauc", "AAUC (normalized)", "aauc"),
-            ("backward_transfer", "Backward Transfer", "backward_transfer"),
-            ("f1", "Macro F1 Score", "f1"),
-            ("mcc", "Matthews Correlation Coefficient", "mcc"),
-            ("kappa", "Cohen's Kappa", "kappa"),
-            ("exact_match", "Exact Match Rate", "exact_match"),
-            ("forgetting_max", "Max Forgetting (tracked metrics)", "forgetting_max"),
-            ("update_latency_s", "Update Latency (s since last eval)", "update_latency_s"),
-            ("grad_norm", "Gradient Norm", "grad_norm"),
-            ("tokens_per_sec", "Token Throughput (tok/s)", "tokens_per_sec"),
-            # ── Qualitative metrics (populated when testing_strategy is enabled) ──
-            ("qual_semantic_similarity", "Semantic Similarity (MiniLM)", "qual_semantic_similarity"),
-            ("qual_keyword_density", "Domain Keyword Density", "qual_keyword_density"),
-            ("qual_type_token_ratio", "Type-Token Ratio (Lexical Diversity)", "qual_type_token_ratio"),
-            ("qual_hapax_ratio", "Hapax Ratio (Word Uniqueness)", "qual_hapax_ratio"),
-            ("qual_cot_anchor_count", "CoT Logic Anchor Count (mean)", "qual_cot_anchor_count_mean"),
-            ("qual_cot_step_length", "CoT Step Length - chars between anchors (mean)", "qual_cot_step_length_mean"),
-            ("qual_cot_coverage", "CoT Coverage Rate", "qual_cot_coverage_rate"),
-            ("qual_mean_response_length", "Mean Response Length (words)", "qual_mean_response_length"),
-            ("qual_repetition_rate", "Bigram Repetition Rate", "qual_repetition_rate"),
-            ("qual_non_empty_rate", "Non-Empty Response Rate", "qual_non_empty_rate"),
-            # ── E2E NLG metrics ──
-            ("qual_slot_coverage_mean", "Slot Coverage (mean)", "qual_slot_coverage_mean"),
-            ("qual_consistency_score_mean", "Consistency Score (mean)", "qual_consistency_score_mean"),
-            ("answer_overlap_f1", "Answer Overlap F1 (token-level)", "answer_overlap_f1"),
-        ]
-
-        generated = 0
-        for filename, title, key in plots:
-            xs, ys = _series(key)
-            if not xs:
-                continue
-            plt.figure()
-            plt.plot(xs, ys, marker="o", markersize=3, linewidth=1.2)
-            plt.title(title)
-            plt.xlabel("Step")
-            plt.ylabel(key)
-            plt.grid(True, alpha=0.3)
-            out_path = os.path.join(self.dir, f"{filename}.png")
-            plt.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close()
-            generated += 1
-
-        _log(f"Generated {generated} plot(s) in: {self.dir}")
 
 # --------------------------------------------------
 # LoRAProducer: sends adapter weights via Kafka
@@ -961,7 +929,7 @@ def train_model(config, config_path: str = "(unknown)"):
     except Exception as e:
         _log(f"Warning: Clean CSV generation failed: {e}")
     try:
-        metrics_logger.generate_plots()
+        metrics_logger.generate_plots(config=config)
     except Exception as e:
         _log(f"Warning: Plot generation failed: {e}")
     _log(f"To regenerate plots later: python utils/plot_metrics.py \"{metrics_logger.metrics_path}\"")

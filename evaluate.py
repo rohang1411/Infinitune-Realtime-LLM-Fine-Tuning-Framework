@@ -112,9 +112,10 @@ def _make_eval_output_dir(config: dict, checkpoint_name: str) -> str:
 
 
 def _save_results(out_dir: str, metrics: dict, config: dict, checkpoint_path: str) -> None:
-    """Write eval_results.json and eval_config.json to *out_dir*."""
+    """Write eval_results.json, eval_config.json, and config_snapshot.yaml to *out_dir*."""
     results_path = os.path.join(out_dir, "eval_results.json")
-    config_path  = os.path.join(out_dir, "eval_config.json")
+    config_json_path = os.path.join(out_dir, "eval_config.json")
+    config_yaml_path = os.path.join(out_dir, "config_snapshot.yaml")
 
     payload = {
         "checkpoint_path": checkpoint_path,
@@ -124,69 +125,55 @@ def _save_results(out_dir: str, metrics: dict, config: dict, checkpoint_path: st
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    with open(config_path, "w", encoding="utf-8") as f:
+    with open(config_json_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, default=str)
+
+    # Also save a clean YAML snapshot for human readability
+    try:
+        import yaml
+        with open(config_yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    except Exception:
+        pass  # yaml optional — JSON is always written
 
     _log(f"Results saved to: {results_path}")
 
 
-def _generate_plots(metrics_over_time: list, out_dir: str) -> None:
+def _generate_plots(metrics_over_time: list, out_dir: str, config: dict = None) -> None:
     """
-    Generate PNG plots from a list of {metric_name: value} dicts.
-    For decoupled eval this is typically a single dict (one checkpoint),
-    or a list when --all-checkpoints is used.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        _log("matplotlib not installed — skipping plots.")
-        return
+    Generate PNG plots from a list of {metric_name: value} dicts using
+    plot_metrics.generate_plots(), which also produces the unified dashboard.
 
+    For a single checkpoint, metrics_over_time has one entry.
+    For --all-checkpoints, it has one entry per checkpoint.
+    """
+    # Write a temporary CSV that generate_plots() can read
     plots_dir = os.path.join(out_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # Collect all metric names (excluding step, which is the x-axis)
+    # Collect all keys
     all_keys = set()
     for row in metrics_over_time:
         all_keys.update(row.keys())
-    all_keys.discard("step")
     all_keys.discard("checkpoint")
+    # Ensure step is first, then sorted rest
+    fieldnames = ["step"] + sorted(k for k in all_keys if k != "step")
 
-    generated = 0
-    for key in sorted(all_keys):
-        xs, ys = [], []
+    csv_path = os.path.join(plots_dir, "eval_metrics.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
         for row in metrics_over_time:
-            if key not in row or row[key] is None:
-                continue
-            try:
-                xs.append(row.get("step", 0))
-                ys.append(float(row[key]))
-            except (TypeError, ValueError):
-                continue
-        if not xs:
-            continue
+            # Normalise step: map "final" numerically for plotting
+            clean_row = {k: row.get(k, "") for k in fieldnames}
+            writer.writerow(clean_row)
 
-        plt.figure(figsize=(10, 6))
-        if len(xs) == 1:
-            plt.bar([str(xs[0])], ys)
-        else:
-            plt.plot(xs, ys, marker="o", markersize=5, linewidth=1.5)
-        plt.title(f"{key} (decoupled eval)", fontsize=14)
-        plt.xlabel("Step", fontsize=12)
-        plt.ylabel(key, fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        safe_key = key.replace("/", "_")
-        out_path = os.path.join(plots_dir, f"{safe_key}.png")
-        plt.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        generated += 1
-
-    if generated:
-        _log(f"Generated {generated} plot(s) in: {plots_dir}")
+    try:
+        from utils.plot_metrics import generate_plots
+        generate_plots(csv_path, out_dir=plots_dir, config=config)
+    except Exception as exc:
+        _log(f"Warning: plot generation failed: {exc}")
+        import traceback; traceback.print_exc()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,7 +393,7 @@ def main():
         # ── Save results for this checkpoint ─────────────────────────────────
         out_dir = _make_eval_output_dir(config, ckpt_name)
         _save_results(out_dir, metrics, config, ckpt_path)
-        _generate_plots([{"step": ckpt["step"], **metrics}], out_dir)
+        _generate_plots([{"step": ckpt["step"], **metrics}], out_dir, config=config)
 
         # Print summary
         _log("── Metrics summary ──")
@@ -421,7 +408,7 @@ def main():
     # ── If multiple checkpoints, also produce combined plots ─────────────────
     if len(all_results) > 1:
         combined_out = _make_eval_output_dir(config, "all_checkpoints")
-        _generate_plots(all_results, combined_out)
+        _generate_plots(all_results, combined_out, config=config)
 
         # Write a combined CSV for easy analysis
         csv_path = os.path.join(combined_out, "all_checkpoints_results.csv")

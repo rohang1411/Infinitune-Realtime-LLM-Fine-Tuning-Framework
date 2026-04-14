@@ -2,7 +2,7 @@
 # InfiniTune Configuration — Qualitative: Structured Data Generation (E2E NLG)
 # Task Type   : Causal LM / Conditional Language Modeling
 # Dataset     : GEM/e2e_nlg
-# Model       : Qwen/Qwen2.5-1.5B (1.5B params base model)
+# Model       : gpt2-medium (345M params base model)
 # Eval Method : Structured Data Slot Coverage & Consistency
 #
 # Objective:
@@ -97,7 +97,7 @@ training:
     T_max: 2100                # Align with max_steps
   save_checkpoints:
     enabled: true
-    save_every_steps: 200      # User requested saving every 100 steps
+    save_every_steps: 200      # Save every 200 steps for checkpoint coverage
     save_final: true
 
 # --- Inference ---
@@ -137,11 +137,50 @@ testing_strategy:
   enabled: true
   method: "structured_slot_coverage"
   eval_interval: 200            # Matrix generation is heavy, doing it at checkpoint intervals
-  eval_samples: 50              # The table of 10 samples
+  eval_samples: 50              # Rotating pool window size
   eval_pool_size: 150
   max_new_tokens: 60
-  consistency_runs: 10           
+  consistency_runs: 10
   consistency_temperature: 0.7
   slot_keywords: null           # Dynamic parsed from MR natively
   logic_anchors: null
   sentence_model: null
+
+  # ── E2E NLG specific options ─────────────────────────────────────────────────
+  # These keys are ONLY read when method == "structured_slot_coverage".
+  # They are fully optional — configs without this block behave identically.
+  e2e_nlg_options:
+    # Per-slot coverage tracking.
+    # Each name listed here produces a separate metric: qual_slot_<name>_coverage
+    # Slot names must match the keys used in the MR string, e.g. "familyFriendly"
+    track_per_slot:
+      - "name"
+      - "eatType"
+      - "food"
+      - "priceRange"
+      - "customer rating"
+      - "area"
+      - "familyFriendly"
+      - "near"
+
+    # Negation-aware slot checkers.
+    # Maps slot_name → checker_type.
+    # "boolean_negation": detects positive/negative phrasing rather than simple substring.
+    # Leave empty or omit for pure substring matching on all slots.
+    slot_checkers:
+      familyFriendly: "boolean_negation"
+
+    # Pinned anchor MRs — evaluated at EVERY checkpoint for direct cross-step comparison.
+    # Span difficulty: 2-slot easy → 7-slot hard, include familyFriendly yes/no variants.
+    # Add or remove anchors freely; metric names adjust automatically.
+    pinned_anchors:
+      - "name[The Punter], eatType[coffee shop], priceRange[less than £20], near[Café Sicilia]"
+      - "name[Aromi], eatType[coffee shop], priceRange[cheap], area[city centre]"
+      - "name[The Punter], customer rating[3 out of 5], area[riverside]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[cheap], customer rating[average]"
+      - "name[The Eagle], eatType[coffee shop], food[English], customer rating[average], area[riverside], familyFriendly[no], near[Burger King]"
+      - "name[The Punter], eatType[coffee shop], food[English], customer rating[high], familyFriendly[yes], near[Café Sicilia]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[high], customer rating[average], area[city centre], familyFriendly[yes]"
+      - "name[Browns Cambridge], eatType[coffee shop], food[English], customer rating[5 out of 5], area[city centre], familyFriendly[yes], near[Crowne Plaza Hotel]"
+      - "name[The Eagle], eatType[coffee shop], food[English], priceRange[cheap], customer rating[average], area[city centre], familyFriendly[yes], near[Burger King]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[moderate], customer rating[1 out of 5], area[riverside], familyFriendly[no]"

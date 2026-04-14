@@ -46,6 +46,12 @@ import time
 import uuid
 from typing import Optional
 
+try:
+    import yaml as _yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -202,6 +208,18 @@ class CheckpointManager:
                 json.dump(meta, f, indent=2)
         except Exception as exc:
             _log(f"Warning: Could not write checkpoint_meta.json: {exc}")
+
+        # --- Write full config snapshot alongside the adapter ---
+        # This ensures every checkpoint is self-contained: you can always
+        # know exactly which hyperparameters produced it without needing the
+        # original config file path.
+        if _YAML_AVAILABLE and self._config:
+            config_snapshot_path = os.path.join(save_path, "config_snapshot.yaml")
+            try:
+                with open(config_snapshot_path, "w", encoding="utf-8") as f:
+                    _yaml.dump(self._config, f, default_flow_style=False, allow_unicode=True)
+            except Exception as exc:
+                _log(f"Warning: Could not write config_snapshot.yaml: {exc}")
 
         step_label = f"step {step}" if step != "final" else "final"
         _log(f"Checkpoint saved [{step_label}] → {save_path} (run: {self._run_dir})")

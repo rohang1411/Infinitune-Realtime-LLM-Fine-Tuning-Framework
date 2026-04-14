@@ -17,6 +17,13 @@ Strategies
 - structural_cot       : Counts chain-of-thought "logic anchors" (regex) and
                          measures inter-anchor step length to prove CoT
                          adoption on reasoning tasks.
+- structured_slot_coverage : Evaluates whether the model successfully
+                         verbalizes all attributes from a structured Meaning
+                         Representation (MR). Supports per-slot tracking,
+                         negation-aware boolean checkers, pinned anchor
+                         evaluation, and perfect-coverage-rate reporting.
+                         Dataset-specific options are driven from the YAML
+                         config under testing_strategy.e2e_nlg_options.
 
 All strategies also compute universal metrics that run on already-generated
 text at zero additional cost:
@@ -153,6 +160,19 @@ class QualitativeMetric(ABC):
         """
         return {}
 
+    def compute_pinned(self, predictions_matrix: list, inputs: list) -> dict:
+        """
+        Base default: Returns an empty dict.
+        Subclasses override this to compute metrics on the fixed pinned anchor set.
+
+        Args:
+            predictions_matrix: List of Lists of strings. Shape: [n_anchors, consistency_runs].
+            inputs: List of pinned MR input strings.
+        Returns:
+            dict[str, float] with pinned anchor metrics, all prefixed "qual_pinned_".
+        """
+        return {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Strategy 1: Semantic Similarity (UltraChat / Conversational)
@@ -178,140 +198,95 @@ class SemanticSimilarityMetric(QualitativeMetric):
         # Import guarded: only crashes if this strategy is actually used
         try:
             from sentence_transformers import SentenceTransformer  # noqa: F401
-            self._SentenceTransformer = SentenceTransformer
+            self._available = True
         except ImportError:
-            raise ImportError(
-                "The 'sentence-transformers' package is required for the "
-                "semantic_similarity strategy.  Install it with:\n"
-                "  pip install sentence-transformers"
-            )
+            self._available = False
         self._model_name = model_name
-        self._model = None  # Lazy-loaded on first compute() call
+        self._model = None
 
-    def _ensure_model_loaded(self) -> None:
+    def _get_model(self):
         if self._model is None:
-            _log(
-                f"Loading sentence embedding model '{self._model_name}' on CPU "
-                f"(first use — may download ~90 MB)..."
-            )
-            # device="cpu" is explicit — never touches GPU VRAM
-            self._model = self._SentenceTransformer(self._model_name, device="cpu")
-            _log("Sentence embedding model ready.")
+            if not self._available:
+                raise ImportError(
+                    "sentence-transformers is required for semantic_similarity. "
+                    "Install it: pip install sentence-transformers"
+                )
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self._model_name, device="cpu")
+        return self._model
 
     def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
-        """
-        Returns qual_semantic_similarity: mean cosine similarity across pairs.
-        Pairs where either prediction or reference is empty score 0.0.
-        """
-        self._ensure_model_loaded()
-
-        if not predictions:
+        if not predictions or not references:
             return {}
 
-        similarities = []
-        valid_preds = []
-        valid_refs = []
-
-        for pred, ref in zip(predictions, references):
-            pred_text = (pred or "").strip()
-            ref_text = (ref or "").strip()
-
-            # Empty prediction or reference cannot be compared; score 0.0
-            if not pred_text or not ref_text:
-                similarities.append(0.0)
-            else:
-                valid_preds.append(pred_text)
-                valid_refs.append(ref_text)
-
-        # Batch-encode all valid pairs at once for efficiency
-        if valid_preds:
-            import torch as _torch
-            pred_embeddings = self._model.encode(valid_preds, convert_to_tensor=True, device="cpu")
-            ref_embeddings  = self._model.encode(valid_refs,  convert_to_tensor=True, device="cpu")
-
-            # Cosine similarity per pair
-            cos_sim = _torch.nn.functional.cosine_similarity(pred_embeddings, ref_embeddings)
-            # Clamp to [0, 1] — cosine can technically be negative for dissimilar vectors
-            cos_sim = cos_sim.clamp(min=0.0, max=1.0)
-            similarities.extend(cos_sim.tolist())
-
-        if not similarities:
+        valid_pairs = [
+            (p, r) for p, r in zip(predictions, references)
+            if p and r and p.strip() and r.strip()
+        ]
+        if not valid_pairs:
             return {}
 
-        return {"qual_semantic_similarity": sum(similarities) / len(similarities)}
+        model = self._get_model()
+        preds_clean, refs_clean = zip(*valid_pairs)
+
+        import torch
+        pred_embs = model.encode(list(preds_clean), convert_to_tensor=True, device="cpu")
+        ref_embs  = model.encode(list(refs_clean),  convert_to_tensor=True, device="cpu")
+
+        cos_sims = torch.nn.functional.cosine_similarity(pred_embs, ref_embs, dim=1)
+        return {"qual_semantic_similarity": float(cos_sims.mean().item())}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy 2: Keyword Density & Lexical Profiling (IMDb / Domain Adaptation)
+# Strategy 2: Keyword Density (Domain Vocabulary Adoption)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KeywordDensityMetric(QualitativeMetric):
     """
-    Measures how much domain-specific vocabulary the model is adopting through:
-      - Keyword Density  : fraction of words that are domain keywords
-      - Type-Token Ratio : lexical diversity (unique words / total words)
-      - Hapax Ratio      : fraction of words used exactly once per response
+    Measures how densely the model uses a provided list of domain keywords,
+    plus Type-Token Ratio (TTR) and Hapax Ratio (word uniqueness).
 
-    This is a reference-free metric — it analyses the model's generated text
-    without needing a golden answer.
+    Reference-free: does not need golden answers.
 
     Returns keys:
-        qual_keyword_density : mean keyword density across responses
-        qual_type_token_ratio: mean TTR (skips responses < 5 words)
-        qual_hapax_ratio     : mean hapax ratio
+        qual_keyword_density : fraction of keywords present in mean response
+        qual_type_token_ratio : unique tokens / total tokens (lexical diversity)
+        qual_hapax_ratio      : fraction of words appearing exactly once
     """
 
-    def __init__(self, keywords: list):
-        """
-        Args:
-            keywords: List of domain-specific words or phrases (case-insensitive).
-                      These come directly from testing_strategy.keywords in YAML.
-        """
-        if not keywords:
-            raise ValueError("KeywordDensityMetric requires a non-empty keywords list.")
-        # Lower-case all keywords at init time; avoid repeated lower() in hot path
-        self._keywords = [str(k).lower().strip() for k in keywords if k]
-        _log(f"KeywordDensityMetric initialized with {len(self._keywords)} keywords.")
+    def __init__(self, keywords: list = None):
+        self._keywords = [k.lower() for k in (keywords or [])]
 
     def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
-        """
-        references is ignored — this is a reference-free metric.
-        """
         if not predictions:
             return {}
 
-        density_scores = []
+        keyword_hits = []
         ttr_scores = []
         hapax_scores = []
 
         for pred in predictions:
             text = (pred or "").strip().lower()
-            if not text:
-                continue
-
             words = text.split()
             if not words:
                 continue
 
-            total_words = len(words)
+            # Keyword density
+            if self._keywords:
+                hits = sum(1 for kw in self._keywords if kw in text)
+                keyword_hits.append(hits / len(self._keywords))
 
-            # --- Keyword Density ---
-            keyword_hits = sum(1 for w in words if w in self._keywords)
-            density_scores.append(keyword_hits / total_words)
-
-            # --- Type-Token Ratio (skip very short responses to avoid inflation) ---
-            if total_words >= 5:
-                unique_words = set(words)
-                ttr_scores.append(len(unique_words) / total_words)
-
-            # --- Hapax Ratio ---
+            # Type-Token Ratio
             word_counts = collections.Counter(words)
-            hapax = sum(1 for count in word_counts.values() if count == 1)
-            hapax_scores.append(hapax / total_words)
+            ttr_scores.append(len(word_counts) / len(words))
+
+            # Hapax ratio
+            hapax = sum(1 for c in word_counts.values() if c == 1)
+            hapax_scores.append(hapax / len(words))
 
         metrics = {}
-        if density_scores:
-            metrics["qual_keyword_density"] = sum(density_scores) / len(density_scores)
+        if keyword_hits:
+            metrics["qual_keyword_density"] = sum(keyword_hits) / len(keyword_hits)
         if ttr_scores:
             metrics["qual_type_token_ratio"] = sum(ttr_scores) / len(ttr_scores)
         if hapax_scores:
@@ -321,61 +296,44 @@ class KeywordDensityMetric(QualitativeMetric):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy 3: Structural CoT Adherence (GSM8k / Reasoning)
+# Strategy 3: Structural CoT (Chain-of-Thought Logic Anchor Counting)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StructuralCoTMetric(QualitativeMetric):
     """
-    Measures Chain-of-Thought structural adoption by counting "logic anchors"
-    (e.g. "First,", "Therefore,", "Step \\d+:") and measuring the length of
-    reasoning content between those anchors.
+    Counts occurrences of "logic anchor" phrases (regex patterns) in generated
+    text and measures the mean character length of reasoning steps between them.
 
-    A model that is learning CoT will show:
-      - Increasing anchor_count over training steps
-      - Increasing step_length (it's generating actual reasoning, not just
-        inserting anchors at the start and stopping)
-
-    Logic anchors are compiled as regex patterns from the YAML config.  Invalid
-    patterns are logged and skipped gracefully.
+    Default anchors detect common English chain-of-thought discourse markers
+    (\"first\", \"therefore\", \"step N:\", \"because\", etc.).
 
     Returns keys:
-        qual_cot_anchor_count_mean : mean number of anchors found per response
-        qual_cot_step_length_mean  : mean character length between anchors
+        qual_cot_anchor_count_mean : mean anchor count per response
+        qual_cot_step_length_mean  : mean chars between consecutive anchors
         qual_cot_coverage_rate     : fraction of responses with ≥1 anchor
     """
 
-    # Fallback anchors used when none are specified in config
-    DEFAULT_ANCHORS = [
-        r"First[,\s]",
-        r"Second[,\s]",
-        r"Third[,\s]",
-        r"Next[,\s]",
-        r"Then[,\s]",
-        r"Finally[,\s]",
-        r"Therefore[,\s]",
-        r"Thus[,\s]",
-        r"So[,\s]",
-        r"Hence[,\s]",
-        r"Step\s*\d+[:\.]",
-        r"Let(?:'s| us)\s",
-        r"We (?:know|have|can|need)",
-        r"This means",
-        r"In other words",
+    _DEFAULT_ANCHORS = [
+        r"\bfirst\b",
+        r"\bsecond\b",
+        r"\bthird\b",
+        r"\btherefore\b",
+        r"\bthus\b",
+        r"\bbecause\b",
+        r"\bsince\b",
+        r"\bhence\b",
+        r"\bin conclusion\b",
+        r"\bfinally\b",
+        r"\bstep\s+\d+",
+        r"\b\d+\.\s",
     ]
 
     def __init__(self, logic_anchors: list = None):
-        """
-        Args:
-            logic_anchors: List of regex strings from testing_strategy.logic_anchors.
-                           Falls back to DEFAULT_ANCHORS if None or empty.
-        """
-        raw_patterns = logic_anchors if logic_anchors else self.DEFAULT_ANCHORS
+        raw_patterns = logic_anchors if logic_anchors is not None else self._DEFAULT_ANCHORS
         self._patterns = []
         for pattern_str in raw_patterns:
             try:
-                # YAML strings like "Step \\d+:" arrive in Python as "Step \\d+:"
-                # re.compile handles the double-backslash correctly
-                self._patterns.append(re.compile(str(pattern_str), re.IGNORECASE))
+                self._patterns.append(re.compile(pattern_str, re.IGNORECASE))
             except re.error as exc:
                 _log(f"Warning: invalid logic_anchor regex '{pattern_str}': {exc} — skipping.")
 
@@ -456,90 +414,336 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
     """
     Evaluates whether the model successfully verbalizes all attributes specified
     in a structured Meaning Representation (MR).
-    
+
     Parses slots shaped exactly like: `name[The Punter] | food[Indian]`
-    and simply checks if the target value string was included in the generation.
+    and checks if the target value string is included in the generation.
+
+    Enhanced features (all config-driven, all optional):
+    ─────────────────────────────────────────────────────
+    • Per-slot coverage tracking  : reports qual_slot_<name>_coverage for each
+                                    slot in e2e_nlg_options.track_per_slot
+    • Negation-aware checkers     : maps slot_name → checker_type via
+                                    e2e_nlg_options.slot_checkers
+                                    "boolean_negation" detects positive/negative
+                                    phrasing rather than substring match
+    • Perfect coverage rate       : qual_perfect_coverage_rate = fraction of
+                                    samples achieving 100% slot coverage
+    • familyFriendly inversion    : qual_slot_familyFriendly_inversion_rate =
+                                    fraction where model semantics contradict MR
+    • Pinned anchor evaluation    : compute_pinned() evaluates a fixed anchor
+                                    set for cross-checkpoint comparison
     """
 
-    def __init__(self, slot_keywords: dict = None):
-        # We don't strictly require keywords dict since we parse them directly from the MR string.
-        # But we accept it to maintain a shared interface signature if needed.
-        self._pattern = re.compile(r"(\w+)\[([^\]]+)\]")
+    def __init__(self, slot_keywords: dict = None, e2e_nlg_options: dict = None):
+        self._pattern = re.compile(r"(\w[\w ]*)\[([^\]]+)\]")
+        opts = e2e_nlg_options or {}
+        self._track_per_slot: list = opts.get("track_per_slot") or []
+        self._slot_checkers: dict = opts.get("slot_checkers") or {}
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _parse_mr(self, mr_string: str) -> dict:
+        """Parse 'name[The Punter], food[Chinese]' → {'name': 'The Punter', 'food': 'Chinese'}."""
         slots = {}
         for match in self._pattern.finditer(mr_string):
-            attr, val = match.groups()
-            slots[attr] = val.strip()
+            attr = match.group(1).strip()
+            val  = match.group(2).strip()
+            # For duplicate slots (e.g. two customer rating values), keep first
+            if attr not in slots:
+                slots[attr] = val
         return slots
 
+    def _check_slot(self, slot_name: str, slot_value: str, text: str) -> bool:
+        """
+        Check whether a single slot is covered in the generated text.
+        Dispatches to the appropriate checker based on slot_checkers config.
+        """
+        checker = self._slot_checkers.get(slot_name, "substring")
+        if checker == "boolean_negation":
+            return self._check_boolean_negation(slot_value, text)
+        # Default: simple substring match on the slot value
+        return slot_value.lower() in text
+
+    def _check_boolean_negation(self, slot_value: str, text: str) -> bool:
+        """
+        Negation-aware checker for boolean yes/no slots (e.g. familyFriendly).
+
+        For slot_value='yes': output must contain a positive phrase and NOT a
+        negative phrase.
+        For slot_value='no': output must contain a negative phrase, OR must
+        contain NO positive phrase (absence of positive = implicit negative).
+
+        This fixes the systematic under-counting caused by naive string
+        matching on 'familyFriendly', which would score "not family friendly"
+        and "family friendly" identically.
+        """
+        positive_phrases = [
+            "family friendly", "family-friendly",
+            "kid friendly", "kid-friendly",
+            "child friendly", "child-friendly",
+            "children friendly", "children-friendly",
+            "family-orientated", "family orientated",
+        ]
+        negative_phrases = [
+            "not family", "not child", "not kid",
+            "not family-friendly", "not family friendly",
+            "non family", "non-family",
+            "adults only", "adult only",
+            "no children", "not child-friendly",
+        ]
+        has_positive = any(p in text for p in positive_phrases)
+        has_negative = any(n in text for n in negative_phrases)
+
+        if slot_value.lower() == "yes":
+            return has_positive and not has_negative
+        else:  # 'no'
+            return has_negative or not has_positive
+
+    def _score_sample(self, mr_string: str, text: str) -> tuple:
+        """
+        Score a single (MR, generated text) pair.
+
+        Returns:
+            (coverage: float, per_slot: dict[str, bool | None])
+            per_slot maps each slot_name → True/False/None (None if not in MR).
+        """
+        text_lower = text.lower()
+        slots = self._parse_mr(mr_string)
+        if not slots:
+            return 0.0, {}
+
+        hits = 0
+        per_slot: dict = {}
+        for slot_name, slot_val in slots.items():
+            covered = self._check_slot(slot_name, slot_val, text_lower)
+            per_slot[slot_name] = covered
+            if covered:
+                hits += 1
+
+        return hits / len(slots), per_slot
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def compute(self, predictions: list, references: list, inputs: list = None) -> dict:
+        """Compute mean slot coverage + per-slot coverage over a flat predictions list."""
         if not predictions or not inputs:
             return {}
 
         coverage_scores = []
+        per_slot_hits: dict = collections.defaultdict(list)
+
         for pred, inp in zip(predictions, inputs):
             text = (pred or "").strip().lower()
-            mr_string = (inp or "")
-            slots = self._parse_mr(mr_string)
-            
-            if not slots:
-                coverage_scores.append(0.0)
-                continue
+            coverage, per_slot = self._score_sample(inp or "", text)
+            coverage_scores.append(coverage)
+            for slot_name, covered in per_slot.items():
+                per_slot_hits[slot_name].append(float(covered))
 
-            hits = sum(1 for _, val in slots.items() if val.lower() in text)
-            coverage_scores.append(hits / len(slots))
+        metrics = {}
+        if coverage_scores:
+            metrics["qual_slot_coverage_mean"] = sum(coverage_scores) / len(coverage_scores)
+            metrics["qual_perfect_coverage_rate"] = sum(
+                1 for c in coverage_scores if c >= 1.0
+            ) / len(coverage_scores)
 
-        if not coverage_scores:
-            return {}
-        return {"qual_slot_coverage_mean": sum(coverage_scores) / len(coverage_scores)}
+        # Per-slot metrics for tracked slots
+        for slot_name in self._track_per_slot:
+            hits = per_slot_hits.get(slot_name)
+            if hits:
+                safe_key = re.sub(r"[^a-zA-Z0-9]", "_", slot_name).rstrip("_")
+                metrics[f"qual_slot_{safe_key}_coverage"] = sum(hits) / len(hits)
+
+        return metrics
 
     def compute_consistency(self, predictions_matrix: list, references: list, inputs: list = None) -> dict:
+        """
+        Evaluate consistency across multiple generation runs per sample.
+
+        Computes:
+          qual_consistency_score_mean         : fraction of runs with ≥85% coverage per sample, averaged
+          qual_perfect_coverage_rate          : fraction of samples where mean coverage = 100%
+          qual_slot_<name>_coverage           : per-slot coverage averaged over all runs
+          qual_slot_familyFriendly_inversion_rate : fraction of familyFriendly samples where
+                                                    model semantics contradict the MR
+        Logs a markdown table of MR → first-run output → coverage.
+        """
         if not predictions_matrix or not inputs:
             return {}
-            
-        full_coverage_counts = []
+
         n_runs = len(predictions_matrix[0]) if predictions_matrix else 1
-        
-        # Log table header
+
+        # Log markdown table header
         _log("")
         _log("| MR Input | Generated Output (Sample Run) | Coverage |")
         _log("|---|---|---|")
-        
-        for i, (pred_runs, inp) in enumerate(zip(predictions_matrix, inputs)):
+
+        full_coverage_counts = []
+        mean_coverage_per_sample = []
+        per_slot_hits_all: dict = collections.defaultdict(list)
+        # familyFriendly inversion tracking
+        ff_inversion_count = 0
+        ff_total_count = 0
+
+        for pred_runs, inp in zip(predictions_matrix, inputs):
             mr_string = (inp or "")
             slots = self._parse_mr(mr_string)
             if not slots:
                 full_coverage_counts.append(0.0)
+                mean_coverage_per_sample.append(0.0)
                 continue
-                
+
             runs_with_full_coverage = 0
             sample_run_text = ""
             sample_coverage = 0.0
-            
-            for text in pred_runs:
+            run_coverages = []
+            per_slot_run_hits: dict = collections.defaultdict(list)
+
+            # familyFriendly inversion: check if the model inverts the semantics
+            ff_slot_val = slots.get("familyFriendly")
+            if ff_slot_val and self._slot_checkers.get("familyFriendly") == "boolean_negation":
+                ff_total_count += 1
+                # Count inversion: positive phrasing when MR says 'no', or negative when MR says 'yes'
+                positive_phrases = [
+                    "family friendly", "family-friendly", "kid friendly",
+                    "kid-friendly", "child friendly", "child-friendly",
+                    "children friendly", "children-friendly",
+                ]
+                negative_phrases = [
+                    "not family", "not child", "not kid",
+                    "not family-friendly", "non family", "non-family",
+                    "adults only",
+                ]
+                inverted_runs = 0
+                for text in pred_runs:
+                    text_lower = (text or "").strip().lower()
+                    has_pos = any(p in text_lower for p in positive_phrases)
+                    has_neg = any(n in text_lower for n in negative_phrases)
+                    if ff_slot_val.lower() == "yes":
+                        inverted = has_neg and not has_pos
+                    else:
+                        inverted = has_pos and not has_neg
+                    if inverted:
+                        inverted_runs += 1
+                if inverted_runs > (n_runs / 2):  # majority of runs inverted = inverted sample
+                    ff_inversion_count += 1
+
+            for run_idx, text in enumerate(pred_runs):
                 clean_text = (text or "").strip().lower()
-                hits = sum(1 for _, val in slots.items() if val.lower() in clean_text)
-                coverage = hits / len(slots)
-                
-                # Keep the first run for logging exactly
+                coverage, per_slot = self._score_sample(mr_string, clean_text)
+                run_coverages.append(coverage)
+
+                for slot_name, covered in per_slot.items():
+                    per_slot_run_hits[slot_name].append(float(covered))
+
+                if coverage >= 0.85:
+                    runs_with_full_coverage += 1
+
                 if not sample_run_text:
                     sample_run_text = text.strip().replace("\n", " ")
                     sample_coverage = coverage
-                    
-                if coverage >= 0.85: # Almost full coverage
-                    runs_with_full_coverage += 1
-                    
+
             full_coverage_counts.append(runs_with_full_coverage / n_runs)
-            
-            # Log this row into the visually readable markdown table!
+            mean_cov = sum(run_coverages) / len(run_coverages) if run_coverages else 0.0
+            mean_coverage_per_sample.append(mean_cov)
+
+            # Aggregate per-slot hits (mean across runs for this sample)
+            for slot_name, hits in per_slot_run_hits.items():
+                per_slot_hits_all[slot_name].append(sum(hits) / len(hits))
+
+            # Log table row
             _log(f"| {mr_string} | {sample_run_text} | {sample_coverage*100:.0f}% |")
-            
+
         _log("")
 
-        if not full_coverage_counts:
+        metrics = {}
+        if full_coverage_counts:
+            metrics["qual_consistency_score_mean"] = (
+                sum(full_coverage_counts) / len(full_coverage_counts)
+            )
+        if mean_coverage_per_sample:
+            metrics["qual_perfect_coverage_rate"] = sum(
+                1 for c in mean_coverage_per_sample if c >= 1.0
+            ) / len(mean_coverage_per_sample)
+
+        # Per-slot metrics
+        for slot_name in self._track_per_slot:
+            hits = per_slot_hits_all.get(slot_name)
+            if hits:
+                safe_key = re.sub(r"[^a-zA-Z0-9]", "_", slot_name).rstrip("_")
+                metrics[f"qual_slot_{safe_key}_coverage"] = sum(hits) / len(hits)
+
+        # familyFriendly inversion rate
+        if ff_total_count > 0:
+            metrics["qual_slot_familyFriendly_inversion_rate"] = ff_inversion_count / ff_total_count
+
+        return metrics
+
+    def compute_pinned(self, predictions_matrix: list, inputs: list) -> dict:
+        """
+        Compute metrics on the fixed pinned anchor set.
+
+        Returns:
+            qual_pinned_slot_coverage_mean    : mean slot coverage across all anchors & runs
+            qual_pinned_perfect_coverage_rate : fraction of anchors with mean coverage = 100%
+            qual_pinned_consistency_score     : fraction of runs with ≥85% coverage, averaged
+
+        Logs a dedicated pinned-anchor markdown table.
+        """
+        if not predictions_matrix or not inputs:
             return {}
-        return {"qual_consistency_score_mean": sum(full_coverage_counts) / len(full_coverage_counts)}
+
+        n_runs = len(predictions_matrix[0]) if predictions_matrix else 1
+
+        _log("")
+        _log("=== Pinned Anchor Evaluation ===")
+        _log("| Anchor MR | Generated Output (Sample Run) | Coverage |")
+        _log("|---|---|---|")
+
+        all_mean_coverages = []
+        all_consistency_scores = []
+
+        for pred_runs, inp in zip(predictions_matrix, inputs):
+            mr_string = (inp or "")
+            slots = self._parse_mr(mr_string)
+            if not slots:
+                continue
+
+            run_coverages = []
+            runs_with_good_cov = 0
+            sample_text = ""
+            sample_cov = 0.0
+
+            for text in pred_runs:
+                clean_text = (text or "").strip().lower()
+                coverage, _ = self._score_sample(mr_string, clean_text)
+                run_coverages.append(coverage)
+                if coverage >= 0.85:
+                    runs_with_good_cov += 1
+                if not sample_text:
+                    sample_text = text.strip().replace("\n", " ")
+                    sample_cov = coverage
+
+            mean_cov = sum(run_coverages) / len(run_coverages) if run_coverages else 0.0
+            all_mean_coverages.append(mean_cov)
+            all_consistency_scores.append(runs_with_good_cov / n_runs)
+            _log(f"| {mr_string} | {sample_text} | {sample_cov*100:.0f}% |")
+
+        _log("")
+
+        metrics = {}
+        if all_mean_coverages:
+            metrics["qual_pinned_slot_coverage_mean"] = (
+                sum(all_mean_coverages) / len(all_mean_coverages)
+            )
+            metrics["qual_pinned_perfect_coverage_rate"] = sum(
+                1 for c in all_mean_coverages if c >= 1.0
+            ) / len(all_mean_coverages)
+        if all_consistency_scores:
+            metrics["qual_pinned_consistency_score"] = (
+                sum(all_consistency_scores) / len(all_consistency_scores)
+            )
+
+        return metrics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -576,7 +780,11 @@ def _build_metric(ts_cfg: dict) -> QualitativeMetric:
 
     if method == "structured_slot_coverage":
         slot_keywords = ts_cfg.get("slot_keywords")
-        return StructuredSlotCoverageMetric(slot_keywords=slot_keywords)
+        e2e_nlg_options = ts_cfg.get("e2e_nlg_options") or {}
+        return StructuredSlotCoverageMetric(
+            slot_keywords=slot_keywords,
+            e2e_nlg_options=e2e_nlg_options,
+        )
 
     raise ValueError(
         f"Unknown testing_strategy.method: '{method}'. "
@@ -622,6 +830,7 @@ class QualitativeEvaluator:
             _log("QualitativeEvaluator disabled (no testing_strategy block or enabled: false).")
             self._metric = None
             self.eval_data = []
+            self._pinned_eval_data = []
             return
 
         # --- Build the metric strategy ---
@@ -650,6 +859,18 @@ class QualitativeEvaluator:
             _log("Warning: QualitativeEvaluator could not load eval data — disabling.")
             self.enabled = False
             return
+
+        # --- Load pinned anchor samples (structured_slot_coverage only) ---
+        self._pinned_eval_data: list = []
+        e2e_opts = ts_cfg.get("e2e_nlg_options") or {}
+        raw_anchors = e2e_opts.get("pinned_anchors") or []
+        if raw_anchors and self._method == "structured_slot_coverage":
+            self._pinned_eval_data = [
+                {"input": mr_string, "reference": None}
+                for mr_string in raw_anchors
+                if mr_string and mr_string.strip()
+            ]
+            _log(f"Loaded {len(self._pinned_eval_data)} pinned anchor samples for cross-checkpoint comparison.")
 
         _log(
             f"QualitativeEvaluator ready: method={self._method}, "
@@ -804,7 +1025,6 @@ class QualitativeEvaluator:
                 predictions.append(response)
                 references.append(sample.get("reference"))
 
-                # Intelligently clean boundary matrices immediately preserving PyTorch native graphs safely intrinsically beautifully securely effectively
                 del inputs
                 del output_ids
                 del generated_ids
@@ -858,10 +1078,11 @@ class QualitativeEvaluator:
                 for i, p in enumerate(preds):
                     predictions_matrix[i].append(p)
                     
-            predictions = [runs[0] for runs in predictions_matrix] # fallback to standard 1D stats for compatibility
+            predictions = [runs[0] for runs in predictions_matrix]  # first run for universal metrics
             references = final_references
         else:
             predictions, references = self._generate_responses(model, window, do_sample=False)
+            predictions_matrix = None
 
         if not any(p.strip() for p in predictions):
             _log("  Warning: all qualitative eval generations were empty — skipping metrics.")
@@ -871,11 +1092,34 @@ class QualitativeEvaluator:
         strategy_metrics = {}
         try:
             strategy_metrics = self._metric.compute(predictions, references, inputs=inputs)
-            if self._consistency_runs > 1:
+            if self._consistency_runs > 1 and predictions_matrix is not None:
                 consistency_metrics = self._metric.compute_consistency(predictions_matrix, references, inputs=inputs)
                 strategy_metrics.update(consistency_metrics)
         except Exception as exc:
             _log(f"  Warning: strategy metric ({self._method}) failed: {exc}")
+
+        # Run pinned anchor evaluation (structured_slot_coverage only)
+        if self._pinned_eval_data and self._consistency_runs > 1:
+            try:
+                _log(f"  Running pinned anchor generation: {len(self._pinned_eval_data)} anchors × {self._consistency_runs} runs")
+                pinned_matrix = [[] for _ in range(len(self._pinned_eval_data))]
+                for _ in range(self._consistency_runs):
+                    preds, _ = self._generate_responses(
+                        model, self._pinned_eval_data,
+                        do_sample=True, temperature=self._consistency_temperature
+                    )
+                    for i, p in enumerate(preds):
+                        pinned_matrix[i].append(p)
+
+                pinned_inputs = [s["input"] for s in self._pinned_eval_data]
+                pinned_metrics = self._metric.compute_pinned(pinned_matrix, pinned_inputs)
+                strategy_metrics.update(pinned_metrics)
+
+                for k, v in pinned_metrics.items():
+                    if isinstance(v, float):
+                        _log(f"  {k}: {v:.4f}")
+            except Exception as exc:
+                _log(f"  Warning: pinned anchor evaluation failed: {exc}")
 
         # Run universal metrics (always, zero extra compute)
         universal_metrics = _compute_universal_qualitative_metrics(predictions)
@@ -891,7 +1135,7 @@ class QualitativeEvaluator:
                 _log(f"  {k}: {v}")
         _log("--- End Qualitative Eval ---")
 
-        # Aggressive memory cleanup after generation passes
+        # Memory cleanup after generation passes
         import gc
         gc.collect()
         if torch.backends.mps.is_available():
