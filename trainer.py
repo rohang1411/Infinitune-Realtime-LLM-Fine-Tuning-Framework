@@ -559,6 +559,8 @@ def train_model(config, config_path: str = "(unknown)"):
 
     eof_received = False
     stop_requested = False
+    consecutive_empty_polls_after_eof = 0
+    max_consecutive_empty_polls = 50  # Allow up to 50 empty polls after EOF before giving up
 
     # In test_mode we train on the ENTIRE dataset (stop on EOF, not max_steps).
     # max_steps still serves as a safety cap in normal mode.
@@ -620,17 +622,33 @@ def train_model(config, config_path: str = "(unknown)"):
             while len(batch_samples) < training_args.per_device_train_batch_size:
                 messages = consumer.poll(timeout_ms=poll_timeout_ms)
                 if not messages:
+                    # After EOF is received, track consecutive empty polls to detect
+                    # when the queue is truly exhausted (accounting for temporary gaps).
+                    if eof_received:
+                        consecutive_empty_polls_after_eof += 1
+                        if consecutive_empty_polls_after_eof >= max_consecutive_empty_polls:
+                            _log(
+                                f"End-of-stream reached: {consecutive_empty_polls_after_eof} consecutive empty polls "
+                                f"after EOF marker. Exiting training loop. (total_messages_seen={total_messages_seen})"
+                            )
+                            stop_requested = True
+                            break
+                    
                     # Heartbeat so it never looks "stuck" while waiting for producer data.
                     now = time.time()
-                    if eof_received and (now - last_data_time) >= 2.0:
-                        _log("End-of-stream: no more data from producer. Exiting training loop.")
-                        stop_requested = True
-                        break
                     if now - last_heartbeat_time >= heartbeat_every_s:
-                        _log(f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s")
+                        _log(
+                            f"Waiting for Kafka data... batch_progress={len(batch_samples)}/{training_args.per_device_train_batch_size}, "
+                            f"total_messages_seen={total_messages_seen}, idle_for={now - last_data_time:.1f}s"
+                            + (f", consecutive_empty_polls_after_eof={consecutive_empty_polls_after_eof}/{max_consecutive_empty_polls}" if eof_received else "")
+                        )
                         last_heartbeat_time = now
                     time.sleep(0.1)
                     continue
+
+                # Reset counter whenever we get data after EOF
+                if eof_received:
+                    consecutive_empty_polls_after_eof = 0
 
                 for tp, records in messages.items():
                     for message in records:
@@ -642,6 +660,7 @@ def train_model(config, config_path: str = "(unknown)"):
                         if isinstance(sample_data, dict) and ("_eof" in sample_data or "_verify" in sample_data):
                             if sample_data.get("_eof"):
                                 eof_received = True
+                                consecutive_empty_polls_after_eof = 0  # Reset on EOF marker
                                 _log("Received end-of-stream marker from producer.")
                             continue
 

@@ -36,6 +36,7 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -86,7 +87,7 @@ class CheckpointManager:
         checkpoint_meta.json for traceability.
     """
 
-    def __init__(self, config: dict, config_path: str | None = None):
+    def __init__(self, config: dict, config_path: Optional[str] = None):
         self._config = config
         self._config_path = config_path or "(unknown)"
 
@@ -121,8 +122,8 @@ class CheckpointManager:
         tokenizer,
         step,
         force: bool = False,
-        loss: float | None = None,
-    ) -> str | None:
+        loss: Optional[float] = None,
+    ) -> Optional[str]:
         """
         Save LoRA adapter + tokenizer + metadata to a versioned directory.
 

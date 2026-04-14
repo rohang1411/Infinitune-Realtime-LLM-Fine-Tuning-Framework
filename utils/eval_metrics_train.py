@@ -251,7 +251,7 @@ class Evaluator:
             else None
         )
 
-        # Sliding window cursor — tracks position within the eval pool
+        # Sliding window cursor ï¿½ tracks position within the eval pool
         self._eval_cursor = 0
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
@@ -726,8 +726,10 @@ class Evaluator:
                     ).strip()
 
                     _log(f"  [SAMPLE {idx}]")
-                    _log(f"    Input  : {prompt_text[:150].replace('\\n', ' ')}")
-                    _log(f"    Target : {str(sample.get('target', ''))[:150].replace('\\n', ' ')}")
+                    prompt_display = prompt_text[:150].replace('\n', ' ')
+                    target_display = str(sample.get('target', ''))[:150].replace('\n', ' ')
+                    _log(f"    Input  : {prompt_display}")
+                    _log(f"    Target : {target_display}")
                     _log(f"    Model  : {response}")
                     
                     del inputs
