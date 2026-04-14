@@ -7,35 +7,43 @@ Design principles
 -----------------
 - Saves ONLY the LoRA adapter (~5-20 MB), not the full base model.
   The base model is always re-loaded from HuggingFace cache at eval time.
-- Step directories are NEVER overwritten (skipped if they already exist).
-  Only "final/" is overwritten — it always represents the latest endpoint.
-- Directory naming: <output_dir>/checkpoints/<model>__<dataset>/step_XXXX/
+- Each training run gets its own unique subdirectory so multiple runs
+  never collide. The "final" checkpoint inside a run is always overwritten
+  by subsequent saves within that same run.
+- Directory naming:
+    <output_dir>/checkpoints/<model>__<dataset>/run_<ts>_<uid>/step_XXXX/
   Zero-padded step numbers ensure natural alphabetical sorting.
 - checkpoint_meta.json records provenance so evaluate.py needs only the
   checkpoint directory (not the original config path) to reconstruct the
   model.
+- list_checkpoints() discovers checkpoints from ALL past runs under the
+  scope directory and includes backward-compatible discovery of legacy
+  flat step_* directories from pre-versioning releases.
 
 Directory layout
 ----------------
 <output_dir>/
   checkpoints/
-    <model>__<dataset>/          ← checkpoint_root
-      step_0100/
-        adapter_model.safetensors
-        adapter_config.json
-        checkpoint_meta.json
-      step_0200/
+    <model>__<dataset>/          ← checkpoint_root (scope dir)
+      run_20260413-153020_a3f2/  ← per-run subdir (created at init)
+        step_000100/
+          adapter_model.safetensors
+          adapter_config.json
+          checkpoint_meta.json
+        step_000200/
+          ...
+        final/
+          ...
+      run_20260413-180045_b7c1/  ← second run; never collides with first
+        step_000100/
         ...
-      final/
-        adapter_model.safetensors
-        adapter_config.json
-        checkpoint_meta.json
 """
 
 import json
 import os
 import re
 import time
+import uuid
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -110,7 +118,17 @@ class CheckpointManager:
 
         self.checkpoint_root = os.path.join(output_dir, "checkpoints", scope_dir)
         os.makedirs(self.checkpoint_root, exist_ok=True)
+
+        # Each CheckpointManager instance corresponds to exactly one training run.
+        # Generate a unique run subdirectory so repeated runs never collide.
+        _run_ts  = time.strftime("%Y%m%d-%H%M%S")
+        _run_uid = uuid.uuid4().hex[:4]
+        self._run_dir  = f"run_{_run_ts}_{_run_uid}"
+        self._run_path = os.path.join(self.checkpoint_root, self._run_dir)
+        # The run dir is created on first save, not at init (avoids empty dirs).
+
         _log(f"CheckpointManager initialised. Root: {self.checkpoint_root}")
+        _log(f"Run directory: {self._run_dir}")
 
     # -----------------------------------------------------------------------
     # Public API
@@ -142,16 +160,17 @@ class CheckpointManager:
         The checkpoint directory path if saved, None if skipped.
         """
         dir_name  = _step_dir_name(step)
-        save_path = os.path.join(self.checkpoint_root, dir_name)
+        save_path = os.path.join(self._run_path, dir_name)
 
-        # "final" always overwrites; numbered steps never overwrite (unless forced).
+        # "final" always overwrites within the same run; numbered steps never
+        # overwrite (a step can't appear twice within a single run).
         if step == "final":
             force = True
 
         if not force and os.path.isdir(save_path):
             _log(
-                f"Checkpoint '{dir_name}' already exists — skipping save "
-                f"(pass force=True to overwrite)."
+                f"Checkpoint '{dir_name}' already exists in run '{self._run_dir}' "
+                f"— skipping save (pass force=True to overwrite)."
             )
             return None
 
@@ -185,38 +204,41 @@ class CheckpointManager:
             _log(f"Warning: Could not write checkpoint_meta.json: {exc}")
 
         step_label = f"step {step}" if step != "final" else "final"
-        _log(f"Checkpoint saved [{step_label}] → {save_path}")
+        _log(f"Checkpoint saved [{step_label}] → {save_path} (run: {self._run_dir})")
         return save_path
 
     # -----------------------------------------------------------------------
 
     def list_checkpoints(self) -> list:
         """
-        Return a sorted list of available checkpoints.
+        Return a sorted list of available checkpoints across ALL runs.
+
+        Scans:
+          1. run_* subdirectories (new hierarchical layout) — each run's
+             step_* and final directories are discovered.
+          2. Legacy flat step_* directories directly under checkpoint_root
+             (from pre-versioning releases) for backward compatibility.
 
         Each entry is a dict:
             {
-                "name":      "step_0100",
-                "step":      100,          # int or "final"
-                "path":      "/abs/path/step_0100",
-                "timestamp": "2026-04-12T15:02:30",   # from meta, or None
+                "name":      "step_000100",
+                "step":      100,           # int or "final"
+                "path":      "/abs/path/run_xxx/step_000100",
+                "run":       "run_20260413-153020_a3f2",  # None for legacy
+                "timestamp": "2026-04-12T15:02:30",       # from meta, or None
             }
 
-        Results are sorted: numbered steps first (ascending), then "final".
+        Results are sorted: numbered steps ascending, then "final" last.
         """
         if not os.path.isdir(self.checkpoint_root):
             return []
 
         checkpoints = []
-        for entry in os.scandir(self.checkpoint_root):
-            if not entry.is_dir():
-                continue
-            name = entry.name
-            path = entry.path
 
-            # Only include directories that have an adapter config (valid ckpts)
+        def _load_step_dir(path: str, name: str, run_name):
+            """Parse a single step directory and append to checkpoints."""
             if not os.path.exists(os.path.join(path, "adapter_config.json")):
-                continue
+                return  # not a valid checkpoint
 
             meta_path = os.path.join(path, "checkpoint_meta.json")
             timestamp = None
@@ -231,19 +253,36 @@ class CheckpointManager:
             if name == "final":
                 step_val = "final"
             elif name.startswith("step_"):
+                # Handle both "step_000200" and legacy "step_0200" widths
+                numeric_part = name[len("step_"):]
                 try:
-                    step_val = int(name[len("step_"):])
+                    step_val = int(numeric_part)
                 except ValueError:
-                    continue  # malformed directory name
+                    return  # malformed directory name
             else:
-                continue
+                return  # not a checkpoint directory
 
             checkpoints.append({
                 "name":      name,
                 "step":      step_val,
                 "path":      path,
+                "run":       run_name,
                 "timestamp": timestamp,
             })
+
+        for entry in os.scandir(self.checkpoint_root):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+
+            if name.startswith("run_"):
+                # New hierarchical layout: scan step dirs inside each run dir
+                for step_entry in os.scandir(entry.path):
+                    if step_entry.is_dir():
+                        _load_step_dir(step_entry.path, step_entry.name, name)
+            elif name.startswith("step_") or name == "final":
+                # Legacy flat layout: step dirs directly under checkpoint_root
+                _load_step_dir(entry.path, name, run_name=None)
 
         # Sort: numbered steps ascending, then "final" last
         def sort_key(c):
@@ -256,8 +295,29 @@ class CheckpointManager:
     # -----------------------------------------------------------------------
 
     def get_checkpoint_path(self, step) -> str:
-        """Return the expected path for a given step (does not check existence)."""
-        return os.path.join(self.checkpoint_root, _step_dir_name(step))
+        """Return the path for a step within the CURRENT run's directory.
+        
+        Use this during training. For evaluation (finding a checkpoint from
+        any run), use resolve_checkpoint_path() instead.
+        """
+        return os.path.join(self._run_path, _step_dir_name(step))
+
+    def resolve_checkpoint_path(self, step) -> Optional[str]:
+        """Resolve a checkpoint path by scanning all runs for a given step.
+
+        Returns the path from the most-recent run that contains the step,
+        or None if no match is found. Used by evaluate.py to locate
+        checkpoints from previous training runs.
+        """
+        target = _step_dir_name(step)
+        # list_checkpoints() is already sorted ascending by step then by run;
+        # we want the latest run, so collect all matches and return the last.
+        matches = [
+            c["path"]
+            for c in self.list_checkpoints()
+            if c["step"] == ("final" if step == "final" else int(step))
+        ]
+        return matches[-1] if matches else None
 
     # -----------------------------------------------------------------------
 

@@ -137,19 +137,18 @@ def _default_metric_flags(strategy: str):
             **_online,
             "compute_accuracy": True,
             "compute_backward_transfer": True,
-            "compute_backward_transfer": True,
             "compute_exact_match": True,
             "compute_f1": True,
             "compute_mcc": True,
             "compute_kappa": True,
             "compute_qafacteval": False,
+            "compute_answer_overlap_f1": False,
         }
     if strategy == "regex_extract":
         return {
             **loss,
             **_online,
             "compute_accuracy": True,
-            "compute_backward_transfer": True,
             "compute_backward_transfer": True,
             "compute_exact_match": True,
             # F1 / MCC / kappa are usually misleading for free-form or
@@ -158,6 +157,7 @@ def _default_metric_flags(strategy: str):
             "compute_mcc": False,
             "compute_kappa": False,
             "compute_qafacteval": False,
+            "compute_answer_overlap_f1": False,
         }
     # perplexity-only or unknown strategy: forward-pass metrics only
     return {
@@ -165,24 +165,34 @@ def _default_metric_flags(strategy: str):
         **_online,
         "compute_accuracy": False,
         "compute_backward_transfer": False,
-        "compute_backward_transfer": False,
         "compute_exact_match": False,
         "compute_f1": False,
         "compute_mcc": False,
         "compute_kappa": False,
         "compute_qafacteval": False,
+        "compute_answer_overlap_f1": False,
     }
 
 
 def _merge_metric_flags(strategy: str, eval_cfg: dict) -> dict:
-    """Merge user `evaluation.metrics` onto strategy defaults (user wins)."""
+    """Merge user `evaluation.metrics` onto strategy defaults (user wins).
+    
+    Unknown keys in the user config (e.g. compute_answer_overlap_f1 before
+    it was added to defaults) are also merged in so no user flag is silently
+    dropped.
+    """
     base = _default_metric_flags(strategy)
     user = eval_cfg.get("metrics") or {}
     if not isinstance(user, dict):
         return base
-    for key in base:
+    # Apply known keys first
+    for key in list(base.keys()):
         if key in user and user[key] is not None:
             base[key] = bool(user[key])
+    # Also forward any user-supplied keys not yet in base (forward-compat)
+    for key, val in user.items():
+        if key not in base and val is not None:
+            base[key] = bool(val)
     return base
 
 
@@ -254,7 +264,6 @@ class Evaluator:
         # Sliding window cursor � tracks position within the eval pool
         self._eval_cursor = 0
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
-        self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
 
         # Forgetting + update latency (online / continual-learning style diagnostics)
         self._best_eval = {}  # metric_name -> running best (peak or valley)
@@ -281,8 +290,8 @@ class Evaluator:
                 f"exact_match={self.metric_flags['compute_exact_match']}, "
                 f"f1={self.metric_flags['compute_f1']}, mcc={self.metric_flags['compute_mcc']}, "
                 f"kappa={self.metric_flags['compute_kappa']}, "
-                f"qafacteval={self.metric_flags.get('compute_qafacteval', False)} "
-                f"kappa={self.metric_flags['compute_kappa']}, "
+                f"qafacteval={self.metric_flags.get('compute_qafacteval', False)}, "
+                f"answer_overlap_f1={self.metric_flags.get('compute_answer_overlap_f1', False)}, "
                 f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
                 f"update_latency={self.metric_flags.get('compute_update_latency', False)} "
                 f"(max_distinct_labels={self.max_distinct_labels})"
@@ -394,6 +403,7 @@ class Evaluator:
                 "compute_f1",
                 "compute_mcc",
                 "compute_kappa",
+                "compute_answer_overlap_f1",
             )
         )
 
@@ -416,6 +426,7 @@ class Evaluator:
             pred_labels = []
             source_texts = []   # raw input texts for QAFactEval
             generated_responses = []  # full model responses for QAFactEval
+            verbose_samples = []  # collected when self.verbose is True
 
             for i, sample in enumerate(eval_window):
                 try:
@@ -479,11 +490,18 @@ class Evaluator:
                     del generated_ids
 
                     if self.verbose:
-                        mark = "✓" if pred == gold else "✗"
+                        mark = "\u2713" if pred == gold else "\u2717"
                         _log(
                             f"  [{mark}] sample {i}: expected='{sample.get('target', '')}' "
                             f"got='{response[:80]}'"
                         )
+                        verbose_samples.append({
+                            "sample_idx": i,
+                            "input": prompt_text[:200].replace("\n", " "),
+                            "target": str(sample.get("target", ""))[:200].replace("\n", " "),
+                            "prediction": response[:200].replace("\n", " "),
+                            "correct": pred == gold,
+                        })
                 except Exception as e:
                     _log(f"  Warning: skipping eval sample {i} in generation pass: {e}")
 
@@ -517,25 +535,6 @@ class Evaluator:
                             metrics["backward_transfer"] = bwt_sum / bwt_count
                     self._aauc_history.append((step, metrics["accuracy"]))
                     metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
-
-                    if mf.get("compute_backward_transfer", False):
-                        bwt_sum = 0.0
-                        bwt_count = 0
-                        for i, is_correct in enumerate(correct_list):
-                            sample_idx = (window_start + i) % len(self.eval_data)
-                            curr_acc = 1.0 if is_correct else 0.0
-                            
-                            if sample_idx in self.past_sample_accuracies:
-                                max_past = self.past_sample_accuracies[sample_idx]
-                                bwt_sum += (curr_acc - max_past)
-                                bwt_count += 1
-                                if curr_acc > max_past:
-                                    self.past_sample_accuracies[sample_idx] = curr_acc
-                            else:
-                                self.past_sample_accuracies[sample_idx] = curr_acc
-                                
-                        if bwt_count > 0:
-                            metrics["backward_transfer"] = bwt_sum / bwt_count
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)
@@ -630,6 +629,20 @@ class Evaluator:
                     except Exception as e:
                         _log(f"  Warning: QAFactEval scoring failed (skipped): {e}")
 
+                # Token-level F1 between generated response and gold reference.
+                # Works for any generation strategy (perplexity, regex_extract, class_match).
+                if mf.get("compute_answer_overlap_f1", False) and gold_labels and pred_labels:
+                    try:
+                        overlap_scores = [
+                            _QAFactEvalScorer._token_f1(p, g)
+                            for g, p in zip(gold_labels, pred_labels)
+                        ]
+                        if overlap_scores:
+                            metrics["answer_overlap_f1"] = sum(overlap_scores) / len(overlap_scores)
+                            _log(f"  answer_overlap_f1: {metrics['answer_overlap_f1']:.4f}")
+                    except Exception as e:
+                        _log(f"  Warning: answer_overlap_f1 computation failed (skipped): {e}")
+
         # --- Forgetting: drop from running peak (higher-better) or rise from running
         # best minimum (lower-better). Only for known scalar keys; skips unknown types.
         if mf.get("compute_forgetting", False):
@@ -694,12 +707,15 @@ class Evaluator:
 
 
         # --- Verbose Manual Verification (Sample Generation) ---
+        # When need_generation was False (perplexity-only strategy), we still run
+        # a small generation pass here for human-readable inspection.
         if self.verbose and not need_generation:
             _log("  Verbose mode: generating sample records for manual verification...")
             cfg_max_new_tokens = self.config.get("inference", {}).get("max_new_tokens", 50)
-            
+            verbose_samples = []  # reset for this path
+
             # Use a small subset of the current window for verbosity
-            sample_subset = eval_window[:5] 
+            sample_subset = eval_window[:5]
             for idx, sample in enumerate(sample_subset):
                 try:
                     prompt_text = self.prompt_template.render(**sample)
@@ -731,11 +747,23 @@ class Evaluator:
                     _log(f"    Input  : {prompt_display}")
                     _log(f"    Target : {target_display}")
                     _log(f"    Model  : {response}")
-                    
+
+                    verbose_samples.append({
+                        "sample_idx": idx,
+                        "input": prompt_display,
+                        "target": target_display,
+                        "prediction": response[:200].replace("\n", " "),
+                        "correct": None,  # No gold comparison in perplexity-only path
+                    })
+
                     del inputs
                     del output_ids
                 except Exception as e:
                     _log(f"    Warning: skip verbose sample {idx}: {e}")
+
+        # Attach verbose samples to metrics dict so the caller can persist them
+        if self.verbose and verbose_samples:
+            metrics["_verbose_samples"] = verbose_samples
 
         self._last_eval_end_wall = time.monotonic()
 
@@ -757,3 +785,4 @@ class Evaluator:
             torch.cuda.empty_cache()
 
         return metrics if metrics else None
+
