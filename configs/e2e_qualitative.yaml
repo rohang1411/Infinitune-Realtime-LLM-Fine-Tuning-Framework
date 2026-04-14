@@ -87,17 +87,17 @@ training:
   gradient_accumulation_steps: 2
   gradient_checkpointing: true # Enabled to save VRAM by recomputing activations
   learning_rate: 5e-5
-  max_steps: 2100              # 33.5k examples / (8 * 2) effective batch size ~= 2095 steps for 1 Epoch
+  max_steps: 2629              # 42,061 examples / (8 * 2) effective batch size ~= 2629 steps for 1 Full Epoch
   logging_steps: 1
   weight_push_interval: 60
   lr_scheduler:
     type: "cosine_with_warmup"
     warmup_steps: 50
     min_lr_ratio: 0.01
-    T_max: 2100                # Align with max_steps
+    T_max: 2629                # Align with max_steps
   save_checkpoints:
     enabled: true
-    save_every_steps: 200      # Save every 200 steps for checkpoint coverage
+    save_every_steps: 250      # Increased slightly to distribute evenly across 2629 steps
     save_final: true
 
 # --- Inference ---
@@ -116,9 +116,9 @@ evaluation:
   enabled: true
   decoupled: true
   strategy: "perplexity"
-  eval_interval: 50
-  eval_pool_size: 500
-  eval_batch_size: 50
+  eval_interval: 100
+  eval_pool_size: 4672          # Full validation dataset (4,672 samples)
+  eval_batch_size: 180          # 180 samples * 26 evals = 4680 (perfectly covers the 4672 pool)
   verbose: false
   answer_regex: null
   metrics:
@@ -136,9 +136,9 @@ evaluation:
 testing_strategy:
   enabled: true
   method: "structured_slot_coverage"
-  eval_interval: 200            # Matrix generation is heavy, doing it at checkpoint intervals
-  eval_samples: 50              # Rotating pool window size
-  eval_pool_size: 150
+  eval_interval: 100            # Generate 26 times across 2629 steps (distributes the payload)
+  eval_samples: 180             # 180 samples * 26 evals = 4680 (perfectly slides over all 4672 testing records)
+  eval_pool_size: 4672          # Target the full validation dataset pool (decoupled eval uses this entirely)
   max_new_tokens: 60
   consistency_runs: 10
   consistency_temperature: 0.7
