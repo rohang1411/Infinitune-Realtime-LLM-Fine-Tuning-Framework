@@ -461,6 +461,22 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
         checker = self._slot_checkers.get(slot_name, "substring")
         if checker == "boolean_negation":
             return self._check_boolean_negation(slot_value, text)
+
+        # Fuzzy Price Matching to combat stringent substring dropout
+        if slot_name.lower() == "pricerange":
+            PRICE_ALIASES = {
+                "£20-25": ["£20", "20-25", "twenty"],
+                "less than £20": ["under £20", "below £20", "less than 20"],
+                "more than £30": ["over £30", "above £30", "more than 30"],
+            }
+            # Check exact match first
+            if slot_value.lower() in text:
+                return True
+            # Fallback to aliases
+            if slot_value in PRICE_ALIASES:
+                if any(alias in text for alias in PRICE_ALIASES[slot_value]):
+                    return True
+                
         # Default: simple substring match on the slot value
         return slot_value.lower() in text
 
@@ -499,6 +515,20 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
         else:  # 'no'
             return has_negative or not has_positive
 
+    def _is_valid_restaurant_description(self, name_value: str, text: str) -> bool:
+        """Fluency gate to combat false positives in early hallucinations."""
+        if name_value and name_value.lower() in text:
+            return True
+            
+        domain_keywords = [
+            'coffee shop', 'restaurant', 'pub', 'food', 'menu', 
+            'eat', 'serve', 'taste', 'price', 'bar', 'cafe', 'café'
+        ]
+        if any(keyword in text for keyword in domain_keywords):
+            return True
+            
+        return False
+
     def _score_sample(self, mr_string: str, text: str) -> tuple:
         """
         Score a single (MR, generated text) pair.
@@ -511,6 +541,10 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
         slots = self._parse_mr(mr_string)
         if not slots:
             return 0.0, {}
+
+        # Fluency Gate: Kill false positive metrics if the text is pure conversational hallucination
+        if not self._is_valid_restaurant_description(slots.get("name", ""), text_lower):
+            return 0.0, {slot_name: False for slot_name in slots.keys()}
 
         hits = 0
         per_slot: dict = {}

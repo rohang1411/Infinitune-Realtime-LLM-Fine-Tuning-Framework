@@ -137,7 +137,7 @@ testing_strategy:
   enabled: true
   method: "structured_slot_coverage"
   eval_interval: 200            # Synced explicitly with save_every_steps
-  eval_samples: 334             # 334 samples * 14 evals (including final) = 4676 (perfectly slides over all 4672 testing records)
+  eval_samples: 150             # Reduced from 334 to 150 to cut inference time by 55% during online training.
   eval_pool_size: 4672          # Target the full validation dataset pool
   max_new_tokens: 60
   consistency_runs: 3           # Reduced from 10 to exactly 3 for lightning fast inline iterations
