@@ -845,6 +845,7 @@ class QualitativeEvaluator:
         # --- Consistency loops ---
         self._consistency_runs: int = int(ts_cfg.get("consistency_runs", 1))
         self._consistency_temperature: float = float(ts_cfg.get("consistency_temperature", 0.7))
+        self._eval_batch_size: int = int(ts_cfg.get("eval_batch_size", 16))
 
         # --- Jinja2 templates (for prompt construction during generation) ---
         preproc = config.get("preprocessing", {})
@@ -983,7 +984,7 @@ class QualitativeEvaluator:
         Generate model responses for the eval window.
 
         Returns (predictions, references) as parallel lists.
-        model is temporarily set to .eval() and restored to .train() after.
+        Generates in high-speed batches seamlessly.
         """
         model.eval()
         predictions = []
@@ -999,17 +1000,32 @@ class QualitativeEvaluator:
             gen_config_kwargs["temperature"] = temperature
             
         gen_config = GenerationConfig(**gen_config_kwargs)
-
         max_seq_length = self.config.get("model", {}).get("max_seq_length", 512)
 
-        for i, sample in enumerate(window):
+        # Batch generation with decoder-only models natively requires left padding
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
+        batch_size = getattr(self, "_eval_batch_size", 16)
+        
+        import math
+        total_batches = math.ceil(len(window) / batch_size)
+
+        for batch_i in range(0, len(window), batch_size):
+            batch_window = window[batch_i:batch_i + batch_size]
+            prompt_texts = []
+            
+            for sample in batch_window:
+                prompt_texts.append(self._prompt_template.render(**sample))
+                references.append(sample.get("reference"))
+
             try:
-                prompt_text = self._prompt_template.render(**sample)
                 inputs = self.tokenizer(
-                    prompt_text,
+                    prompt_texts,
                     return_tensors="pt",
                     max_length=max_seq_length,
                     truncation=True,
+                    padding=True,
                 ).to(self.device)
 
                 prompt_token_len = inputs["input_ids"].shape[1]
@@ -1017,23 +1033,24 @@ class QualitativeEvaluator:
                 with torch.no_grad():
                     output_ids = model.generate(**inputs, generation_config=gen_config)
 
-                generated_ids = output_ids[0, prompt_token_len:]
-                response = self.tokenizer.decode(
-                    generated_ids, skip_special_tokens=True
-                ).strip()
-
-                predictions.append(response)
-                references.append(sample.get("reference"))
+                # Exactly slice off only the newly generated dimension identically for all
+                generated_ids = output_ids[:, prompt_token_len:]
+                responses = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                
+                for response in responses:
+                    predictions.append(response.strip())
 
                 del inputs
                 del output_ids
                 del generated_ids
                 
             except Exception as exc:
-                _log(f"  Warning: generation failed for eval sample {i}: {exc}")
-                predictions.append("")
-                references.append(sample.get("reference"))
+                _log(f"  Warning: batch generation failed for batch offsets {batch_i}: {exc}")
+                # Fallback purely to maintain identical lengths securely
+                for _ in batch_window:
+                    predictions.append("")
 
+        self.tokenizer.padding_side = original_padding_side
         model.train()
         return predictions, references
 
