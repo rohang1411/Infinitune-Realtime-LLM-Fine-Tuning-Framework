@@ -608,8 +608,8 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
 
         # Log markdown table header
         _log("")
-        _log("| MR Input | Generated Output (Sample Run) | Coverage |")
-        _log("|---|---|---|")
+        _log("| MR Input | Generated Output (Sample Run) | Coverage | Perfect? | Diagnostics |")
+        _log("|---|---|---|---|---|")
 
         full_coverage_counts = []
         mean_coverage_per_sample = []
@@ -629,6 +629,7 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
             runs_with_full_coverage = 0
             sample_run_text = ""
             sample_coverage = 0.0
+            sample_per_slot = {}
             run_coverages = []
             per_slot_run_hits: dict = collections.defaultdict(list)
 
@@ -675,6 +676,7 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
                 if not sample_run_text:
                     sample_run_text = text.strip().replace("\n", " ")
                     sample_coverage = coverage
+                    sample_per_slot = per_slot
 
             full_coverage_counts.append(runs_with_full_coverage / n_runs)
             mean_cov = sum(run_coverages) / len(run_coverages) if run_coverages else 0.0
@@ -684,8 +686,20 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
             for slot_name, hits in per_slot_run_hits.items():
                 per_slot_hits_all[slot_name].append(sum(hits) / len(hits))
 
+            # Diagnostic string generation
+            if sample_coverage >= 1.0:
+                perfect_str = "✅"
+                missing_str = "-"
+            elif sample_coverage == 0.0 and sample_per_slot and all(v is False for v in sample_per_slot.values()):
+                perfect_str = "❌"
+                missing_str = "**[HALLUCINATION IGNORED]**"
+            else:
+                perfect_str = "❌"
+                missed = [k for k, v in sample_per_slot.items() if not v]
+                missing_str = f"Missing: [{', '.join(missed)}]"
+
             # Log table row
-            _log(f"| {mr_string} | {sample_run_text} | {sample_coverage*100:.0f}% |")
+            _log(f"| {mr_string} | {sample_run_text} | {sample_coverage*100:.0f}% | {perfect_str} | {missing_str} |")
 
         _log("")
 
@@ -730,8 +744,8 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
 
         _log("")
         _log("=== Pinned Anchor Evaluation ===")
-        _log("| Anchor MR | Generated Output (Sample Run) | Coverage |")
-        _log("|---|---|---|")
+        _log("| Anchor MR | Generated Output (Sample Run) | Coverage | Perfect? | Diagnostics |")
+        _log("|---|---|---|---|---|")
 
         all_mean_coverages = []
         all_consistency_scores = []
@@ -746,21 +760,36 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
             runs_with_good_cov = 0
             sample_text = ""
             sample_cov = 0.0
+            sample_per_slot = {}
 
             for text in pred_runs:
                 clean_text = (text or "").strip().lower()
-                coverage, _ = self._score_sample(mr_string, clean_text)
+                coverage, per_slot = self._score_sample(mr_string, clean_text)
                 run_coverages.append(coverage)
                 if coverage >= 0.85:
                     runs_with_good_cov += 1
                 if not sample_text:
                     sample_text = text.strip().replace("\n", " ")
                     sample_cov = coverage
+                    sample_per_slot = per_slot
 
             mean_cov = sum(run_coverages) / len(run_coverages) if run_coverages else 0.0
             all_mean_coverages.append(mean_cov)
             all_consistency_scores.append(runs_with_good_cov / n_runs)
-            _log(f"| {mr_string} | {sample_text} | {sample_cov*100:.0f}% |")
+            
+            # Diagnostic string generation
+            if sample_cov >= 1.0:
+                perfect_str = "✅"
+                missing_str = "-"
+            elif sample_cov == 0.0 and sample_per_slot and all(v is False for v in sample_per_slot.values()):
+                perfect_str = "❌"
+                missing_str = "**[HALLUCINATION IGNORED]**"
+            else:
+                perfect_str = "❌"
+                missed = [k for k, v in sample_per_slot.items() if not v]
+                missing_str = f"Missing: [{', '.join(missed)}]"
+
+            _log(f"| {mr_string} | {sample_text} | {sample_cov*100:.0f}% | {perfect_str} | {missing_str} |")
 
         _log("")
 
@@ -1013,7 +1042,7 @@ class QualitativeEvaluator:
     # Generation
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _generate_responses(self, model, window: list, do_sample: bool = False, temperature: float = 1.0) -> tuple:
+    def _generate_responses(self, model, window: list, do_sample: bool = False, temperature: float = 1.0, num_return_sequences: int = 1) -> tuple:
         """
         Generate model responses for the eval window.
 
@@ -1027,6 +1056,7 @@ class QualitativeEvaluator:
         gen_config_kwargs = {
             "max_new_tokens": self._max_new_tokens,
             "do_sample": do_sample,
+            "num_return_sequences": num_return_sequences,
             "pad_token_id": self.tokenizer.eos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
@@ -1082,7 +1112,8 @@ class QualitativeEvaluator:
                 _log(f"  Warning: batch generation failed for batch offsets {batch_i}: {exc}")
                 # Fallback purely to maintain identical lengths securely
                 for _ in batch_window:
-                    predictions.append("")
+                    for _ in range(num_return_sequences):
+                        predictions.append("")
 
         self.tokenizer.padding_side = original_padding_side
         model.train()
@@ -1114,23 +1145,23 @@ class QualitativeEvaluator:
         window = self._get_eval_window()
         inputs = [sample.get("input", "") for sample in window]
         
-        # Generalized Consistency Generation
+        # Generalized Consistency Generation (GPU Parallelized)
         if self._consistency_runs > 1:
-            _log(f"  Running matrix generation: {self._consistency_runs} runs per sample (temp={self._consistency_temperature})")
-            predictions_matrix = [[] for _ in range(len(window))]
-            final_references = []
+            _log(f"  Running GPU-parallel matrix generation: {self._consistency_runs} runs per sample (temp={self._consistency_temperature})")
             
-            for run_idx in range(self._consistency_runs):
-                preds, refs = self._generate_responses(
-                    model, window, do_sample=True, temperature=self._consistency_temperature
-                )
-                if run_idx == 0:
-                    final_references = refs
-                for i, p in enumerate(preds):
-                    predictions_matrix[i].append(p)
-                    
-            predictions = [runs[0] for runs in predictions_matrix]  # first run for universal metrics
-            references = final_references
+            # Generate all sequences in a single, massively parallel GPU forward pass
+            flat_preds, references = self._generate_responses(
+                model, window, do_sample=True, temperature=self._consistency_temperature, num_return_sequences=self._consistency_runs
+            )
+            
+            # Reshape 1D flat tensor response back into 2D (window_size x consistency_runs)
+            predictions_matrix = []
+            for i in range(len(window)):
+                start_idx = i * self._consistency_runs
+                end_idx = start_idx + self._consistency_runs
+                predictions_matrix.append(flat_preds[start_idx:end_idx])
+                
+            predictions = [runs[0] for runs in predictions_matrix if runs]  # first run for universal metrics
         else:
             predictions, references = self._generate_responses(model, window, do_sample=False)
             predictions_matrix = None
