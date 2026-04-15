@@ -247,8 +247,20 @@ def evaluate_checkpoint(ckpt_path: str, config: dict, config_file: str) -> dict:
 
     ckpt_manager = CheckpointManager(config, config_path=config_file)
 
-    _log(f"Loading checkpoint: {ckpt_path}")
-    model, tokenizer = ckpt_manager.load(ckpt_path, device=str(device))
+    if ckpt_path == "base_model":
+        _log("Loading base model (no adapter)...")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        model_name = config.get("model", {}).get("name")
+        prec = config.get("model", {}).get("precision", "fp32")
+        dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+        
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+        model.to(device)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    else:
+        _log(f"Loading checkpoint: {ckpt_path}")
+        model, tokenizer = ckpt_manager.load(ckpt_path, device=str(device))
 
     metrics = run_evaluation(model, tokenizer, config, device)
 
@@ -329,7 +341,15 @@ def main():
         if not checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(1)
-        _log(f"Found {len(checkpoints)} checkpoint(s) to evaluate.")
+            
+        # Prepend the base model for a step 0 baseline
+        checkpoints.insert(0, {
+            "name": "base_model",
+            "step": 0,
+            "path": "base_model",
+            "timestamp": None,
+        })
+        _log(f"Found {len(checkpoints) - 1} checkpoint(s). Added base_model for baseline comparison.")
     elif args.checkpoint_dir:
         if not os.path.isdir(args.checkpoint_dir):
             _log(f"ERROR: Checkpoint directory not found: {args.checkpoint_dir}")
