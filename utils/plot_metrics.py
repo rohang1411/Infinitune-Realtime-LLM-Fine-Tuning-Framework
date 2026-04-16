@@ -132,11 +132,12 @@ def _build_config_header(config: dict) -> str:
 # Static plot definitions: (filename, title, csv_key)
 _STATIC_PLOT_DEFS = [
     # ── Quantitative metrics ──────────────────────────────────────────────────
-    ("train_loss",           "Training Loss",                          "train_loss"),
+    ("train_loss",           "Training Loss",                          "loss"),
+    ("learning_rate",        "Learning Rate",                          "lr"),
     ("eval_loss",            "Eval Loss",                              "eval_loss"),
     ("perplexity",           "Perplexity",                             "perplexity"),
     ("accuracy",             "Accuracy",                               "accuracy"),
-    ("aauc",                 "AAUC (normalized)",                      "aauc"),
+    ("average_accuracy",     "Average Accuracy (over training)",       "average_accuracy"),
     ("backward_transfer",    "Backward Transfer",                      "backward_transfer"),
     ("f1",                   "Macro F1 Score",                         "f1"),
     ("mcc",                  "Matthews Correlation Coefficient",       "mcc"),
@@ -144,7 +145,7 @@ _STATIC_PLOT_DEFS = [
     ("exact_match",          "Exact Match Rate",                       "exact_match"),
     ("qafacteval",           "QAFactEval Score",                       "qafacteval"),
     ("forgetting_max",       "Max Forgetting (tracked metrics)",       "forgetting_max"),
-    ("update_latency_s",     "Update Latency (s since last eval)",     "update_latency_s"),
+    ("eval_cycle_time_s",    "Eval Cycle Time (s)",                    "eval_cycle_time_s"),
     ("grad_norm",            "Gradient Norm",                          "grad_norm"),
     ("tokens_per_sec",       "Token Throughput (tok/s)",               "tokens_per_sec"),
     ("answer_overlap_f1",    "Answer Overlap F1 (token-level)",        "answer_overlap_f1"),
@@ -170,14 +171,18 @@ _STATIC_PLOT_DEFS = [
 ]
 
 
-def _plot_single(ax, xs, ys, title, ylabel, color="steelblue"):
+def _plot_single(ax, xs, ys, title, ylabel, color="#81b29a"):
     """Plot a single metric onto a matplotlib Axes object."""
     ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.5, color=color)
-    ax.set_title(title, fontsize=10, fontweight="bold", pad=6)
-    ax.set_xlabel("Step", fontsize=8)
-    ax.set_ylabel(ylabel, fontsize=8)
-    ax.tick_params(labelsize=7)
-    ax.grid(True, alpha=0.25, linestyle="--")
+    ax.set_title(title, fontsize=10, fontweight="bold", pad=6, color="#333333")
+    ax.set_xlabel("Step", fontsize=8, color="#555555")
+    ax.set_ylabel(ylabel, fontsize=8, color="#555555")
+    ax.tick_params(labelsize=7, colors="#777777")
+    ax.grid(True, alpha=0.15, linestyle="--", color="#bbbbbb")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#dddddd")
+    ax.spines["bottom"].set_color("#dddddd")
     if ys:
         ax.set_ylim(bottom=max(0, min(ys) * 0.9), top=max(ys) * 1.1 + 1e-9)
 
@@ -228,14 +233,14 @@ def generate_individual_plots(rows: list, out_dir: str, extra_cols: list = None)
 # Dashboard generator
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Color palette for dashboard panels
+# Color palette for dashboard panels (Minimalist Pastel)
 _PALETTE = {
-    "quant":     "#4C72B0",   # muted blue — training health
-    "coverage":  "#55A868",   # green — slot coverage summary
-    "per_slot":  "#C44E52",   # red — per-slot breakdown
-    "consist":   "#8172B3",   # purple — consistency / inversion
-    "universal": "#CCB974",   # gold — universal quality
-    "pinned":    "#64B5CD",   # teal — pinned anchors
+    "quant":     "#81b29a",   # sage green
+    "coverage":  "#f2cc8f",   # pastel yellow/orange
+    "per_slot":  "#e07a5f",   # muted terracotta
+    "consist":   "#9f86c0",   # soft purple
+    "universal": "#84a98c",   # pastel green
+    "pinned":    "#7ebce6",   # powder blue
 }
 
 
@@ -275,10 +280,10 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
 
     # Panel 1: Training Health
     health_cols = [
-        ("eval_loss", "Eval Loss", "eval_loss", _PALETTE["quant"]),
-        ("perplexity", "Perplexity", "perplexity", _PALETTE["quant"]),
+        ("Eval Loss", "eval_loss", _PALETTE["quant"]),
+        ("Perplexity", "perplexity", _PALETTE["quant"]),
     ]
-    health_present = [(t, lbl, k, c) for t, lbl, k, c in health_cols if _has(k)]
+    health_present = [(lbl, k, c) for lbl, k, c in health_cols if _has(k)]
     if health_present:
         panels.append(("health", health_present))
 
@@ -337,7 +342,7 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
     fig_height = 2.0 + n_data_rows * 3.2  # header + data rows
     fig_width  = 16
 
-    fig = plt.figure(figsize=(fig_width, fig_height), facecolor="#1a1a2e")
+    fig = plt.figure(figsize=(fig_width, fig_height), facecolor="#ffffff")
 
     # Outer gridspec: header row (1) + data rows (n_data_rows)
     outer_gs = gridspec.GridSpec(
@@ -349,7 +354,7 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
 
     # ── Header strip ──────────────────────────────────────────────────────────
     header_ax = fig.add_subplot(outer_gs[0])
-    header_ax.set_facecolor("#16213e")
+    header_ax.set_facecolor("#fafafa")
     header_ax.axis("off")
 
     header_text = _build_config_header(config) if config else "InfiniTune — Evaluation Dashboard"
@@ -358,14 +363,14 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
         "InfiniTune — Evaluation Dashboard",
         transform=header_ax.transAxes,
         ha="center", va="center",
-        fontsize=14, fontweight="bold", color="#e0e0e0",
+        fontsize=14, fontweight="bold", color="#222222",
     )
     header_ax.text(
         0.5, 0.18,
         header_text,
         transform=header_ax.transAxes,
         ha="center", va="center",
-        fontsize=7.5, color="#a0a0c0",
+        fontsize=7.5, color="#666666",
         family="monospace",
     )
 
@@ -380,7 +385,7 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
 
         for col_idx in range(n_subplots):
             ax = fig.add_subplot(inner_gs[col_idx])
-            ax.set_facecolor("#0f3460")
+            ax.set_facecolor("#ffffff")
 
             # Unpack column info based on panel type
             col_info = panel_cols[col_idx]
@@ -397,20 +402,20 @@ def generate_dashboard(rows: list, out_dir: str, config: dict = None) -> str:
             xs, ys = extract_series(rows, key)
             if xs:
                 ax.plot(xs, ys, marker="o", markersize=3.5, linewidth=1.5, color=color)
-                ax.fill_between(xs, ys, alpha=0.12, color=color)
+                ax.fill_between(xs, ys, alpha=0.10, color=color)
 
-            ax.set_title(title, fontsize=9, fontweight="bold", color="#e0e0e0", pad=5)
-            ax.set_xlabel("Step", fontsize=7.5, color="#9090b0")
-            ax.set_ylabel(ylabel, fontsize=7.5, color="#9090b0")
-            ax.tick_params(colors="#8080a0", labelsize=7)
-            ax.spines["bottom"].set_color("#334466")
-            ax.spines["left"].set_color("#334466")
+            ax.set_title(title, fontsize=9, fontweight="bold", color="#333333", pad=5)
+            ax.set_xlabel("Step", fontsize=7.5, color="#555555")
+            ax.set_ylabel(ylabel, fontsize=7.5, color="#555555")
+            ax.tick_params(colors="#777777", labelsize=7)
+            ax.spines["bottom"].set_color("#dddddd")
+            ax.spines["left"].set_color("#dddddd")
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
-            ax.grid(True, alpha=0.18, linestyle="--", color="#4466aa")
+            ax.grid(True, alpha=0.15, linestyle="--", color="#bbbbbb")
 
     out_path = os.path.join(out_dir, "dashboard.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"  Dashboard saved: {out_path}")
     return out_path

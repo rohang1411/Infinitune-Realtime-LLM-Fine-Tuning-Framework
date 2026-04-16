@@ -894,6 +894,7 @@ class QualitativeEvaluator:
             self._metric = None
             self.eval_data = []
             self._pinned_eval_data = []
+            self.eval_interval = 50 # Default safe value even if disabled
             return
 
         # --- Build the metric strategy ---

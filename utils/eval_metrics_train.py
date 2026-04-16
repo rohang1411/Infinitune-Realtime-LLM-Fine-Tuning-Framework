@@ -101,16 +101,36 @@ def _normalized_aauc_from_history(history):
         return 0.0
     if len(history) == 1:
         return float(history[0][1])
+    def _to_float_safe(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
     raw = 0.0
+    last_step = None
+    last_acc = None
     for i in range(len(history) - 1):
         s0, a0 = history[i]
         s1, a1 = history[i + 1]
-        ds = s1 - s0
+        s0f = _to_float_safe(s0)
+        s1f = _to_float_safe(s1)
+        a0f = _to_float_safe(a0)
+        a1f = _to_float_safe(a1)
+        if None in (s0f, s1f, a0f, a1f):
+            continue
+        ds = s1f - s0f
         if ds > 0:
-            raw += 0.5 * (float(a0) + float(a1)) * ds
-    span = history[-1][0] - history[0][0]
-    if span <= 0:
+            raw += 0.5 * (a0f + a1f) * ds
+            last_step = s1f
+            last_acc = a1f
+
+    if last_step is None:
         return float(history[-1][1])
+
+    span = last_step - 0.0
+    if span <= 0:
+        return last_acc if last_acc is not None else float(history[-1][1])
     return raw / float(span)
 
 # Forgetting: higher is better vs lower is better (used only when compute_forgetting is on).
@@ -129,7 +149,7 @@ def _default_metric_flags(strategy: str):
         # if eval window slides or data distribution shifts.
         "compute_forgetting": False,
         # Wall-clock seconds since the *previous* eval finished (training + I/O between evals).
-        "compute_update_latency": False,
+        "compute_eval_cycle_time": False,
     }
     if strategy == "class_match":
         return {
@@ -293,7 +313,7 @@ class Evaluator:
                 f"qafacteval={self.metric_flags.get('compute_qafacteval', False)}, "
                 f"answer_overlap_f1={self.metric_flags.get('compute_answer_overlap_f1', False)}, "
                 f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
-                f"update_latency={self.metric_flags.get('compute_update_latency', False)} "
+                f"eval_cycle_time={self.metric_flags.get('compute_eval_cycle_time', False)} "
                 f"(max_distinct_labels={self.max_distinct_labels})"
             )
 
@@ -329,7 +349,16 @@ class Evaluator:
                     elif str(target_val) in label_map:
                         target_val = label_map[str(target_val)]
                 target_val = str(target_val)
-                self.eval_data.append({"input": input_val, "target": target_val})
+                sample_dict = {"input": input_val, "target": target_val}
+                self.eval_data.append(sample_dict)
+                
+                # Segregate unconditionally strictly for potential balanced windows natively
+                if self.strategy == 'class_match':
+                    if not hasattr(self, '_eval_data_by_class'):
+                        self._eval_data_by_class = collections.defaultdict(list)
+                        self._eval_cursor_by_class = collections.defaultdict(int)
+                    self._eval_data_by_class[target_val].append(sample_dict)
+                    
             _log(f"Loaded {len(self.eval_data)} evaluation samples into pool (split='{eval_split}', batch_size={self.eval_batch_size}).")
         except Exception as e:
             _log(f"Warning: Could not load eval dataset: {e}")
@@ -338,9 +367,32 @@ class Evaluator:
     def _get_eval_window(self):
         """Return the next sliding window of eval samples and advance cursor."""
         pool_size = len(self.eval_data)
-        start = self._eval_cursor
-        end = start + self.eval_batch_size
+        start = getattr(self, '_eval_cursor', 0)
+        
+        # Strategy conditionally creates balanced chunks 
+        if self.strategy == 'class_match' and getattr(self, '_eval_data_by_class', None):
+            classes = list(self._eval_data_by_class.keys())
+            samples_per_class = max(1, self.eval_batch_size // len(classes))
+            
+            window = []
+            for c in classes:
+                c_pool = self._eval_data_by_class[c]
+                c_pool_size = len(c_pool)
+                c_start = getattr(self, '_eval_cursor_by_class', {}).get(c, 0)
+                c_end = c_start + samples_per_class
+                
+                if c_end <= c_pool_size:
+                    window.extend(c_pool[c_start:c_end])
+                else:
+                    window.extend(c_pool[c_start:] + c_pool[:c_end - c_pool_size])
+                    
+                self._eval_cursor_by_class[c] = c_end % c_pool_size
+                
+            import random
+            random.shuffle(window)
+            return window[:self.eval_batch_size], start
 
+        end = start + self.eval_batch_size
         if end <= pool_size:
             window = self.eval_data[start:end]
         else:
@@ -366,9 +418,9 @@ class Evaluator:
         model.eval()
         metrics = {}
 
-        if mf.get("compute_update_latency", False) and self._last_eval_end_wall is not None:
+        if mf.get("compute_eval_cycle_time", False) and self._last_eval_end_wall is not None:
             try:
-                metrics["update_latency_s"] = float(t_wall_start - self._last_eval_end_wall)
+                metrics["eval_cycle_time_s"] = float(t_wall_start - self._last_eval_end_wall)
             except (TypeError, ValueError):
                 pass
 
@@ -534,7 +586,7 @@ class Evaluator:
                         if bwt_count > 0:
                             metrics["backward_transfer"] = bwt_sum / bwt_count
                     self._aauc_history.append((step, metrics["accuracy"]))
-                    metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
+                    metrics["average_accuracy"] = _normalized_aauc_from_history(self._aauc_history)
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)
@@ -782,7 +834,10 @@ class Evaluator:
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
         elif torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                _log(f"  Warning: CUDA cache cleanup skipped after prior device error: {e}")
 
         return metrics if metrics else None
 

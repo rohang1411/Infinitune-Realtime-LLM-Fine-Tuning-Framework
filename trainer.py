@@ -37,6 +37,18 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def _apply_label_map_if_configured(target_value, label_map):
+    """Normalize raw dataset labels to configured textual labels when possible."""
+    if label_map is None:
+        return target_value
+    if target_value in label_map:
+        return label_map[target_value]
+    target_str = str(target_value)
+    if target_str in label_map:
+        return label_map[target_str]
+    return target_value
+
+
 class MetricsLogger:
     """
     CSV logger for training/eval metrics + optional plotting.
@@ -276,21 +288,31 @@ def tokenize_with_label_masking(tokenizer, prompt_text, response_text, max_seq_l
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
     response_ids = tokenizer.encode(response_text, add_special_tokens=False)
 
-    if len(prompt_ids) >= max_seq_length:
-        prompt_ids = prompt_ids[:max_seq_length - 1]
-        response_ids = []
+    bos_id = tokenizer.bos_token_id
+
+    # Compute effective target length cleanly guaranteeing targets get full priority bounds mapping
+    effective_response_len = len(response_ids)
+    if eos_id is not None:
+        effective_response_len += 1
+
+    # Overly massive responses (rare corner case mapping limit bounds)
+    if effective_response_len > max_seq_length:
+        prompt_ids = []
         if eos_id is not None:
-            prompt_ids.append(eos_id)
-    else:
-        max_response_len = max_seq_length - len(prompt_ids)
-        if len(response_ids) > max_response_len:
-            if eos_id is not None:
-                response_ids = response_ids[:max_response_len - 1] + [eos_id]
-            else:
-                response_ids = response_ids[:max_response_len]
+            response_ids = response_ids[:max_seq_length - 1] + [eos_id]
         else:
-            if eos_id is not None:
-                response_ids = response_ids + [eos_id]
+            response_ids = response_ids[:max_seq_length]
+    else:
+        # Prompt must be cleanly truncated from the LEFT to make room for targets safely natively
+        max_prompt_len = max_seq_length - effective_response_len
+        if len(prompt_ids) > max_prompt_len:
+            if bos_id is not None and prompt_ids[0] == bos_id and max_prompt_len > 0:
+                prompt_ids = [bos_id] + prompt_ids[-(max_prompt_len - 1):]
+            else:
+                prompt_ids = prompt_ids[-max_prompt_len:]
+                
+        if eos_id is not None:
+            response_ids = response_ids + [eos_id]
 
     input_ids = prompt_ids + response_ids
     attention_mask = [1] * len(input_ids)
@@ -722,6 +744,12 @@ def train_model(config, config_path: str = "(unknown)"):
                                 consecutive_empty_polls_after_eof = 0  # Reset on EOF marker
                                 _log("Received end-of-stream marker from producer.")
                             continue
+
+                        if "target" in sample_data:
+                            sample_data["target"] = _apply_label_map_if_configured(
+                                sample_data.get("target"),
+                                config.get("dataset", {}).get("label_map"),
+                            )
 
                         prompt_text = prompt_template.render(**sample_data)
                         response_text = response_template.render(**sample_data)
