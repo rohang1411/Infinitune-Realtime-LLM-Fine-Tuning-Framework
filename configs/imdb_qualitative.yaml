@@ -1,0 +1,436 @@
+# ============================================================
+# InfiniTune Configuration — Qualitative: Domain Adaptation (IMDb)
+# Task Type   : Causal LM / Unconditional Language Modeling
+# Dataset     : imdb
+# Model       : Qwen/Qwen2.5-1.5B (1.5B params)
+# Eval Method : Keyword Density + Type-Token Ratio (CPU, zero extra RAM)
+#
+# Objective:
+#   Prove that the model is absorbing movie-review vocabulary and style
+#   through domain-specific keyword density and lexical diversity (TTR).
+#
+# IMPORTANT — This config differs from imdb_quantitative.yaml:
+#   imdb_quantitative.yaml  → sentiment CLASSIFICATION (classifies reviews as
+#                        positive/negative). Response = "positive"/"negative".
+#   THIS config       → unconditional language MODELING (learns to WRITE
+#                        movie reviews from scratch). The model is trained
+#                        on the review text itself as the target, and at
+#                        eval time it generates free-form reviews which are
+#                        then analysed for domain vocabulary.
+#
+#   Quantitative eval is disabled here because a "correct" generated review
+#   cannot be graded — the success signal is qualitative vocabulary adoption.
+#
+# Run:
+#   python producer.py --config configs/imdb_qualitative.yaml
+#   python trainer.py  --config configs/imdb_qualitative.yaml
+# ============================================================
+
+project:
+  name: "infinitune-qual-domain"
+  output_dir: "./output/qual_domain"
+
+# --- Model ---
+model:
+  name: "Qwen/Qwen2.5-1.5B"
+  task_type: "CAUSAL_LM"
+  precision: "fp16"           # MPS (Apple Silicon) natively leverages float16 for this config
+  max_seq_length: 768         # IMDB reviews avg 300 words (~400 tokens); 512 truncates many mid-sentence
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 16                   # Standardized scaling multiplier (alpha/r = 2x) stabilizing parameters
+  dropout: 0.1                # Slightly higher for domain adaptation (prevents memorizing specific reviews)
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# --- Dataset ---
+dataset:
+  name: "imdb"
+  config_name: null
+  split: "train"
+  eval_split: "test"
+  column_mapping:
+    input_col: "text"         # The review text is the training target
+    target_col: "text"        # Unconditional LM: input = target (self-supervised)
+  label_map: null             # No label mapping — we train on raw text
+  shuffle: true
+  shuffle_seed: 42
+
+# --- Preprocessing / Templating ---
+# Unconditional LM: the model is prompted to write a review and generates freely.
+# During training: prompt = instruction, response = the actual review text.
+# During qualitative eval: model is prompted and free-form output is analysed.
+preprocessing:
+  prompt_template: "Write a detailed movie review:\n\n"
+  response_template: " {{ input }}"  # Leading space ensures clean tokenization at prompt/response boundary
+  hash_column: "input"
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 50            # Movie reviews should be substantive
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5
+      max_repetition_ratio: 0.2
+    domain_specific:
+      require_numeric_content: null
+      custom_regex_must_match: null
+      custom_regex_must_not_match: null
+      chat_structure:
+        min_turns: null
+        require_assistant_final: null
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-qual-domain"
+  lora_updates_topic: "lora-updates-qual-domain"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
+  producer_send_interval: 0.05
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  test_mode: true              # Train on full dataset, stop on EOF
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-5          # 1.5B models need lower LR than small models; 1e-4 causes oscillating loss
+  max_steps: 1000
+  logging_steps: 1
+  weight_push_interval: 60
+  lr_scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 1000
+  save_checkpoints:
+    enabled: true              # Save LoRA adapter to disk periodically
+    save_every_steps: 100      # ~10 checkpoints over 1000 steps
+    save_final: true           # Always save a 'final' checkpoint at training end
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 200          # Long output for free-form review generation
+  do_sample: true
+  temperature: 0.8             # Slightly higher temp for more creative writing
+  top_p: 0.9
+
+# --- Quantitative Evaluation ---
+# Set to perplexity-only: unconditional generation has no "correct" class to
+# match against, making accuracy/exact_match meaningless here.
+evaluation:
+  enabled: true
+  decoupled: true             # If true, disables inline eval during training (run evaluate.py later)
+  strategy: "perplexity"       # Forward-pass loss + perplexity only
+  eval_interval: 50
+  eval_pool_size: 100
+  eval_batch_size: 20
+  verbose: false
+  answer_regex: null
+  metrics:
+    compute_loss: true
+    compute_accuracy: false
+    compute_exact_match: false
+    compute_f1: false
+    compute_mcc: false
+    compute_kappa: false
+    compute_forgetting: false
+    compute_update_latency: true
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"
+    forgetting_track_metrics: ["eval_loss", "perplexity"]
+
+# --- Qualitative Evaluation (Superset Schema) ---
+# method: keyword_density
+#   Reference-free: no golden answers needed.
+#   The model is prompted to write a review; the output is analysed for
+#   domain-specific vocabulary density and lexical diversity.
+#
+#   Keyword list: curated film-criticism vocabulary from IMDB/Rotten Tomatoes
+#   style guides. A rising keyword_density over training steps proves the model
+#   is internalising movie-review jargon.
+#
+# Superset fields (set irrelevant fields to null):
+#   sentence_model : null (unused for keyword_density)
+#   keywords       : active (domain keyword list)
+#   logic_anchors  : null (unused for keyword_density)
+testing_strategy:
+  enabled: true
+  method: "keyword_density"
+  eval_interval: 50            # Every 50 optimizer steps
+  eval_samples: 30             # Larger window since reference-free is faster
+  eval_pool_size: 150          # Pool to slide over (5× eval_samples)
+  max_new_tokens: 200          # Generate full reviews for meaningful density analysis
+
+  # Method-specific fields (superset: null the unused ones)
+  sentence_model: null
+  keywords:
+    # Film Craft
+    - "cinematography"
+    - "screenplay"
+    - "cinematographer"
+    - "directing"
+    - "direction"
+    - "editing"
+    - "score"
+    - "soundtrack"
+    - "lighting"
+    - "photography"
+    - "composition"
+    - "choreography"
+    - "production"
+    - "footage"
+    - "framing"
+    - "camera"
+    - "visual"
+    - "visuals"
+    - "sequence"
+    - "sequences"
+    - "shot"
+    - "shots"
+    - "lens"
+    - "practical"
+    - "effects"
+    - "cgi"
+    - "mise-en-scene"
+    - "montage"
+    # Narrative Structure
+    - "plot"
+    - "storyline"
+    - "subplot"
+    - "subplots"
+    - "narrative"
+    - "protagonist"
+    - "antagonist"
+    - "villain"
+    - "arc"
+    - "twist"
+    - "twists"
+    - "climax"
+    - "resolution"
+    - "ending"
+    - "flashback"
+    - "flashbacks"
+    - "tension"
+    - "conflict"
+    - "backstory"
+    - "motivation"
+    - "setup"
+    - "payoff"
+    - "pacing"
+    - "structure"
+    - "opening"
+    - "third"
+    - "act"
+    - "acts"
+    - "premise"
+    - "exposition"
+    # Performance Acting
+    - "performance"
+    - "performances"
+    - "acting"
+    - "portrayal"
+    - "portrayals"
+    - "delivers"
+    - "delivery"
+    - "chemistry"
+    - "ensemble"
+    - "cast"
+    - "casting"
+    - "role"
+    - "roles"
+    - "portrays"
+    - "embodies"
+    - "convincing"
+    - "believable"
+    - "nuanced"
+    - "charismatic"
+    - "presence"
+    - "screen"
+    - "dialogue"
+    - "monologue"
+    - "improvisation"
+    - "mannerisms"
+    # Film Industry
+    - "director"
+    - "directors"
+    - "filmmaker"
+    - "filmmakers"
+    - "studio"
+    - "franchise"
+    - "sequel"
+    - "sequels"
+    - "prequel"
+    - "prequels"
+    - "remake"
+    - "reboot"
+    - "adaptation"
+    - "Hollywood"
+    - "independent"
+    - "debut"
+    - "cameo"
+    - "release"
+    - "theatrical"
+    - "producer"
+    - "blockbuster"
+    - "indie"
+    - "budget"
+    - "low-budget"
+    - "distributor"
+    # Genre Format
+    - "thriller"
+    - "horror"
+    - "comedy"
+    - "drama"
+    - "documentary"
+    - "animated"
+    - "animation"
+    - "genre"
+    - "western"
+    - "romantic"
+    - "biographical"
+    - "biopic"
+    - "fantasy"
+    - "mystery"
+    - "crime"
+    - "musical"
+    - "satire"
+    - "parody"
+    - "noir"
+    - "slasher"
+    - "superhero"
+    - "psychological"
+    - "procedural"
+    - "anthology"
+    - "mockumentary"
+    # Review Language
+    - "recommend"
+    - "recommended"
+    - "masterpiece"
+    - "flawed"
+    - "standout"
+    - "mediocre"
+    - "underrated"
+    - "overrated"
+    - "overlooked"
+    - "highlight"
+    - "highlights"
+    - "weakness"
+    - "weaknesses"
+    - "strengths"
+    - "potential"
+    - "entertaining"
+    - "enjoyable"
+    - "gripping"
+    - "engaging"
+    - "compelling"
+    - "riveting"
+    - "absorbing"
+    - "immersive"
+    - "rewarding"
+    - "disappointing"
+    # Audience Experience
+    - "suspenseful"
+    - "emotional"
+    - "invested"
+    - "immersed"
+    - "hooked"
+    - "laugh"
+    - "laughs"
+    - "laughter"
+    - "cry"
+    - "thrilling"
+    - "haunting"
+    - "disturbing"
+    - "touching"
+    - "moving"
+    - "hilarious"
+    - "heartwarming"
+    - "shocking"
+    - "surprising"
+    - "predictable"
+    - "satisfying"
+    - "bored"
+    - "boredom"
+    - "captivated"
+    - "enthralled"
+    - "mesmerised"
+    # Cinematic Language
+    - "atmospheric"
+    - "visceral"
+    - "stylistic"
+    - "stylised"
+    - "gritty"
+    - "brooding"
+    - "whimsical"
+    - "frenetic"
+    - "hypnotic"
+    - "surreal"
+    - "minimalist"
+    - "epic"
+    - "intimate"
+    - "sweeping"
+    - "claustrophobic"
+    - "dreamlike"
+    - "kinetic"
+    - "lyrical"
+    - "sparse"
+    - "evocative"
+    # General Domain
+    - "film"
+    - "films"
+    - "movie"
+    - "movies"
+    - "cinema"
+    - "screen"
+    - "scenes"
+    - "scene"
+    - "actor"
+    - "actors"
+    - "actress"
+    - "character"
+    - "characters"
+    - "audience"
+    - "viewers"
+    - "watching"
+    - "watched"
+    - "watch"
+    - "reviewer"
+    - "review"
+    - "script"
+    - "written"
+    - "directed"
+    - "produced"
+    - "released"
+    - "runtime"
+    - "opening"
+    - "minutes"
+    - "hour"
+    - "hours"
+    - "remake"
+    - "sequel"
+    - "original"
+    - "version"
+    - "adaptation"
+    - "franchise"
+    - "series"
+    - "episode"
+    - "episodes"
+    - "season"
+  logic_anchors: null

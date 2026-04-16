@@ -5,8 +5,10 @@ import argparse
 import torch
 import threading
 import queue
+import os
 import yaml
 from kafka import KafkaConsumer
+from utils.checkpoint_manager import CheckpointManager
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -254,11 +256,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Inference Server")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., 'step_0100'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config_global = config
     _log(f"Loaded config: {args.config}")
+
+    # Resolve checkpoint path if provided
+    resolved_checkpoint_path = None
+    if args.checkpoint:
+        if os.path.isdir(args.checkpoint):
+            resolved_checkpoint_path = args.checkpoint
+        else:
+            ckpt_mgr = CheckpointManager(config)
+            if args.checkpoint.lower() == "latest":
+                ckpts = ckpt_mgr.list_checkpoints()
+                if not ckpts:
+                    _log("Warning: '--checkpoint latest' requested but no checkpoints found. Falling back to base model with empty LoRA adapter.")
+                    resolved_checkpoint_path = None
+                else:
+                    resolved_checkpoint_path = ckpts[-1]["path"]
+                    _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
+            else:
+                candidate_path = ckpt_mgr.get_checkpoint_path(args.checkpoint)
+                if os.path.exists(candidate_path):
+                    resolved_checkpoint_path = candidate_path
+                    _log(f"Resolved step '{args.checkpoint}' to: {resolved_checkpoint_path}")
+                else:
+                    _log(f"FATAL: Checkpoint '{args.checkpoint}' not found locally at '{candidate_path}' and is not a valid directory.")
+                    exit(1)
 
     model_cfg = config['model']
     lora_cfg = config['lora']
@@ -288,16 +316,17 @@ if __name__ == "__main__":
     _log(f"Using device: {DEVICE}")
     _log(f"Kafka bootstrap_servers={kafka_cfg.get('bootstrap_servers')}, lora_updates_topic='{kafka_cfg.get('lora_updates_topic')}', consumer_group='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}'")
 
-    # 1. Load the base model and tokenizer
     BASE_MODEL_NAME = model_cfg['name']
-    _log(f"Loading base model: {BASE_MODEL_NAME}")
+    prec = model_cfg.get('precision', 'fp32')
+    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    
+    _log(f"Loading base model: {BASE_MODEL_NAME} with dtype {dtype}")
     # Use a try-except block for robustness during model loading
     try:
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME,
-            torch_dtype=torch.float16 if DEVICE != "cpu" else torch.float32, 
-            device_map="auto" # Let accelerate handle device mapping if multiple GPUs/MPS
-            # device_map={"" : DEVICE} # Simpler mapping if single device
+            torch_dtype=dtype,
+            device_map={"": device_global} # Simpler contiguous mapping (prevents arbitrary offload faults)
         )
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
         tokenizer.pad_token = tokenizer.eos_token 
@@ -305,15 +334,19 @@ if __name__ == "__main__":
         _log(f"FATAL: Failed to load base model or tokenizer: {e}")
         exit(1) # Exit if model loading fails
 
-    # 2. Apply the initial LoRA configuration to the base model
+    # 2. Apply the initial LoRA configuration to the base model (or load from checkpoint)
     _log("Applying initial LoRA configuration...")
     try:
-        model = get_peft_model(base_model, LORA_CONFIG)
+        if resolved_checkpoint_path:
+            _log(f"Loading standalone checkpoint from disk: {resolved_checkpoint_path}")
+            model = PeftModel.from_pretrained(base_model, resolved_checkpoint_path)
+            _log("Model checkpoint loaded successfully.")
+        else:
+            model = get_peft_model(base_model, LORA_CONFIG)
+            model.print_trainable_parameters() 
         model.eval() # Set the model to evaluation mode
-        _log("Model loaded and LoRA configured.")
-        model.print_trainable_parameters() 
     except Exception as e:
-        _log(f"FATAL: Failed to apply LoRA config: {e}")
+        _log(f"FATAL: Failed to apply LoRA config / checkpoint: {e}")
         exit(1)
 
     # Assign to global variables for access by Flask routes
@@ -326,19 +359,22 @@ if __name__ == "__main__":
     model_lock_global = model_lock
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
-    #    These threads stop automatically when the trainer sends a '__done__' signal.
-    consumer_thread = threading.Thread(
-        target=kafka_consumer_thread,
-        args=(update_queue, config),
-        daemon=True
-    )
-    applier_thread = threading.Thread(
-        target=weight_application_thread,
-        args=(model_global, update_queue, model_lock_global, DEVICE),
-        daemon=True
-    )
-    consumer_thread.start()
-    applier_thread.start()
+    #    We skip this entirely if a standalone checkpoint was provided and resolved.
+    if resolved_checkpoint_path:
+        _log("Standalone mode (checkpoint provided). Skipping Kafka consumer threads.")
+    else:
+        consumer_thread = threading.Thread(
+            target=kafka_consumer_thread,
+            args=(update_queue, config),
+            daemon=True
+        )
+        applier_thread = threading.Thread(
+            target=weight_application_thread,
+            args=(model_global, update_queue, model_lock_global, DEVICE),
+            daemon=True
+        )
+        consumer_thread.start()
+        applier_thread.start()
 
     FLASK_HOST = inference_cfg.get('host', 'localhost')
     FLASK_PORT = inference_cfg.get('port', 5000)

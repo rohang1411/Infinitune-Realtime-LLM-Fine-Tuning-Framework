@@ -101,16 +101,36 @@ def _normalized_aauc_from_history(history):
         return 0.0
     if len(history) == 1:
         return float(history[0][1])
+    def _to_float_safe(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
     raw = 0.0
+    last_step = None
+    last_acc = None
     for i in range(len(history) - 1):
         s0, a0 = history[i]
         s1, a1 = history[i + 1]
-        ds = s1 - s0
+        s0f = _to_float_safe(s0)
+        s1f = _to_float_safe(s1)
+        a0f = _to_float_safe(a0)
+        a1f = _to_float_safe(a1)
+        if None in (s0f, s1f, a0f, a1f):
+            continue
+        ds = s1f - s0f
         if ds > 0:
-            raw += 0.5 * (float(a0) + float(a1)) * ds
-    span = history[-1][0] - history[0][0]
-    if span <= 0:
+            raw += 0.5 * (a0f + a1f) * ds
+            last_step = s1f
+            last_acc = a1f
+
+    if last_step is None:
         return float(history[-1][1])
+
+    span = last_step - 0.0
+    if span <= 0:
+        return last_acc if last_acc is not None else float(history[-1][1])
     return raw / float(span)
 
 # Forgetting: higher is better vs lower is better (used only when compute_forgetting is on).
@@ -129,7 +149,7 @@ def _default_metric_flags(strategy: str):
         # if eval window slides or data distribution shifts.
         "compute_forgetting": False,
         # Wall-clock seconds since the *previous* eval finished (training + I/O between evals).
-        "compute_update_latency": False,
+        "compute_eval_cycle_time": False,
     }
     if strategy == "class_match":
         return {
@@ -142,6 +162,7 @@ def _default_metric_flags(strategy: str):
             "compute_mcc": True,
             "compute_kappa": True,
             "compute_qafacteval": False,
+            "compute_answer_overlap_f1": False,
         }
     if strategy == "regex_extract":
         return {
@@ -156,6 +177,7 @@ def _default_metric_flags(strategy: str):
             "compute_mcc": False,
             "compute_kappa": False,
             "compute_qafacteval": False,
+            "compute_answer_overlap_f1": False,
         }
     # perplexity-only or unknown strategy: forward-pass metrics only
     return {
@@ -168,18 +190,29 @@ def _default_metric_flags(strategy: str):
         "compute_mcc": False,
         "compute_kappa": False,
         "compute_qafacteval": False,
+        "compute_answer_overlap_f1": False,
     }
 
 
 def _merge_metric_flags(strategy: str, eval_cfg: dict) -> dict:
-    """Merge user `evaluation.metrics` onto strategy defaults (user wins)."""
+    """Merge user `evaluation.metrics` onto strategy defaults (user wins).
+    
+    Unknown keys in the user config (e.g. compute_answer_overlap_f1 before
+    it was added to defaults) are also merged in so no user flag is silently
+    dropped.
+    """
     base = _default_metric_flags(strategy)
     user = eval_cfg.get("metrics") or {}
     if not isinstance(user, dict):
         return base
-    for key in base:
+    # Apply known keys first
+    for key in list(base.keys()):
         if key in user and user[key] is not None:
             base[key] = bool(user[key])
+    # Also forward any user-supplied keys not yet in base (forward-compat)
+    for key, val in user.items():
+        if key not in base and val is not None:
+            base[key] = bool(val)
     return base
 
 
@@ -248,7 +281,7 @@ class Evaluator:
             else None
         )
 
-        # Sliding window cursor — tracks position within the eval pool
+        # Sliding window cursor � tracks position within the eval pool
         self._eval_cursor = 0
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
 
@@ -277,10 +310,10 @@ class Evaluator:
                 f"exact_match={self.metric_flags['compute_exact_match']}, "
                 f"f1={self.metric_flags['compute_f1']}, mcc={self.metric_flags['compute_mcc']}, "
                 f"kappa={self.metric_flags['compute_kappa']}, "
-                f"qafacteval={self.metric_flags.get('compute_qafacteval', False)} "
-                f"kappa={self.metric_flags['compute_kappa']}, "
+                f"qafacteval={self.metric_flags.get('compute_qafacteval', False)}, "
+                f"answer_overlap_f1={self.metric_flags.get('compute_answer_overlap_f1', False)}, "
                 f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
-                f"update_latency={self.metric_flags.get('compute_update_latency', False)} "
+                f"eval_cycle_time={self.metric_flags.get('compute_eval_cycle_time', False)} "
                 f"(max_distinct_labels={self.max_distinct_labels})"
             )
 
@@ -292,6 +325,8 @@ class Evaluator:
         label_map = dataset_cfg.get('label_map')
 
         ds_kwargs = {"path": dataset_cfg['name'], "split": eval_split}
+        if dataset_cfg.get("data_files"):
+            ds_kwargs["data_files"] = dataset_cfg["data_files"]
         if dataset_cfg.get('config_name'):
             ds_kwargs["name"] = dataset_cfg['config_name']
 
@@ -314,7 +349,16 @@ class Evaluator:
                     elif str(target_val) in label_map:
                         target_val = label_map[str(target_val)]
                 target_val = str(target_val)
-                self.eval_data.append({"input": input_val, "target": target_val})
+                sample_dict = {"input": input_val, "target": target_val}
+                self.eval_data.append(sample_dict)
+                
+                # Segregate unconditionally strictly for potential balanced windows natively
+                if self.strategy == 'class_match':
+                    if not hasattr(self, '_eval_data_by_class'):
+                        self._eval_data_by_class = collections.defaultdict(list)
+                        self._eval_cursor_by_class = collections.defaultdict(int)
+                    self._eval_data_by_class[target_val].append(sample_dict)
+                    
             _log(f"Loaded {len(self.eval_data)} evaluation samples into pool (split='{eval_split}', batch_size={self.eval_batch_size}).")
         except Exception as e:
             _log(f"Warning: Could not load eval dataset: {e}")
@@ -323,9 +367,32 @@ class Evaluator:
     def _get_eval_window(self):
         """Return the next sliding window of eval samples and advance cursor."""
         pool_size = len(self.eval_data)
-        start = self._eval_cursor
-        end = start + self.eval_batch_size
+        start = getattr(self, '_eval_cursor', 0)
+        
+        # Strategy conditionally creates balanced chunks 
+        if self.strategy == 'class_match' and getattr(self, '_eval_data_by_class', None):
+            classes = list(self._eval_data_by_class.keys())
+            samples_per_class = max(1, self.eval_batch_size // len(classes))
+            
+            window = []
+            for c in classes:
+                c_pool = self._eval_data_by_class[c]
+                c_pool_size = len(c_pool)
+                c_start = getattr(self, '_eval_cursor_by_class', {}).get(c, 0)
+                c_end = c_start + samples_per_class
+                
+                if c_end <= c_pool_size:
+                    window.extend(c_pool[c_start:c_end])
+                else:
+                    window.extend(c_pool[c_start:] + c_pool[:c_end - c_pool_size])
+                    
+                self._eval_cursor_by_class[c] = c_end % c_pool_size
+                
+            import random
+            random.shuffle(window)
+            return window[:self.eval_batch_size], start
 
+        end = start + self.eval_batch_size
         if end <= pool_size:
             window = self.eval_data[start:end]
         else:
@@ -351,9 +418,9 @@ class Evaluator:
         model.eval()
         metrics = {}
 
-        if mf.get("compute_update_latency", False) and self._last_eval_end_wall is not None:
+        if mf.get("compute_eval_cycle_time", False) and self._last_eval_end_wall is not None:
             try:
-                metrics["update_latency_s"] = float(t_wall_start - self._last_eval_end_wall)
+                metrics["eval_cycle_time_s"] = float(t_wall_start - self._last_eval_end_wall)
             except (TypeError, ValueError):
                 pass
 
@@ -378,7 +445,7 @@ class Evaluator:
             if count > 0:
                 avg_loss = total_loss / count
                 metrics["eval_loss"] = avg_loss
-                metrics["perplexity"] = torch.exp(torch.tensor(avg_loss)).item()
+                metrics["perplexity"] = min(torch.exp(torch.tensor(avg_loss)).item(), 1e6)
 
         need_generation = self.strategy in ("class_match", "regex_extract") and any(
             mf.get(k, False)
@@ -388,6 +455,7 @@ class Evaluator:
                 "compute_f1",
                 "compute_mcc",
                 "compute_kappa",
+                "compute_answer_overlap_f1",
             )
         )
 
@@ -410,6 +478,7 @@ class Evaluator:
             pred_labels = []
             source_texts = []   # raw input texts for QAFactEval
             generated_responses = []  # full model responses for QAFactEval
+            verbose_samples = []  # collected when self.verbose is True
 
             for i, sample in enumerate(eval_window):
                 try:
@@ -467,12 +536,24 @@ class Evaluator:
                     source_texts.append(str(sample.get("input", "")))
                     generated_responses.append(response)
 
+                    # Intelligently clean boundary matrices immediately preserving PyTorch native graphs safely intrinsically beautifully securely effectively
+                    del inputs
+                    del output_ids
+                    del generated_ids
+
                     if self.verbose:
-                        mark = "✓" if pred == gold else "✗"
+                        mark = "\u2713" if pred == gold else "\u2717"
                         _log(
                             f"  [{mark}] sample {i}: expected='{sample.get('target', '')}' "
                             f"got='{response[:80]}'"
                         )
+                        verbose_samples.append({
+                            "sample_idx": i,
+                            "input": prompt_text[:200].replace("\n", " "),
+                            "target": str(sample.get("target", ""))[:200].replace("\n", " "),
+                            "prediction": response[:200].replace("\n", " "),
+                            "correct": pred == gold,
+                        })
                 except Exception as e:
                     _log(f"  Warning: skipping eval sample {i} in generation pass: {e}")
 
@@ -485,8 +566,6 @@ class Evaluator:
                     correct = sum(correct_list)
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
-                    self._aauc_history.append((step, metrics["accuracy"]))
-                    metrics["aauc"] = _normalized_aauc_from_history(self._aauc_history)
 
                     if mf.get("compute_backward_transfer", False):
                         bwt_sum = 0.0
@@ -506,6 +585,8 @@ class Evaluator:
                                 
                         if bwt_count > 0:
                             metrics["backward_transfer"] = bwt_sum / bwt_count
+                    self._aauc_history.append((step, metrics["accuracy"]))
+                    metrics["average_accuracy"] = _normalized_aauc_from_history(self._aauc_history)
 
                 if mf.get("compute_exact_match", False):
                     _punct_table = str.maketrans("", "", string.punctuation)
@@ -600,6 +681,20 @@ class Evaluator:
                     except Exception as e:
                         _log(f"  Warning: QAFactEval scoring failed (skipped): {e}")
 
+                # Token-level F1 between generated response and gold reference.
+                # Works for any generation strategy (perplexity, regex_extract, class_match).
+                if mf.get("compute_answer_overlap_f1", False) and gold_labels and pred_labels:
+                    try:
+                        overlap_scores = [
+                            _QAFactEvalScorer._token_f1(p, g)
+                            for g, p in zip(gold_labels, pred_labels)
+                        ]
+                        if overlap_scores:
+                            metrics["answer_overlap_f1"] = sum(overlap_scores) / len(overlap_scores)
+                            _log(f"  answer_overlap_f1: {metrics['answer_overlap_f1']:.4f}")
+                    except Exception as e:
+                        _log(f"  Warning: answer_overlap_f1 computation failed (skipped): {e}")
+
         # --- Forgetting: drop from running peak (higher-better) or rise from running
         # best minimum (lower-better). Only for known scalar keys; skips unknown types.
         if mf.get("compute_forgetting", False):
@@ -662,6 +757,66 @@ class Evaluator:
             if forgetting_components:
                 metrics["forgetting_max"] = max(forgetting_components)
 
+
+        # --- Verbose Manual Verification (Sample Generation) ---
+        # When need_generation was False (perplexity-only strategy), we still run
+        # a small generation pass here for human-readable inspection.
+        if self.verbose and not need_generation:
+            _log("  Verbose mode: generating sample records for manual verification...")
+            cfg_max_new_tokens = self.config.get("inference", {}).get("max_new_tokens", 50)
+            verbose_samples = []  # reset for this path
+
+            # Use a small subset of the current window for verbosity
+            sample_subset = eval_window[:5]
+            for idx, sample in enumerate(sample_subset):
+                try:
+                    prompt_text = self.prompt_template.render(**sample)
+                    inputs = self.tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        max_length=self.max_seq_length,
+                        truncation=True,
+                    ).to(self.device)
+                    prompt_token_len = inputs["input_ids"].shape[1]
+
+                    gen_config = GenerationConfig(
+                        max_new_tokens=cfg_max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                    with torch.no_grad():
+                        output_ids = model.generate(**inputs, generation_config=gen_config)
+
+                    response = self.tokenizer.decode(
+                        output_ids[0, prompt_token_len:], skip_special_tokens=True
+                    ).strip()
+
+                    _log(f"  [SAMPLE {idx}]")
+                    prompt_display = prompt_text[:150].replace('\n', ' ')
+                    target_display = str(sample.get('target', ''))[:150].replace('\n', ' ')
+                    _log(f"    Input  : {prompt_display}")
+                    _log(f"    Target : {target_display}")
+                    _log(f"    Model  : {response}")
+
+                    verbose_samples.append({
+                        "sample_idx": idx,
+                        "input": prompt_display,
+                        "target": target_display,
+                        "prediction": response[:200].replace("\n", " "),
+                        "correct": None,  # No gold comparison in perplexity-only path
+                    })
+
+                    del inputs
+                    del output_ids
+                except Exception as e:
+                    _log(f"    Warning: skip verbose sample {idx}: {e}")
+
+        # Attach verbose samples to metrics dict so the caller can persist them
+        if self.verbose and verbose_samples:
+            metrics["_verbose_samples"] = verbose_samples
+
         self._last_eval_end_wall = time.monotonic()
 
         model.train()
@@ -673,4 +828,16 @@ class Evaluator:
                 _log(f"  {k}: {v}")
         _log("--- End Eval ---")
 
+        # Aggressive memory cleanup after generation passes
+        import gc
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                _log(f"  Warning: CUDA cache cleanup skipped after prior device error: {e}")
+
         return metrics if metrics else None
+

@@ -12,18 +12,18 @@ project:
 model:
   name: "distilgpt2"
   task_type: "CAUSAL_LM"
-  precision: "fp16" # fp16 | fp32 | 4bit
-  max_seq_length: 256
+  precision: "fp32"           # MPS (Apple Silicon) fp16 fallback enabled natively or via trainer
+  max_seq_length: 512          # IMDb reviews can be 2000+ chars; 256 was truncating heavily
 
 # --- LoRA Adapter ---
 lora:
-  r: 8
-  alpha: 64                    # increased from 32 for stronger adapter scaling
+  r: 16
+  alpha: 32                    # ratio of 2 for better capacity and stable scaling
   dropout: 0.05
   bias: "none"
   target_modules:
-    - "c_attn"               # GPT-2 combined QKV projection
-    - "c_proj"               # GPT-2 output projection
+    - "c_attn"
+    - "c_proj"
 
 # --- Dataset ---
 dataset:
@@ -70,6 +70,7 @@ kafka:
     - "localhost:9092"
   training_topic: "training-data-imdb"
   lora_updates_topic: "lora-updates-imdb"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
   producer_send_interval: 0.1
   consumer_group_trainer: "trainer-group"
   consumer_group_inference: "inference-api-group"
@@ -77,17 +78,22 @@ kafka:
 # --- Training ---
 training:
   test_mode: true # true = train entire dataset, stop all services on EOF
-  batch_size: 8
-  gradient_accumulation_steps: 4  # effective batch = 32
+  batch_size: 4
+  gradient_accumulation_steps: 4  # effective batch = 16
+  gradient_checkpointing: false   # disabled to maximize throughput speed (trades VRAM for compute speed)
   learning_rate: 1e-4             # lower base LR for larger effective batch
-  max_steps: 2000 # reduced for fast testing (original: 1000)
+  max_steps: 1563 # spans exactly dataset_size (25k) / effective batch (16)
   logging_steps: 1
   weight_push_interval: 60 # seconds between LoRA pushes to Kafka
   lr_scheduler:
     type: "cosine_with_warmup"   # cosine_with_warmup | linear | constant
     warmup_steps: 50             # linear warmup from 0 → learning_rate
     min_lr_ratio: 0.01           # floor LR = learning_rate * min_lr_ratio
-    T_max: 1000                  # cosine period in optimizer steps
+    T_max: 1563                  # cosine period — must match max_steps for full decay curve
+  save_checkpoints:
+    enabled: true                # Save LoRA adapter to disk periodically
+    save_every_steps: 50         # Matches eval_interval natively completely independently organically safely mapping successfully
+    save_final: true             # Always save a 'final' checkpoint at training end
 
 # --- Inference ---
 inference:
@@ -101,11 +107,12 @@ inference:
 # --- Evaluation (Polymorphic) ---
 evaluation:
   enabled: true
+  decoupled: true # If true, disables inline eval during training (run evaluate.py later)
   strategy: "class_match" # class_match | regex_extract | perplexity
   eval_interval: 50 # evaluate every N optimizer steps
-  eval_pool_size: 5000 # total samples loaded from eval split (shuffled)
-  eval_batch_size: 100 # samples evaluated per eval step (sliding window)
-  verbose: false # if true, print per-sample predictions during eval
+  eval_pool_size: 4000 # total samples loaded from eval split (shuffled)
+  eval_batch_size: 200 # samples evaluated per eval step (sliding window)
+  verbose: true # if true, print per-sample predictions during eval
   answer_regex: null # not used for class_match
   # Optional: override which metrics run (defaults follow strategy; booleans only).
   # classification (class_match) defaults: all generation + structure metrics on.
@@ -118,6 +125,7 @@ evaluation:
     compute_f1: true # macro F1 over discrete labels in the eval window
     compute_mcc: true
     compute_kappa: true
+    compute_answer_overlap_f1: false # Token-level overlap (not used for discrete classification)
     # If distinct gold/pred labels exceed this, F1/MCC/kappa are skipped (open-ended safety).
     max_distinct_labels_for_structure_metrics: 32
     # QAFactEval: factual consistency between source input and generated response.
@@ -126,5 +134,25 @@ evaluation:
     qafacteval_model: "deepset/minilm-uncased-squad2"  # optional override
     # Online diagnostics (stable eval pool recommended; sliding window can mix distribution shift with true forgetting)
     compute_forgetting: true # peak-vs-current on tracked scalars; see forgetting_track_metrics
-    compute_update_latency: true # wall seconds since previous eval ended (training + I/O between evals)
+    compute_eval_cycle_time: true # wall seconds since previous eval ended (training + I/O between evals)
     forgetting_track_metrics: ["accuracy", "f1", "exact_match", "eval_loss", "perplexity"] # subset of supported keys
+
+# --- Qualitative Evaluation ---
+# This block matches the structure of qualitative configs.
+# Strategy 'semantic_similarity' is used as a proxy for 'sentiment vibes' matching.
+testing_strategy:
+  enabled: false               # Set to true to enable soft semantic vetting
+  method: "" # semantic_similarity | keyword_density | structural_cot | structured_slot_coverage
+  eval_interval: 50
+  eval_samples: 20
+  eval_pool_size: 100
+  max_new_tokens: 6            # Keep short to match the classification task
+  consistency_runs: 1
+  consistency_temperature: 0.7
+  eval_batch_size: 16
+
+  # Method-specific superset fields (null if unused)
+  sentence_model: "sentence-transformers/all-MiniLM-L6-v2"
+  keywords: null
+  logic_anchors: null
+  e2e_nlg_options: null
