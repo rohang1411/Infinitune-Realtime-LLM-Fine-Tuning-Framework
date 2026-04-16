@@ -7,3 +7,8 @@ outputs/
 output/
 helper/
 scratch/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
