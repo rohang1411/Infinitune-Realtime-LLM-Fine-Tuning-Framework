@@ -294,6 +294,10 @@ class Evaluator:
         )
         raw_eval_batch_size = self.eval_cfg.get('eval_batch_size', self.eval_pool_size)
         self.eval_batch_size = _resolve_eval_batch_size(raw_eval_batch_size, self.eval_pool_size)
+        self.generation_batch_size = _resolve_positive_int(
+            self.eval_cfg.get("generation_batch_size", min(16, self.eval_pool_size)),
+            min(16, self.eval_pool_size),
+        )
         self.verbose = self.eval_cfg.get('verbose', False)
         self.class_match_other_label = str(
             self.eval_cfg.get("other_label", "other")
@@ -354,7 +358,8 @@ class Evaluator:
                 f"answer_overlap_f1={self.metric_flags.get('compute_answer_overlap_f1', False)}, "
                 f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
                 f"eval_cycle_time={self.metric_flags.get('compute_eval_cycle_time', False)} "
-                f"(max_distinct_labels={self.max_distinct_labels}, "
+                f"(generation_batch_size={self.generation_batch_size}, "
+                f"max_distinct_labels={self.max_distinct_labels}, "
                 f"other_label='{self.class_match_other_label}')"
             )
 
@@ -381,7 +386,7 @@ class Evaluator:
         canonical = _canonicalize_label_text(text)
         if canonical in self._known_class_label_tokens:
             return canonical
-        return canonical or str(text).lower().strip()
+        return self.class_match_other_label
 
     def _normalize_class_match_prediction(self, response: str) -> str:
         response_tokens = _tokenize_label_text(response)
@@ -393,6 +398,29 @@ class Evaluator:
             if response_tokens[: len(label_tokens)] == label_tokens:
                 return label
         return self.class_match_other_label
+
+    def _normalize_class_match_labels(self, gold_labels, pred_labels):
+        """Collapse any unexpected class-match labels back into the known label space.
+
+        This is intentionally applied just before derived metrics are computed so
+        structure metrics stay robust even if an older caller or stale checkpoint
+        bundle leaked raw generations into `pred_labels`.
+        """
+        if self.strategy != "class_match":
+            return list(gold_labels), list(pred_labels)
+
+        if not getattr(self, "_known_class_label_tokens", None):
+            self._refresh_class_match_label_space()
+
+        normalized_gold = [
+            self._normalize_gold_class_label(label)
+            for label in gold_labels
+        ]
+        normalized_pred = [
+            self._normalize_class_match_prediction(label)
+            for label in pred_labels
+        ]
+        return normalized_gold, normalized_pred
 
     def _load_eval_data(self):
         """Load evaluation dataset pool from the configured eval_split."""
@@ -485,6 +513,87 @@ class Evaluator:
         self._eval_cursor = end % pool_size
         return window, start
 
+    def _generate_single_response(self, model, prompt_text: str, generation_config: GenerationConfig) -> str:
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            max_length=self.max_seq_length,
+            truncation=True,
+        ).to(self.device)
+        prompt_token_len = inputs["input_ids"].shape[1]
+        with torch.inference_mode():
+            output_ids = model.generate(**inputs, generation_config=generation_config)
+        response = self.tokenizer.decode(
+            output_ids[0, prompt_token_len:],
+            skip_special_tokens=True,
+        ).strip()
+        del inputs
+        del output_ids
+        return response
+
+    def _generate_batch_records(self, model, samples, generation_config: GenerationConfig):
+        records = []
+        if not samples:
+            return records
+
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            for batch_start in range(0, len(samples), self.generation_batch_size):
+                batch_samples = samples[batch_start: batch_start + self.generation_batch_size]
+                prompt_texts = [
+                    self.prompt_template.render(**sample)
+                    for sample in batch_samples
+                ]
+                try:
+                    inputs = self.tokenizer(
+                        prompt_texts,
+                        return_tensors="pt",
+                        max_length=self.max_seq_length,
+                        truncation=True,
+                        padding=True,
+                    ).to(self.device)
+                    prompt_token_len = inputs["input_ids"].shape[1]
+                    with torch.inference_mode():
+                        output_ids = model.generate(**inputs, generation_config=generation_config)
+                    generated_ids = output_ids[:, prompt_token_len:]
+                    responses = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+                    for prompt_text, sample, response in zip(prompt_texts, batch_samples, responses):
+                        records.append(
+                            {
+                                "prompt_text": prompt_text,
+                                "sample": sample,
+                                "response": response.strip(),
+                            }
+                        )
+
+                    del inputs
+                    del output_ids
+                    del generated_ids
+                except Exception as exc:
+                    _log(
+                        f"  Warning: batch generation failed for samples "
+                        f"{batch_start}..{batch_start + len(batch_samples) - 1}: {exc}. "
+                        f"Falling back to per-sample generation."
+                    )
+                    for prompt_text, sample in zip(prompt_texts, batch_samples):
+                        try:
+                            response = self._generate_single_response(model, prompt_text, generation_config)
+                        except Exception as sample_exc:
+                            _log(f"  Warning: skipping eval sample in generation fallback: {sample_exc}")
+                            continue
+                        records.append(
+                            {
+                                "prompt_text": prompt_text,
+                                "sample": sample,
+                                "response": response,
+                            }
+                        )
+        finally:
+            self.tokenizer.padding_side = original_padding_side
+        return records
+
     def evaluate(self, model, step):
         """Run evaluation and return a metrics dict (keys depend on config flags)."""
         if not self.enabled or not self.eval_data:
@@ -492,6 +601,7 @@ class Evaluator:
 
         t_wall_start = time.monotonic()
         mf = self.metric_flags
+        was_training = model.training
 
         # Select the current eval window (sliding)
         eval_window, window_start = self._get_eval_window()
@@ -519,7 +629,7 @@ class Evaluator:
                         self.tokenizer, prompt_text, response_text, self.max_seq_length
                     )
                     batch = self.pad_fn([tok], self.tokenizer.pad_token_id, self.device)
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         outputs = model(**batch)
                         total_loss += outputs.loss.item()
                         count += 1
@@ -564,32 +674,19 @@ class Evaluator:
             verbose_samples = []  # collected when self.verbose is True
             other_predictions = 0
 
-            for i, sample in enumerate(eval_window):
+            gen_config = GenerationConfig(
+                max_new_tokens=eval_max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+            generation_records = self._generate_batch_records(model, eval_window, gen_config)
+
+            for i, record in enumerate(generation_records):
                 try:
-                    prompt_text = self.prompt_template.render(**sample)
-                    inputs = self.tokenizer(
-                        prompt_text,
-                        return_tensors="pt",
-                        max_length=self.max_seq_length,
-                        truncation=True,
-                    ).to(self.device)
-                    prompt_token_len = inputs["input_ids"].shape[1]
-
-                    gen_config = GenerationConfig(
-                        max_new_tokens=eval_max_new_tokens,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
-
-                    with torch.no_grad():
-                        output_ids = model.generate(**inputs, generation_config=gen_config)
-
-                    generated_ids = output_ids[0, prompt_token_len:]
-                    response = self.tokenizer.decode(
-                        generated_ids, skip_special_tokens=True
-                    ).strip()
-
+                    sample = record["sample"]
+                    prompt_text = record["prompt_text"]
+                    response = record["response"]
                     gold = str(sample.get("target", "")).lower().strip()
                     pred = None
 
@@ -620,11 +717,6 @@ class Evaluator:
                     source_texts.append(str(sample.get("input", "")))
                     generated_responses.append(response)
 
-                    # Intelligently clean boundary matrices immediately preserving PyTorch native graphs safely intrinsically beautifully securely effectively
-                    del inputs
-                    del output_ids
-                    del generated_ids
-
                     if self.verbose:
                         mark = "\u2713" if pred == gold else "\u2717"
                         _log(
@@ -645,6 +737,21 @@ class Evaluator:
             if total == 0:
                 _log("  Warning: no valid generation samples; skipping generation metrics.")
             else:
+                if self.strategy == "class_match":
+                    raw_distinct = len(set(gold_labels) | set(pred_labels))
+                    gold_labels, pred_labels = self._normalize_class_match_labels(
+                        gold_labels, pred_labels
+                    )
+                    normalized_distinct = len(set(gold_labels) | set(pred_labels))
+                    other_predictions = sum(
+                        1 for pred in pred_labels if pred == self.class_match_other_label
+                    )
+                    if normalized_distinct != raw_distinct:
+                        _log(
+                            f"  Collapsed class label space from {raw_distinct} raw labels "
+                            f"to {normalized_distinct} normalized labels before structure metrics."
+                        )
+
                 if mf.get("compute_accuracy", False):
                     correct_list = [g == p for g, p in zip(gold_labels, pred_labels)]
                     correct = sum(correct_list)
@@ -860,27 +967,13 @@ class Evaluator:
             for idx, sample in enumerate(sample_subset):
                 try:
                     prompt_text = self.prompt_template.render(**sample)
-                    inputs = self.tokenizer(
-                        prompt_text,
-                        return_tensors="pt",
-                        max_length=self.max_seq_length,
-                        truncation=True,
-                    ).to(self.device)
-                    prompt_token_len = inputs["input_ids"].shape[1]
-
                     gen_config = GenerationConfig(
                         max_new_tokens=cfg_max_new_tokens,
                         do_sample=False,
                         pad_token_id=self.tokenizer.eos_token_id,
                         eos_token_id=self.tokenizer.eos_token_id,
                     )
-
-                    with torch.no_grad():
-                        output_ids = model.generate(**inputs, generation_config=gen_config)
-
-                    response = self.tokenizer.decode(
-                        output_ids[0, prompt_token_len:], skip_special_tokens=True
-                    ).strip()
+                    response = self._generate_single_response(model, prompt_text, gen_config)
 
                     _log(f"  [SAMPLE {idx}]")
                     prompt_display = prompt_text[:150].replace('\n', ' ')
@@ -896,9 +989,6 @@ class Evaluator:
                         "prediction": response[:200].replace("\n", " "),
                         "correct": None,  # No gold comparison in perplexity-only path
                     })
-
-                    del inputs
-                    del output_ids
                 except Exception as e:
                     _log(f"    Warning: skip verbose sample {idx}: {e}")
 
@@ -908,7 +998,10 @@ class Evaluator:
 
         self._last_eval_end_wall = time.monotonic()
 
-        model.train()
+        if was_training:
+            model.train()
+        else:
+            model.eval()
 
         for k, v in metrics.items():
             if isinstance(v, float):
