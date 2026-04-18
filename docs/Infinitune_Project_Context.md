@@ -147,51 +147,62 @@ All three services are stateless with respect to each other: they communicate **
 
 ## 4. Repository Structure
 
-```
+```text
 Infinitune-Realtime-LLM-Fine-Tuning-Framework/
-│
-├── producer.py           # Service 1: Streams dataset samples to Kafka
-├── trainer.py            # Service 2: Consumes data, fine-tunes model with QLoRA
-├── inference.py          # Service 3: Serves REST API, hot-swaps LoRA weights
-├── evaluate.py           # Offline evaluation: loads checkpoints, runs eval metrics
-│
-├── configs/
-│   ├── imdb_config.yaml          # IMDb sentiment classification (quantitative)
-│   ├── imdb_qualitative.yaml     # IMDb review generation (qualitative eval)
-│   ├── gsm8k_config.yaml         # GSM8K math reasoning task
-│   └── e2e_qualitative.yaml      # E2E NLG slot-to-text generation
-│
-├── utils/
-│   ├── stream_filter.py          # Data quality filter used by producer.py
-│   ├── plot_metrics.py           # Standalone CLI tool: regenerates training plots from CSV
-│   ├── eval_metrics_train.py     # Evaluator class: perplexity, accuracy, F1, overlap F1
-│   ├── eval_qualitative.py       # QualitativeEvaluator: slot coverage, consistency, TTR
-│   └── checkpoint_manager.py    # CheckpointManager: hierarchical LoRA checkpoint save/load
-│
-├── docs/
-│   ├── Infinitune_Project_Context.md   # This file — full architecture reference
-│   ├── imdb_qualitative_guide.md       # IMDb generation task guide
-│   └── e2e_qualitative_guide.md        # E2E NLG task guide (slot coverage + consistency)
-│
-├── output/               # Auto-created runtime directory
-│   ├── logs/
-│   │   └── <run_name>/<timestamp>_<uid>/
-│   │       ├── metrics.csv          # All columns (many sparse depending on config)
-│   │       ├── metrics_clean.csv    # Only populated columns (recommended for analysis)
-│   │       ├── run_params.json      # Snapshot of all config params at training start
-│   │       ├── verbose_samples.md   # Markdown table of eval samples (if verbose=true)
-│   │       └── *.png                # Auto-generated metric plots
-│   └── checkpoints/
-│       └── <model>__<dataset>/
-│           └── run_<YYYYMMDD-HHMMSS>_<uid>/   # Unique dir per training run
-│               ├── step_000200/
-│               │   ├── adapter_model.safetensors
-│               │   ├── adapter_config.json
-│               │   └── checkpoint_meta.json
-│               └── final/
-│
-├── requirements.txt      # Python package dependencies
-└── README.md             # Setup and quickstart guide
+|
+|-- producer.py           # Service 1: Streams dataset samples to Kafka
+|-- trainer.py            # Service 2: Consumes data, fine-tunes model with QLoRA
+|-- inference.py          # Service 3: Serves REST API, hot-swaps LoRA weights
+|-- evaluate.py           # Offline evaluation: loads checkpoints, runs eval metrics
+|
+|-- configs/
+|   |-- imdb_config.yaml          # IMDb sentiment classification (quantitative)
+|   |-- imdb_qualitative.yaml     # IMDb review generation (qualitative eval)
+|   |-- gsm8k_config.yaml         # GSM8K math reasoning task
+|   `-- e2e_qualitative.yaml      # E2E NLG slot-to-text generation
+|
+|-- utils/
+|   |-- stream_filter.py          # Data quality filter used by producer.py
+|   |-- plot_metrics.py           # Standalone CLI tool: regenerates the full evaluation artifact bundle from CSV
+|   |-- eval_metrics_train.py     # Evaluator class: perplexity, accuracy, F1, overlap F1
+|   |-- eval_qualitative.py       # QualitativeEvaluator: slot coverage, consistency, TTR
+|   `-- checkpoint_manager.py     # CheckpointManager: hierarchical LoRA checkpoint save/load
+|
+|-- docs/
+|   |-- Infinitune_Project_Context.md   # This file - full architecture reference
+|   |-- README.md                       # Guide index + config chooser
+|   |-- imdb_quantitative_guide.md      # IMDb sentiment classification guide
+|   |-- gsm8k_quantitative_guide.md     # GSM8K quantitative reasoning guide
+|   |-- alpaca_qualitative_guide.md     # Alpaca instruction-following guide
+|   |-- imdb_qualitative_guide.md       # IMDb generation task guide
+|   |-- gsm8k_qualitative_guide.md      # GSM8K reasoning-structure guide
+|   `-- e2e_qualitative_guide.md        # E2E NLG task guide (slot coverage + consistency)
+|
+|-- output/               # Auto-created runtime directory
+|   |-- logs/
+|   |   `-- <run_name>/<timestamp>_<uid>/
+|   |       |-- metrics.csv          # All columns (many sparse depending on config)
+|   |       |-- metrics_clean.csv    # Only populated columns (recommended for analysis)
+|   |       |-- run_params.json      # Snapshot of all config params at training start
+|   |       |-- verbose_samples.md   # Markdown table of eval samples (if verbose=true)
+|   |       `-- evaluation_artifacts/
+|   |           |-- index.json
+|   |           `-- artifact_<timestamp>_<uid>/
+|   |               |-- dashboards/
+|   |               |-- insights/
+|   |               |-- plots/
+|   |               `-- report.html
+|   `-- checkpoints/
+|       `-- <model>__<dataset>/
+|           `-- run_<YYYYMMDD-HHMMSS>_<uid>/   # Unique dir per training run
+|               |-- step_000200/
+|               |   |-- adapter_model.safetensors
+|               |   |-- adapter_config.json
+|               |   `-- checkpoint_meta.json
+|               `-- final/
+|
+|-- requirements.txt      # Python package dependencies
+`-- README.md             # Setup and quickstart guide
 ```
 
 ---
@@ -314,7 +325,7 @@ exact_match, grad_norm, tokens_per_sec, step_time_s, records_used_total
 ```
 Design decision: The CSV file is **opened, written, and closed on every `log()` call** (not kept open). This is intentional for Windows compatibility — Windows blocks readers on open file handles.
 
-At the end of training, `generate_plots()` reads the CSV and saves a PNG for each metric using matplotlib (non-interactive `Agg` backend).
+At the end of training, the evaluation artifact orchestrator reads the CSV and generates a versioned artifact bundle containing dashboards, per-metric PNGs, insight charts, a self-contained `report.html`, and a manifest/index for that run directory.
 
 Also writes `run_params.json` — a snapshot of all config params at startup — for reproducibility.
 
@@ -538,22 +549,28 @@ This batching approach means that if the trainer pushes 10 tensor updates rapidl
 
 **Safety:** If the `validate()` function crashes for any reason, it returns `(True, None)` — fail open, to avoid silently starving the trainer.
 
-### 6.5 `utils/plot_metrics.py` — Offline Plot Utility
+### 6.5 `utils/plot_metrics.py` - Offline Plot Utility
 
-A standalone CLI script for regenerating training plots from a `metrics.csv` file.
+A standalone CLI script for regenerating the full evaluation artifact bundle from a `metrics.csv` or `metrics_clean.csv` file.
 
 ```bash
-# Regenerate plots after the run
-python utils/plot_metrics.py "output/imdb/logs/infinitune-imdb-sentiment/20240315-120000/metrics.csv"
+# Regenerate a fresh artifact bundle after the run
+python utils/plot_metrics.py "output/imdb/logs/infinitune-imdb-sentiment/20240315-120000/metrics.csv" \
+  --config configs/imdb_quantitative.yaml
 
-# Save to a custom directory
-python utils/plot_metrics.py metrics.csv --out-dir ./my_analysis_plots
+# Save the new bundle under a custom root directory
+python utils/plot_metrics.py metrics.csv \
+  --config configs/imdb_quantitative.yaml \
+  --out-dir ./my_analysis_plots
 ```
 
-Generates one PNG per metric:
-- `train_loss.png`, `eval_loss.png`, `perplexity.png`
-- `accuracy.png`, `f1.png`, `mcc.png`, `kappa.png`, `exact_match.png`
-- `grad_norm.png`, `tokens_per_sec.png`
+Each run creates a fresh `evaluation_artifacts/artifact_<timestamp>_<uid>/` bundle and does not overwrite prior dashboards or reports.
+
+The generated bundle includes:
+- `plots/<theme>/...` for individual metric plots
+- `insights/<theme>/...` for grouped insight charts
+- `dashboards/dashboard_dark.png` and `dashboards/dashboard_light.png`
+- `report.html`, `manifest.json`, and `generation_log.json`
 
 Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C interrupt, or for sharing results without re-running training.
 

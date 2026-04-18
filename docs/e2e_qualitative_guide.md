@@ -5,13 +5,13 @@
 
 ## Overview
 
-This pipeline fine-tunes **DistilGPT-2** on the [E2E NLG Challenge](https://huggingface.co/datasets/e2e_nlg) dataset in **structured slot-to-text generation** mode. The model learns to convert structured meaning representations (MRs) — key-value slot pairs describing a restaurant — into fluent natural language descriptions.
+This pipeline fine-tunes **gpt2-medium** on the [E2E NLG Challenge](https://huggingface.co/datasets/e2e_nlg) dataset in **structured slot-to-text generation** mode. The model learns to convert structured meaning representations (MRs) — key-value slot pairs describing a restaurant — into fluent natural language descriptions.
 
 Unlike sentiment classification or review generation, this task has **verifiable targets**: each MR has reference sentences that mention specific slots (name, cuisine, price range, area, rating). We measure whether the model reliably surfaces those slots in its output.
 
 | Property | Value |
 |---|---|
-| **Model** | `distilgpt2` |
+| **Model** | `gpt2-medium` |
 | **Dataset** | E2E NLG Challenge (~33,525 train samples) |
 | **Task** | Structured data-to-text NLG (MR → restaurant description) |
 | **Eval (Quant)** | `perplexity` + `answer_overlap_f1` (token-level F1 vs. reference) |
@@ -158,8 +158,8 @@ training:
 ```
 
 Checkpoints are saved under:
-```
-output/checkpoints/distilgpt2__e2e_nlg/run_<YYYYMMDD-HHMMSS>_<uid>/step_000200/
+```text
+output/e2e/checkpoints/gpt2-medium__parquet/run_<YYYYMMDD-HHMMSS>_<uid>/step_000200/
 ```
 
 Each run gets its own `run_*` subdirectory. Previous runs are never overwritten.
@@ -170,18 +170,19 @@ Each run gets its own `run_*` subdirectory. Previous runs are never overwritten.
 
 After a complete training run, the following files are generated:
 
-```
-output/logs/<run_name>/<ts>_<uid>/
+```text
+output/e2e/logs/infinitune-e2e-nlg/<ts>_<uid>/
   metrics.csv              # All columns (many sparse for E2E perplexity config)
   metrics_clean.csv        # Only populated columns (recommended for analysis)
   run_params.json          # Full training config snapshot
   verbose_samples.md       # Markdown table of eval samples (if verbose=true)
-  train_loss.png
-  eval_loss.png
-  perplexity.png
-  answer_overlap_f1.png    # Token-level F1 trend over training
-  qual_slot_coverage_mean.png
-  qual_consistency_score_mean.png
+  evaluation_artifacts/
+    index.json
+    artifact_<timestamp>_<uid>/
+      dashboards/
+      insights/
+      plots/
+      report.html
 ```
 
 ### `metrics_clean.csv` vs. `metrics.csv`
@@ -190,6 +191,49 @@ output/logs/<run_name>/<ts>_<uid>/
 
 ---
 
+## Regenerating Evaluation Artifacts
+
+If you already have `metrics_clean.csv` from an E2E run, you can regenerate a fresh bundle containing:
+- `dashboards/dashboard_dark.png` + `dashboards/dashboard_light.png`
+- grouped insight charts under `insights/<theme>/...`
+- individual metric plots under `plots/<theme>/...`
+- the offline HTML report: `report.html`
+
+### Latest inline training run -> fresh bundle
+
+```powershell
+$Run = Get-ChildItem "output/e2e/logs/infinitune-e2e-nlg" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/e2e_qualitative.yaml
+```
+
+### Latest inline training run -> fresh bundle in a custom directory
+
+```powershell
+$Run = Get-ChildItem "output/e2e/logs/infinitune-e2e-nlg" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/e2e_qualitative.yaml --out-dir .\my_e2e_run_plots
+```
+
+### Latest decoupled single-checkpoint eval -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/e2e/eval_results/gpt2-medium__parquet" -Directory -Recurse | Where-Object { $_.Name -like "eval_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "plots\eval_metrics.csv"
+python utils/plot_metrics.py $Csv --config configs/e2e_qualitative.yaml
+```
+
+### Latest all-checkpoints comparison -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/e2e/eval_results/gpt2-medium__parquet\all_checkpoints" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "all_checkpoints_results.csv"
+python utils/plot_metrics.py $Csv --config configs/e2e_qualitative.yaml
+```
+
+---
 ## Running the Pipeline
 
 ### Step 1: Start Trainer (Colab Cell 1)
@@ -226,12 +270,18 @@ Watch for these log patterns:
 
 ### Step 4: Evaluate Checkpoints
 
-```bash
-# Evaluate a specific checkpoint
+```powershell
+# Evaluate final checkpoint
+python evaluate.py --config configs/e2e_qualitative.yaml
+
+# Evaluate checkpoint step 1000
 python evaluate.py --config configs/e2e_qualitative.yaml --step 1000
 
-# Evaluate all checkpoints from all runs
+# Evaluate all checkpoints and build the combined comparison bundle
 python evaluate.py --config configs/e2e_qualitative.yaml --all-checkpoints
+
+# List saved checkpoints
+python evaluate.py --config configs/e2e_qualitative.yaml --list
 ```
 
 ---

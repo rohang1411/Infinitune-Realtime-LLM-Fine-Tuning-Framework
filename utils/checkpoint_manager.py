@@ -71,11 +71,27 @@ def _log(msg: str) -> None:
 _PAD_WIDTH = 6   # "step_000100" — supports up to 999,999 steps
 
 
-def _step_dir_name(step) -> str:
-    """Return the directory name for a given step. 'final' stays as-is."""
+def _normalize_step_value(step):
+    """Normalize step identifiers like 600, '600', 'step_000600', or 'final'."""
     if step == "final":
         return "final"
-    return f"step_{int(step):0{_PAD_WIDTH}d}"
+
+    if isinstance(step, str):
+        step = step.strip()
+        if step.lower() == "final":
+            return "final"
+        if step.lower().startswith("step_"):
+            step = step[len("step_"):]
+
+    return int(step)
+
+
+def _step_dir_name(step) -> str:
+    """Return the directory name for a given step. 'final' stays as-is."""
+    normalized_step = _normalize_step_value(step)
+    if normalized_step == "final":
+        return "final"
+    return f"step_{normalized_step:0{_PAD_WIDTH}d}"
 
 
 def _slugify(text: str) -> str:
@@ -327,13 +343,14 @@ class CheckpointManager:
         or None if no match is found. Used by evaluate.py to locate
         checkpoints from previous training runs.
         """
-        target = _step_dir_name(step)
+        normalized_step = _normalize_step_value(step)
+        target = _step_dir_name(normalized_step)
         # list_checkpoints() is already sorted ascending by step then by run;
         # we want the latest run, so collect all matches and return the last.
         matches = [
             c["path"]
             for c in self.list_checkpoints()
-            if c["step"] == ("final" if step == "final" else int(step))
+            if c["step"] == normalized_step
         ]
         return matches[-1] if matches else None
 

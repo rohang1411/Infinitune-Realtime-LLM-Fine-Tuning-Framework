@@ -5,13 +5,13 @@
 
 ## Overview
 
-This pipeline fine-tunes **Qwen2.5-1.5B** on the Stanford IMDb dataset to perform **binary sentiment classification**. The model learns to read a movie review and output either `positive` or `negative`.
+This pipeline fine-tunes **distilgpt2** on the Stanford IMDb dataset to perform **binary sentiment classification**. The model learns to read a movie review and output either `positive` or `negative`.
 
 This is the cleanest demo of quantitative learning in InfiniTune: you get hard accuracy, F1, and MCC numbers that rise visibly over training steps, providing unambiguous proof that the model is absorbing signal from the data stream.
 
 | Property | Value |
 |---|---|
-| **Model** | `Qwen/Qwen2.5-1.5B` |
+| **Model** | `distilgpt2` |
 | **Dataset** | Stanford IMDb (~25k train / 25k test reviews) |
 | **Task** | Binary sentiment classification |
 | **Eval Strategy** | `class_match` (generate token → match against known labels) |
@@ -50,7 +50,7 @@ The target token is ` positive` or ` negative` (with a leading space matching th
 2. Python dependencies installed: `pip install -r requirements.txt`
 3. Approximately **4 GB free disk space** for HuggingFace model cache
 
-**First-run note:** `Qwen/Qwen2.5-1.5B` (~3 GB) will be downloaded from HuggingFace on the first run and cached at `~/.cache/huggingface/`. Subsequent runs start instantly.
+**First-run note:** `distilgpt2` will be downloaded from HuggingFace on the first run and cached at `~/.cache/huggingface/`. Subsequent runs start instantly.
 
 ---
 
@@ -68,7 +68,7 @@ python inference.py --config configs/imdb_quantitative.yaml
 
 **Expected output:**
 ```
-[INFERENCE] Loading base model: Qwen/Qwen2.5-1.5B
+[INFERENCE] Loading base model: distilgpt2
 [INFERENCE] Flask server running on http://localhost:5000
 [INFERENCE] Listening for LoRA updates on topic: lora-updates-imdb
 ```
@@ -224,29 +224,79 @@ python evaluate.py --config configs/imdb_quantitative.yaml --list
 ```
 
 Results are saved to:
-```
-output/imdb/eval_results/Qwen2.5-1.5B__imdb/final/eval_<timestamp>/
-    eval_results.json       ← all metric values (full pool, not windowed)
-    eval_config.json        ← config snapshot
-    plots/
-        accuracy.png
-        f1.png
-        mcc.png
-        perplexity.png
+```text
+output/imdb/eval_results/distilgpt2__imdb/<checkpoint>/eval_<timestamp>_<uid>/
+  eval_results.json
+  eval_config.json
+  config_snapshot.yaml
+  evaluation_artifacts/
+    index.json
+    artifact_<timestamp>_<uid>/
+      dashboards/
+      insights/
+      plots/
+      report.html
 ```
 
 **Decoupled eval uses the full 5,000-sample pool** (not a 100-sample sliding window), giving you definitive, unsampled scores.
 
+### PowerShell Copy-Paste Commands
+
+```powershell
+# Train with inline evaluation enabled
+python trainer.py --config configs/imdb_quantitative.yaml
+
+# Evaluate final checkpoint
+python evaluate.py --config configs/imdb_quantitative.yaml
+
+# Evaluate checkpoint step 500
+python evaluate.py --config configs/imdb_quantitative.yaml --step 500
+
+# Evaluate all checkpoints and build the combined comparison bundle
+python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
+
+# List saved checkpoints
+python evaluate.py --config configs/imdb_quantitative.yaml --list
+```
+
 ---
 
-## Regenerating Plots
+## Regenerating Evaluation Artifacts
 
-```bash
-python utils/plot_metrics.py output/imdb/logs/infinitune-imdb-sentiment/<timestamp>/metrics.csv
+Use `python utils/plot_metrics.py ...` as the canonical regenerate command. It builds a fresh bundle containing plots, dashboards, insights, and `report.html`.
 
-# Optional: specify output directory
-python utils/plot_metrics.py output/imdb/logs/infinitune-imdb-sentiment/<timestamp>/metrics.csv \
-  --out-dir ./my_plots
+### Latest inline training run -> fresh bundle
+
+```powershell
+$Run = Get-ChildItem "output/imdb/logs/infinitune-imdb-sentiment" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/imdb_quantitative.yaml
+```
+
+### Latest inline training run -> fresh bundle in a custom directory
+
+```powershell
+$Run = Get-ChildItem "output/imdb/logs/infinitune-imdb-sentiment" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/imdb_quantitative.yaml --out-dir .\my_imdb_run_plots
+```
+
+### Latest decoupled single-checkpoint eval -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/imdb/eval_results/distilgpt2__imdb" -Directory -Recurse | Where-Object { $_.Name -like "eval_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "plots\eval_metrics.csv"
+python utils/plot_metrics.py $Csv --config configs/imdb_quantitative.yaml
+```
+
+### Latest all-checkpoints comparison -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/imdb/eval_results/distilgpt2__imdb\all_checkpoints" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "all_checkpoints_results.csv"
+python utils/plot_metrics.py $Csv --config configs/imdb_quantitative.yaml
 ```
 
 ---
@@ -276,12 +326,13 @@ This reduces networking overhead and focuses the trainer entirely on saving loca
 
 **Step 2: Locate your Checkpoint**
 After training is complete, your adapter weights are saved under the project's `output_dir`.
-- Locate the final checkpoint: `output/infinitune-imdb-sentiment/checkpoint-final`
+- Easiest option: let InfiniTune resolve the newest saved adapter automatically with `--checkpoint latest`
+- If you need an explicit path, checkpoints live under `output/imdb/checkpoints/distilgpt2__imdb/run_<timestamp>_<uid>/final`
 
 **Step 3: Run Inference Server**
 Launch `inference.py` and pass the mapped checkpoint using the `--checkpoint` flag. This natively bypasses Kafka and locks the adapter statically:
 ```bash
-python inference.py --config configs/imdb_quantitative.yaml --checkpoint output/infinitune-imdb-sentiment/checkpoint-final
+python inference.py --config configs/imdb_quantitative.yaml --checkpoint latest
 ```
 
 **Step 4: Test the Endpoint**

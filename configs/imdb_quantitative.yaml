@@ -111,9 +111,20 @@ evaluation:
   strategy: "class_match" # class_match | regex_extract | perplexity
   eval_interval: 50 # evaluate every N optimizer steps
   eval_pool_size: 4000 # total samples loaded from eval split (shuffled)
-  eval_batch_size: 200 # samples evaluated per eval step (sliding window)
-  verbose: true # if true, print per-sample predictions during eval
+  eval_batch_size: "full_pool" # evaluate the full shuffled pool each time to remove window-composition noise
+  verbose: false # if true, print per-sample predictions during eval
   answer_regex: null # not used for class_match
+  other_label: "other" # fallback bucket for class_match generations that do not start with a known label
+  plotting:
+    rolling_average_enabled: true
+    rolling_average_window: 11
+    rolling_average_include:
+      - "accuracy"
+      - "f1"
+      - "mcc"
+      - "kappa"
+      - "exact_match"
+      - "continual_learning_stability"
   # Optional: override which metrics run (defaults follow strategy; booleans only).
   # classification (class_match) defaults: all generation + structure metrics on.
   # regex_extract defaults: accuracy + exact_match only (F1/MCC/kappa off).
@@ -122,7 +133,7 @@ evaluation:
     compute_loss: true # eval_loss + perplexity (recommended)
     compute_accuracy: true
     compute_exact_match: true
-    compute_f1: true # macro F1 over discrete labels in the eval window
+    compute_f1: true # macro F1 after class_match predictions are normalized to known labels + other
     compute_mcc: true
     compute_kappa: true
     compute_answer_overlap_f1: false # Token-level overlap (not used for discrete classification)

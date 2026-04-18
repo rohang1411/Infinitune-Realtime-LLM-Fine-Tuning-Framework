@@ -141,8 +141,8 @@ def _save_results(out_dir: str, metrics: dict, config: dict, checkpoint_path: st
 
 def _generate_plots(metrics_over_time: list, out_dir: str, config: dict = None) -> None:
     """
-    Generate PNG plots from a list of {metric_name: value} dicts using
-    plot_metrics.generate_plots(), which also produces the unified dashboard.
+    Generate the shared evaluation artifact bundle from a list of
+    {metric_name: value} dicts.
 
     For a single checkpoint, metrics_over_time has one entry.
     For --all-checkpoints, it has one entry per checkpoint.
@@ -169,8 +169,17 @@ def _generate_plots(metrics_over_time: list, out_dir: str, config: dict = None) 
             writer.writerow(clean_row)
 
     try:
-        from utils.plot_metrics import generate_plots
-        generate_plots(csv_path, out_dir=plots_dir, config=config)
+        from utils.evaluation_artifacts import generate_evaluation_artifacts
+        context = "all_checkpoints_eval" if len(metrics_over_time) > 1 else "decoupled_eval"
+        manifest = generate_evaluation_artifacts(
+            metrics_csv_path=csv_path,
+            run_root=out_dir,
+            config=config,
+            context=context,
+        )
+        bundle = manifest.get("artifact_bundle")
+        if bundle:
+            _log(f"Evaluation artifacts generated in: {bundle}")
     except Exception as exc:
         _log(f"Warning: plot generation failed: {exc}")
         import traceback; traceback.print_exc()

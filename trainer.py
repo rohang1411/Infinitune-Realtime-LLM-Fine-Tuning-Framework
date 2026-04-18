@@ -67,6 +67,11 @@ class MetricsLogger:
         "perplexity",
         "accuracy",
         "aauc",
+        # Backward/forward-compatible aliases:
+        # - utils/eval_metrics_train.py returns `average_accuracy` (normalized AUC)
+        # - utils/plot_metrics.py expects `average_accuracy` for the chart
+        # - older code used `aauc`
+        "average_accuracy",
         "f1",
         "mcc",
         "kappa",
@@ -75,6 +80,9 @@ class MetricsLogger:
         "answer_overlap_f1",
         "forgetting_max",
         "update_latency_s",
+        # utils/eval_metrics_train.py returns `eval_cycle_time_s`
+        # utils/plot_metrics.py expects `eval_cycle_time_s`
+        "eval_cycle_time_s",
         "backward_transfer",
         "grad_norm",
         "tokens_per_sec",
@@ -205,15 +213,16 @@ class MetricsLogger:
             f.write("\n---\n")
 
     def generate_plots(self, config: dict = None):
-        """Generate individual metric PNGs and the unified dashboard.
+        """Generate the evaluation artifact bundle for this training run.
 
-        Delegates to utils/plot_metrics.generate_plots() which handles both
-        individual plots and the multi-panel dashboard with config header.
+        Delegates to `utils.evaluation_artifacts.generate_evaluation_artifacts()`
+        so plots, dashboards, insights, and `report.html` are produced through
+        the shared non-overwriting bundle pipeline.
 
         Parameters
         ----------
-        config : Full YAML config dict. When provided, the dashboard header
-                 shows model, LR, LoRA parameters, and evaluation settings.
+        config : Full YAML config dict used to drive usecase-aware KPIs,
+                 insights, and dashboard/report metadata.
         """
         if not os.path.exists(self.metrics_path):
             _log("Plotting skipped (no metrics CSV found).")
@@ -224,8 +233,17 @@ class MetricsLogger:
         csv_to_plot = clean_path if os.path.exists(clean_path) else self.metrics_path
 
         try:
-            from utils.plot_metrics import generate_plots
-            generate_plots(csv_to_plot, out_dir=self.dir, config=config)
+            from utils.evaluation_artifacts import generate_evaluation_artifacts
+
+            manifest = generate_evaluation_artifacts(
+                metrics_csv_path=csv_to_plot,
+                run_root=self.dir,
+                config=config,
+                context="inline_training",
+            )
+            bundle = manifest.get("artifact_bundle")
+            if bundle:
+                _log(f"Evaluation artifacts generated in: {bundle}")
         except Exception as exc:
             _log(f"Plotting failed: {exc}")
             import traceback; traceback.print_exc()
@@ -642,7 +660,12 @@ def train_model(config, config_path: str = "(unknown)"):
                     "eval_loss": eval_metrics.get("eval_loss"),
                     "perplexity": eval_metrics.get("perplexity"),
                     "accuracy": eval_metrics.get("accuracy"),
-                    "aauc": eval_metrics.get("aauc"),
+                    # Prefer the evaluator's native names, but fill aliases
+                    # so plotting stays consistent across all call sites.
+                    "aauc": eval_metrics.get("aauc", None)
+                    or eval_metrics.get("average_accuracy"),
+                    "average_accuracy": eval_metrics.get("average_accuracy", None)
+                    or eval_metrics.get("aauc"),
                     "backward_transfer": eval_metrics.get("backward_transfer"),
                     "f1": eval_metrics.get("f1"),
                     "mcc": eval_metrics.get("mcc"),
@@ -650,7 +673,10 @@ def train_model(config, config_path: str = "(unknown)"):
                     "exact_match": eval_metrics.get("exact_match"),
                     "answer_overlap_f1": eval_metrics.get("answer_overlap_f1"),
                     "forgetting_max": eval_metrics.get("forgetting_max"),
-                    "update_latency_s": eval_metrics.get("update_latency_s"),
+                    "update_latency_s": eval_metrics.get("update_latency_s", None)
+                    or eval_metrics.get("eval_cycle_time_s"),
+                    "eval_cycle_time_s": eval_metrics.get("eval_cycle_time_s", None)
+                    or eval_metrics.get("update_latency_s"),
                     "records_used_total": total_messages_seen,
                 }
             )

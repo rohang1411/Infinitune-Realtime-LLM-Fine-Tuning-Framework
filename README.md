@@ -134,7 +134,8 @@ InfiniTune/
 │   ├── gsm8k_quantitative.yaml       # GSM8K math exact-match reasoning
 │   ├── alpaca_qualitative.yaml       # Alpaca instruction following (semantic similarity)
 │   ├── imdb_qualitative.yaml         # IMDb unconditional generation (keyword density)
-│   └── gsm8k_qualitative.yaml        # GSM8K + structural Chain-of-Thought metrics
+│   ├── gsm8k_qualitative.yaml        # GSM8K + structural Chain-of-Thought metrics
+│   └── e2e_qualitative.yaml          # E2E structured generation (slot coverage + consistency)
 │
 ├── docs/                             # Per-config testing guides
 │   ├── README.md                     # Guide index + config chooser
@@ -142,19 +143,20 @@ InfiniTune/
 │   ├── gsm8k_quantitative_guide.md
 │   ├── alpaca_qualitative_guide.md
 │   ├── imdb_qualitative_guide.md
-│   └── gsm8k_qualitative_guide.md
+│   ├── gsm8k_qualitative_guide.md
+│   └── e2e_qualitative_guide.md
 │
 ├── utils/
 │   ├── checkpoint_manager.py         # Versioned LoRA adapter save/load
 │   ├── eval_metrics_train.py         # Quantitative evaluation (Evaluator class)
 │   ├── eval_qualitative.py           # Qualitative evaluation (strategies + orchestrator)
-│   ├── plot_metrics.py               # Standalone plot regeneration utility
+│   ├── plot_metrics.py               # Standalone evaluation artifact regeneration utility
 │   └── stream_filter.py              # Kafka data quality filtering
 │
 ├── output/                           # All generated artefacts (git-ignored)
 │   └── <project>/
 │       ├── checkpoints/              # Saved LoRA adapters
-│       ├── logs/                     # Training metrics CSVs + plots
+│       ├── logs/                     # Training metrics CSVs + evaluation artifacts
 │       └── eval_results/             # Decoupled evaluation results
 │
 └── requirements.txt
@@ -302,13 +304,14 @@ Replace `imdb_quantitative.yaml` with any config file from the table below.
 
 | Config | Task | Model | Eval Type | Detailed Guide |
 |---|---|---|---|---|
-| `configs/imdb_quantitative.yaml` | Sentiment classification | Qwen2.5-1.5B | Accuracy · F1 · MCC | [→ Guide](docs/imdb_quantitative_guide.md) |
-| `configs/gsm8k_quantitative.yaml` | Math reasoning | Qwen2.5-3B | Exact Match | [→ Guide](docs/gsm8k_quantitative_guide.md) |
-| `configs/alpaca_qualitative.yaml` | Instruction following | Qwen2.5-1.5B | Semantic Similarity | [→ Guide](docs/alpaca_qualitative_guide.md) |
-| `configs/imdb_qualitative.yaml` | Domain review generation | Qwen2.5-1.5B | Keyword Density + TTR | [→ Guide](docs/imdb_qualitative_guide.md) |
-| `configs/gsm8k_qualitative.yaml` | Math + CoT structure | Qwen2.5-3B | Exact Match + CoT Anchors | [→ Guide](docs/gsm8k_qualitative_guide.md) |
+| `configs/imdb_quantitative.yaml` | Sentiment classification | `distilgpt2` | Accuracy · F1 · MCC | [Guide](docs/imdb_quantitative_guide.md) |
+| `configs/gsm8k_quantitative.yaml` | Math reasoning | `Qwen/Qwen2.5-3B` | Exact Match | [Guide](docs/gsm8k_quantitative_guide.md) |
+| `configs/alpaca_qualitative.yaml` | Instruction following | `Qwen/Qwen2.5-1.5B` | Semantic Similarity | [Guide](docs/alpaca_qualitative_guide.md) |
+| `configs/imdb_qualitative.yaml` | Domain review generation | `Qwen/Qwen2.5-1.5B` | Keyword Density + TTR | [Guide](docs/imdb_qualitative_guide.md) |
+| `configs/gsm8k_qualitative.yaml` | Math + CoT structure | `Qwen/Qwen2.5-3B` | Exact Match + CoT Anchors | [Guide](docs/gsm8k_qualitative_guide.md) |
+| `configs/e2e_qualitative.yaml` | Structured NLG | `gpt2-medium` | Slot Coverage + Consistency | [Guide](docs/e2e_qualitative_guide.md) |
 
-> Each guide contains step-by-step run instructions, metric definitions, learning curve interpretation, decoupled eval commands, and a troubleshooting table. **Read the relevant guide before running a config for the first time.**
+> Each guide contains step-by-step run instructions, metric definitions, learning curve interpretation, decoupled eval commands, and troubleshooting notes. Read the relevant guide before running a config for the first time.
 
 ---
 
@@ -349,7 +352,18 @@ InfiniTune has two independent evaluation modes:
 
 ### Inline Evaluation (during training)
 
-Runs automatically inside `trainer.py` at configurable step intervals. Writes results to `output/<project>/logs/.../metrics.csv`. Plots auto-generated at training end.
+Runs automatically inside `trainer.py` at configurable step intervals.
+
+Inline evaluation writes quantitative results to:
+- `output/<project>/logs/<run...>/metrics.csv`
+
+At training end, plots + a report are generated into a versioned artifact bundle under:
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/dashboards/dashboard_dark.png`
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/dashboards/dashboard_light.png`
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/insights/<theme>/...`
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/plots/<theme>/...`
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/report.html`
+- `evaluation_artifacts/index.json` keeps a history of all bundles for that run directory
 
 **Config control:**
 ```yaml
@@ -369,6 +383,11 @@ evaluation:
 
 Run `evaluate.py` against any saved checkpoint. No Kafka required. Evaluates the full pool (not a sliding window) for definitive scores.
 
+Decoupled evaluation writes versioned artifacts under:
+- `eval_results.json` and `eval_config.json` (full metric payload)
+- `evaluation_artifacts/artifact_<timestamp>_<uid>/...` (dashboards, plots, insights, `report.html`, copied metrics snapshot)
+- `evaluation_artifacts/index.json` (bundle history for that eval directory)
+
 ```bash
 # Evaluate final checkpoint
 python evaluate.py --config configs/imdb_quantitative.yaml
@@ -383,33 +402,88 @@ python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
 python evaluate.py --config configs/imdb_quantitative.yaml --list
 ```
 
-Results saved to: `output/<project>/eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>/`
+Results saved to: `output/<project>/eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>_<uid>/`
 
 > See the per-config guide in [`docs/`](docs/README.md) for the exact commands and expected output for each configuration.
+
+**PowerShell copy-paste helpers**
+
+Use these when you want to regenerate artifacts from the most recent run without manually finding timestamps:
+
+```powershell
+# Latest INLINE training run -> full artifact bundle (plots + dashboards + report.html)
+$Config  = "configs/imdb_quantitative.yaml"                 # change per config
+$LogRoot = "output/imdb/logs/infinitune-imdb-sentiment"     # change per config
+$Run = Get-ChildItem $LogRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config $Config
+
+# Latest single-checkpoint DECOUPLED eval -> full artifact bundle
+$Config   = "configs/imdb_quantitative.yaml"                # change per config
+$EvalRoot = "output/imdb/eval_results/distilgpt2__imdb"     # change per config
+$EvalRun = Get-ChildItem $EvalRoot -Directory -Recurse | Where-Object { $_.Name -like "eval_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "plots\eval_metrics.csv"
+python utils/plot_metrics.py $Csv --config $Config
+
+# Latest ALL-CHECKPOINTS comparison -> full artifact bundle
+$Config   = "configs/imdb_quantitative.yaml"                # change per config
+$EvalRoot = "output/imdb/eval_results/distilgpt2__imdb\all_checkpoints"
+$EvalRun = Get-ChildItem $EvalRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "all_checkpoints_results.csv"
+python utils/plot_metrics.py $Csv --config $Config
+```
 
 ---
 
 ## Output Directory Structure
 
-```
+```text
 output/<project>/
-│
-├── checkpoints/<model>__<dataset>/
-│   ├── step_000100/
-│   │   ├── adapter_model.safetensors
-│   │   ├── adapter_config.json
-│   │   └── checkpoint_meta.json
-│   └── final/
-│
-├── logs/<project-name>/<timestamp>_<uuid>/
-│   ├── metrics.csv          ← one row per eval event
-│   ├── run_params.json      ← config snapshot
-│   └── *.png                ← auto-generated plots
-│
-└── eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>/
-    ├── eval_results.json
-    ├── eval_config.json
-    └── plots/*.png
+|
+|-- checkpoints/<model>__<dataset>/
+|   |-- step_000100/
+|   |   |-- adapter_model.safetensors
+|   |   |-- adapter_config.json
+|   |   `-- checkpoint_meta.json
+|   `-- final/
+|
+|-- logs/<project-name>/<timestamp>_<uuid>/
+|   |-- metrics.csv
+|   |-- metrics_clean.csv
+|   |-- run_params.json
+|   `-- evaluation_artifacts/
+|       |-- index.json
+|       `-- artifact_<timestamp>_<uid>/
+|           |-- manifest.json
+|           |-- generation_log.json
+|           |-- metrics/
+|           |   |-- source_metrics.csv
+|           |   `-- resolved_metrics.csv
+|           |-- dashboards/
+|           |   |-- dashboard_dark.png
+|           |   `-- dashboard_light.png
+|           |-- insights/
+|           |   |-- dark/
+|           |   `-- light/
+|           |-- plots/
+|           |   |-- dark/
+|           |   `-- light/
+|           `-- report.html
+|
+`-- eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>_<uid>/
+    |-- eval_results.json
+    |-- eval_config.json
+    `-- evaluation_artifacts/
+        |-- index.json
+        `-- artifact_<timestamp>_<uid>/
+            |-- manifest.json
+            |-- generation_log.json
+            |-- metrics/
+            |-- dashboards/
+            |-- insights/
+            |-- plots/
+            `-- report.html
 ```
 
 **No-overwrite guarantees:**
@@ -419,12 +493,34 @@ output/<project>/
 
 ---
 
-## Regenerating Plots
+## Regenerating Evaluation Artifacts
 
 ```bash
-# Regenerate from an existing metrics CSV
-python utils/plot_metrics.py output/imdb/logs/infinitune-imdb-sentiment/<timestamp>/metrics.csv
+# Regenerate a full artifact bundle from an existing metrics CSV (INLINE EVAL)
+# Important: pass the same config YAML so the dashboard can choose the correct
+# usecase/KPIs (otherwise it may show "No plottable data for dashboard.").
+python utils/plot_metrics.py output/<project>/logs/<run...>/metrics.csv --config configs/imdb_quantitative.yaml
 
-# Save to a custom directory
-python utils/plot_metrics.py path/to/metrics.csv --out-dir ./my_plots
+# Save the new bundle to a custom directory
+python utils/plot_metrics.py path/to/metrics.csv --out-dir ./my_plots --config configs/imdb_quantitative.yaml
+
+# Regenerate from a decoupled single-checkpoint eval CSV
+python utils/plot_metrics.py path/to/eval_results/<scope>/<checkpoint>/eval_<timestamp>_<uid>/plots/eval_metrics.csv --config configs/imdb_quantitative.yaml
+
+# Regenerate from an all-checkpoints comparison CSV
+python utils/plot_metrics.py path/to/eval_results/<scope>/all_checkpoints/eval_<timestamp>_<uid>/all_checkpoints_results.csv --config configs/imdb_quantitative.yaml
 ```
+
+`python utils/plot_metrics.py ...` now generates the full evaluation bundle:
+- `plots/<theme>/...`
+- `insights/<theme>/...`
+- `dashboards/dashboard_dark.png`
+- `dashboards/dashboard_light.png`
+- `report.html`
+
+If you specifically want to trigger the same artifact pipeline from Python instead of the CLI, you can also run:
+```bash
+python -c "from utils.report_html import generate_html_report; import yaml; cfg=yaml.safe_load(open('configs/imdb_quantitative.yaml')); generate_html_report('path/to/metrics.csv', out_dir='path/to/out_dir', config=cfg)"
+```
+That helper also creates a fresh versioned bundle inside `path/to/out_dir/evaluation_artifacts/`, but `python utils/plot_metrics.py ...` is the recommended user-facing command.
+
