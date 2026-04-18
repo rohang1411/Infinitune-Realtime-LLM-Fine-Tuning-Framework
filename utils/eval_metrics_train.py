@@ -233,6 +233,39 @@ def _forgetting_track_keys(metrics_block: dict):
     return out or None
 
 
+def _tokenize_label_text(text: str) -> list:
+    """Tokenize label-like text for robust prefix matching."""
+    return re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", str(text).lower())
+
+
+def _canonicalize_label_text(text: str) -> str:
+    return " ".join(_tokenize_label_text(text)).strip()
+
+
+def _resolve_eval_batch_size(raw_value, eval_pool_size: int) -> int:
+    """Allow eval_batch_size to be numeric or an alias such as 'full_pool'."""
+    if isinstance(raw_value, str):
+        alias = raw_value.strip().lower()
+        if alias in {"full", "full_pool", "all", "entire_pool"}:
+            return max(1, int(eval_pool_size))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = int(eval_pool_size)
+    if value <= 0:
+        return max(1, int(eval_pool_size))
+    return value
+
+
+def _resolve_positive_int(raw_value, fallback: int) -> int:
+    """Parse a positive integer from config values while tolerating strings."""
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = int(fallback)
+    return max(1, value)
+
+
 class Evaluator:
     """Evaluates model performance using configurable strategies.
     
@@ -255,11 +288,16 @@ class Evaluator:
         self.device = device
 
         # New config-driven parameters (backward-compat: fall back to eval_samples)
-        self.eval_pool_size = self.eval_cfg.get(
-            'eval_pool_size', self.eval_cfg.get('eval_samples', 50)
+        self.eval_pool_size = _resolve_positive_int(
+            self.eval_cfg.get('eval_pool_size', self.eval_cfg.get('eval_samples', 50)),
+            self.eval_cfg.get('eval_samples', 50),
         )
-        self.eval_batch_size = self.eval_cfg.get('eval_batch_size', self.eval_pool_size)
+        raw_eval_batch_size = self.eval_cfg.get('eval_batch_size', self.eval_pool_size)
+        self.eval_batch_size = _resolve_eval_batch_size(raw_eval_batch_size, self.eval_pool_size)
         self.verbose = self.eval_cfg.get('verbose', False)
+        self.class_match_other_label = str(
+            self.eval_cfg.get("other_label", "other")
+        ).strip().lower() or "other"
 
         # Which metrics to compute (config + strategy defaults; user overrides win)
         self.metric_flags = _merge_metric_flags(self.strategy, self.eval_cfg)
@@ -284,6 +322,8 @@ class Evaluator:
         # Sliding window cursor � tracks position within the eval pool
         self._eval_cursor = 0
         self.past_sample_accuracies = {}  # Tracks max accuracy per eval sample for BWT
+        self._known_class_labels = []
+        self._known_class_label_tokens = {}
 
         # Forgetting + update latency (online / continual-learning style diagnostics)
         self._best_eval = {}  # metric_name -> running best (peak or valley)
@@ -314,8 +354,45 @@ class Evaluator:
                 f"answer_overlap_f1={self.metric_flags.get('compute_answer_overlap_f1', False)}, "
                 f"forgetting={self.metric_flags.get('compute_forgetting', False)}, "
                 f"eval_cycle_time={self.metric_flags.get('compute_eval_cycle_time', False)} "
-                f"(max_distinct_labels={self.max_distinct_labels})"
+                f"(max_distinct_labels={self.max_distinct_labels}, "
+                f"other_label='{self.class_match_other_label}')"
             )
+
+    def _refresh_class_match_label_space(self):
+        """Build the canonical class-label space from the loaded eval targets."""
+        if self.strategy != "class_match":
+            self._known_class_labels = []
+            self._known_class_label_tokens = {}
+            return
+
+        labels = []
+        for sample in self.eval_data:
+            canonical = _canonicalize_label_text(sample.get("target", ""))
+            if canonical:
+                labels.append(canonical)
+
+        unique_labels = sorted(set(labels), key=lambda x: (-len(x.split()), x))
+        self._known_class_labels = unique_labels
+        self._known_class_label_tokens = {
+            label: label.split() for label in unique_labels
+        }
+
+    def _normalize_gold_class_label(self, text: str) -> str:
+        canonical = _canonicalize_label_text(text)
+        if canonical in self._known_class_label_tokens:
+            return canonical
+        return canonical or str(text).lower().strip()
+
+    def _normalize_class_match_prediction(self, response: str) -> str:
+        response_tokens = _tokenize_label_text(response)
+        if not response_tokens:
+            return self.class_match_other_label
+
+        for label in self._known_class_labels:
+            label_tokens = self._known_class_label_tokens.get(label, [])
+            if response_tokens[: len(label_tokens)] == label_tokens:
+                return label
+        return self.class_match_other_label
 
     def _load_eval_data(self):
         """Load evaluation dataset pool from the configured eval_split."""
@@ -358,7 +435,8 @@ class Evaluator:
                         self._eval_data_by_class = collections.defaultdict(list)
                         self._eval_cursor_by_class = collections.defaultdict(int)
                     self._eval_data_by_class[target_val].append(sample_dict)
-                    
+
+            self._refresh_class_match_label_space()
             _log(f"Loaded {len(self.eval_data)} evaluation samples into pool (split='{eval_split}', batch_size={self.eval_batch_size}).")
         except Exception as e:
             _log(f"Warning: Could not load eval dataset: {e}")
@@ -368,11 +446,16 @@ class Evaluator:
         """Return the next sliding window of eval samples and advance cursor."""
         pool_size = len(self.eval_data)
         start = getattr(self, '_eval_cursor', 0)
-        
+        batch_size = _resolve_eval_batch_size(getattr(self, 'eval_batch_size', pool_size), pool_size)
+        self.eval_batch_size = batch_size
+
+        if batch_size >= pool_size:
+            return list(self.eval_data), 0
+
         # Strategy conditionally creates balanced chunks 
         if self.strategy == 'class_match' and getattr(self, '_eval_data_by_class', None):
             classes = list(self._eval_data_by_class.keys())
-            samples_per_class = max(1, self.eval_batch_size // len(classes))
+            samples_per_class = max(1, batch_size // len(classes))
             
             window = []
             for c in classes:
@@ -390,9 +473,9 @@ class Evaluator:
                 
             import random
             random.shuffle(window)
-            return window[:self.eval_batch_size], start
+            return window[:batch_size], start
 
-        end = start + self.eval_batch_size
+        end = start + batch_size
         if end <= pool_size:
             window = self.eval_data[start:end]
         else:
@@ -479,6 +562,7 @@ class Evaluator:
             source_texts = []   # raw input texts for QAFactEval
             generated_responses = []  # full model responses for QAFactEval
             verbose_samples = []  # collected when self.verbose is True
+            other_predictions = 0
 
             for i, sample in enumerate(eval_window):
                 try:
@@ -510,10 +594,10 @@ class Evaluator:
                     pred = None
 
                     if self.strategy == "class_match":
-                        target_words = gold.split()
-                        response_words = response.lower().split()
-                        pred_words = response_words[: len(target_words)]
-                        pred = " ".join(pred_words)
+                        gold = self._normalize_gold_class_label(sample.get("target", ""))
+                        pred = self._normalize_class_match_prediction(response)
+                        if pred == self.class_match_other_label:
+                            other_predictions += 1
                     elif self.strategy == "regex_extract" and self.answer_regex:
                         try:
                             pred_match = re.search(self.answer_regex, response)
@@ -566,6 +650,11 @@ class Evaluator:
                     correct = sum(correct_list)
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
+                    if self.strategy == "class_match":
+                        _log(
+                            f"  Normalized class predictions: "
+                            f"{total - other_predictions} known-label, {other_predictions} other"
+                        )
 
                     if mf.get("compute_backward_transfer", False):
                         bwt_sum = 0.0

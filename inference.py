@@ -257,7 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., 'step_0100'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
+                        help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -280,8 +280,8 @@ if __name__ == "__main__":
                     resolved_checkpoint_path = ckpts[-1]["path"]
                     _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
             else:
-                candidate_path = ckpt_mgr.get_checkpoint_path(args.checkpoint)
-                if os.path.exists(candidate_path):
+                candidate_path = ckpt_mgr.resolve_checkpoint_path(args.checkpoint)
+                if candidate_path and os.path.exists(candidate_path):
                     resolved_checkpoint_path = candidate_path
                     _log(f"Resolved step '{args.checkpoint}' to: {resolved_checkpoint_path}")
                 else:

@@ -289,16 +289,67 @@ python evaluate.py --config configs/gsm8k_qualitative.yaml --step 300
 python evaluate.py --config configs/gsm8k_qualitative.yaml --list
 ```
 
-Results saved to: `output/qual_reasoning/eval_results/Qwen2.5-3B__gsm8k/<checkpoint>/eval_<timestamp>/`
+Results saved to: `output/qual_reasoning/eval_results/Qwen2.5-3B__gsm8k/<checkpoint>/eval_<timestamp>_<uid>/`
 
 The `--all-checkpoints` combined CSV is particularly powerful for this config — it lets you show a table correlating exact_match (answer correctness) with cot_anchor_count (reasoning structure) across steps, proving that both improve together.
 
+### PowerShell Copy-Paste Commands
+
+```powershell
+# Train with inline evaluation enabled
+python trainer.py --config configs/gsm8k_qualitative.yaml
+
+# Evaluate final checkpoint
+python evaluate.py --config configs/gsm8k_qualitative.yaml
+
+# Evaluate checkpoint step 300
+python evaluate.py --config configs/gsm8k_qualitative.yaml --step 300
+
+# Evaluate all checkpoints and build the combined comparison bundle
+python evaluate.py --config configs/gsm8k_qualitative.yaml --all-checkpoints
+
+# List saved checkpoints
+python evaluate.py --config configs/gsm8k_qualitative.yaml --list
+```
+
 ---
 
-## Regenerating Plots
+## Regenerating Evaluation Artifacts
 
-```bash
-python utils/plot_metrics.py output/qual_reasoning/logs/infinitune-qual-reasoning/<timestamp>/metrics.csv
+Use `python utils/plot_metrics.py ...` as the canonical regenerate command. It builds a fresh bundle containing plots, dashboards, insights, and `report.html`.
+
+### Latest inline training run -> fresh bundle
+
+```powershell
+$Run = Get-ChildItem "output/qual_reasoning/logs/infinitune-qual-reasoning" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/gsm8k_qualitative.yaml
+```
+
+### Latest inline training run -> fresh bundle in a custom directory
+
+```powershell
+$Run = Get-ChildItem "output/qual_reasoning/logs/infinitune-qual-reasoning" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $Run.FullName "metrics_clean.csv"
+if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
+python utils/plot_metrics.py $Csv --config configs/gsm8k_qualitative.yaml --out-dir .\my_gsm8k_qual_run_plots
+```
+
+### Latest decoupled single-checkpoint eval -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/qual_reasoning/eval_results/Qwen2.5-3B__gsm8k" -Directory -Recurse | Where-Object { $_.Name -like "eval_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "plots\eval_metrics.csv"
+python utils/plot_metrics.py $Csv --config configs/gsm8k_qualitative.yaml
+```
+
+### Latest all-checkpoints comparison -> fresh bundle
+
+```powershell
+$EvalRun = Get-ChildItem "output/qual_reasoning/eval_results/Qwen2.5-3B__gsm8k\all_checkpoints" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Csv = Join-Path $EvalRun.FullName "all_checkpoints_results.csv"
+python utils/plot_metrics.py $Csv --config configs/gsm8k_qualitative.yaml
 ```
 
 ---
@@ -328,12 +379,13 @@ This reduces networking overhead and focuses the trainer entirely on saving loca
 
 **Step 2: Locate your Checkpoint**
 After training is complete, your adapter weights are saved under the project's `output_dir`.
-- Locate the final checkpoint: `output/infinitune-qual-reasoning/checkpoint-final`
+- Easiest option: let InfiniTune resolve the newest saved adapter automatically with `--checkpoint latest`
+- If you need an explicit path, checkpoints live under `output/qual_reasoning/checkpoints/Qwen2.5-3B__gsm8k/run_<timestamp>_<uid>/final`
 
 **Step 3: Run Inference Server**
 Launch `inference.py` and pass the mapped checkpoint using the `--checkpoint` flag. This natively bypasses Kafka and locks the adapter statically:
 ```bash
-python inference.py --config configs/gsm8k_qualitative.yaml --checkpoint output/infinitune-qual-reasoning/checkpoint-final
+python inference.py --config configs/gsm8k_qualitative.yaml --checkpoint latest
 ```
 
 **Step 4: Test the Endpoint**

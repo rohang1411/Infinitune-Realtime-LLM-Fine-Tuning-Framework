@@ -6,6 +6,7 @@ outputs/
 .vscode/Docs/
 output/
 helper/
+.cursor/
 scratch/
 __pycache__/
 *.pyc
