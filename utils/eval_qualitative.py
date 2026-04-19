@@ -1039,6 +1039,10 @@ class QualitativeEvaluator:
         self._eval_cursor = end % pool_size
         return window
 
+    def reset_runtime_state(self):
+        """Reset sliding-window state without reloading the dataset."""
+        self._eval_cursor = 0
+
     # ──────────────────────────────────────────────────────────────────────────
     # Generation
     # ──────────────────────────────────────────────────────────────────────────
@@ -1050,6 +1054,7 @@ class QualitativeEvaluator:
         Returns (predictions, references) as parallel lists.
         Generates in high-speed batches seamlessly.
         """
+        was_training = model.training
         model.eval()
         predictions = []
         references = []
@@ -1095,7 +1100,7 @@ class QualitativeEvaluator:
 
                 prompt_token_len = inputs["input_ids"].shape[1]
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     output_ids = model.generate(**inputs, generation_config=gen_config)
 
                 # Exactly slice off only the newly generated dimension identically for all
@@ -1117,7 +1122,10 @@ class QualitativeEvaluator:
                         predictions.append("")
 
         self.tokenizer.padding_side = original_padding_side
-        model.train()
+        if was_training:
+            model.train()
+        else:
+            model.eval()
         return predictions, references
 
     # ──────────────────────────────────────────────────────────────────────────

@@ -189,14 +189,21 @@ def _generate_plots(metrics_over_time: list, out_dir: str, config: dict = None) 
 # Full-pool evaluation runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_evaluation(model, tokenizer, config: dict, device: torch.device) -> dict:
+def run_evaluation(
+    model,
+    tokenizer,
+    config: dict,
+    device: torch.device,
+    evaluator_bundle: dict | None = None,
+    run_quantitative: bool = True,
+    run_qualitative: bool = True,
+) -> dict:
     """
-    Run the full evaluation suite (quantitative + qualitative) and return
-    a flat dict of all metric values.
+    Run the enabled evaluation suite for one checkpoint and return a flat dict
+    of all metric values.
 
-    Unlike inline eval, this runs the ENTIRE eval pool (not just one window)
-    for a definitive, un-windowed score.  The sliding-window cursor is left
-    to wrap around naturally until all samples have been seen.
+    Unlike inline eval, this runs the entire configured evaluation pool for
+    the evaluators selected for this checkpoint.
     """
     from utils.eval_metrics_train import Evaluator
     from utils.eval_qualitative import QualitativeEvaluator
@@ -204,39 +211,61 @@ def run_evaluation(model, tokenizer, config: dict, device: torch.device) -> dict
 
     combined_metrics: dict = {}
 
-    # ── Quantitative evaluation ──────────────────────────────────────────────
     eval_cfg = config.get("evaluation", {})
     if eval_cfg.get("enabled", False):
-        _log("Running quantitative evaluation (full pool)...")
-        evaluator = Evaluator(
-            config, tokenizer, device,
-            tokenize_with_label_masking, pad_batch,
-        )
-        if evaluator.enabled and evaluator.eval_data:
-            # Force batch_size = full pool so we evaluate all samples at once
-            pool_size = len(evaluator.eval_data)
-            evaluator.eval_batch_size = pool_size
-            quant_metrics = evaluator.evaluate(model, step=0) or {}
-            combined_metrics.update(quant_metrics)
-            _log(f"Quantitative metrics: {list(quant_metrics.keys())}")
+        if run_quantitative:
+            _log("Running quantitative evaluation (full pool)...")
+            evaluator = (evaluator_bundle or {}).get("quantitative")
+            if evaluator is None:
+                evaluator = Evaluator(
+                    config, tokenizer, device,
+                    tokenize_with_label_masking, pad_batch,
+                )
+                if evaluator_bundle is not None:
+                    evaluator_bundle["quantitative"] = evaluator
+            else:
+                evaluator.tokenizer = tokenizer
+                evaluator.device = device
+            if evaluator.enabled and evaluator.eval_data:
+                pool_size = len(evaluator.eval_data)
+                evaluator.eval_batch_size = pool_size
+                quant_metrics = evaluator.evaluate(model, step=0) or {}
+                combined_metrics.update(quant_metrics)
+                _log(f"Quantitative metrics: {list(quant_metrics.keys())}")
+            else:
+                _log("Quantitative evaluator is disabled or has no data - skipping.")
         else:
-            _log("Quantitative evaluator is disabled or has no data — skipping.")
+            _log(
+                "Skipping quantitative evaluation at this checkpoint because "
+                f"evaluation.eval_interval={eval_cfg.get('eval_interval', 1)} does not select this step."
+            )
     else:
         _log("Quantitative evaluation disabled in config (evaluation.enabled: false).")
 
-    # ── Qualitative evaluation ───────────────────────────────────────────────
     ts_cfg = config.get("testing_strategy", {})
     if ts_cfg.get("enabled", False):
-        _log("Running qualitative evaluation (full pool)...")
-        qual_eval = QualitativeEvaluator(config, tokenizer, device)
-        if qual_eval.enabled and qual_eval.eval_data:
-            # Expand window to cover the full pool
-            qual_eval._eval_samples = len(qual_eval.eval_data)
-            qual_metrics = qual_eval.run(model, step=0) or {}
-            combined_metrics.update(qual_metrics)
-            _log(f"Qualitative metrics: {list(qual_metrics.keys())}")
+        if run_qualitative:
+            _log("Running qualitative evaluation (full pool)...")
+            qual_eval = (evaluator_bundle or {}).get("qualitative")
+            if qual_eval is None:
+                qual_eval = QualitativeEvaluator(config, tokenizer, device)
+                if evaluator_bundle is not None:
+                    evaluator_bundle["qualitative"] = qual_eval
+            else:
+                qual_eval.tokenizer = tokenizer
+                qual_eval.device = device
+            if qual_eval.enabled and qual_eval.eval_data:
+                qual_eval._eval_samples = len(qual_eval.eval_data)
+                qual_metrics = qual_eval.run(model, step=0) or {}
+                combined_metrics.update(qual_metrics)
+                _log(f"Qualitative metrics: {list(qual_metrics.keys())}")
+            else:
+                _log("Qualitative evaluator is disabled or has no data - skipping.")
         else:
-            _log("Qualitative evaluator is disabled or has no data — skipping.")
+            _log(
+                "Skipping qualitative evaluation at this checkpoint because "
+                f"testing_strategy.eval_interval={ts_cfg.get('eval_interval', 1)} does not select this step."
+            )
     else:
         _log("Qualitative evaluation disabled in config (testing_strategy.enabled: false).")
 
@@ -247,7 +276,14 @@ def run_evaluation(model, tokenizer, config: dict, device: torch.device) -> dict
 # Main evaluation flow
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_checkpoint(ckpt_path: str, config: dict, config_file: str) -> dict:
+def evaluate_checkpoint(
+    ckpt_path: str,
+    config: dict,
+    config_file: str,
+    evaluator_bundle: dict | None = None,
+    run_quantitative: bool = True,
+    run_qualitative: bool = True,
+) -> dict:
     """Load a checkpoint and run evaluation. Returns the combined metrics dict."""
     from utils.checkpoint_manager import CheckpointManager
 
@@ -271,7 +307,15 @@ def evaluate_checkpoint(ckpt_path: str, config: dict, config_file: str) -> dict:
         _log(f"Loading checkpoint: {ckpt_path}")
         model, tokenizer = ckpt_manager.load(ckpt_path, device=str(device))
 
-    metrics = run_evaluation(model, tokenizer, config, device)
+    metrics = run_evaluation(
+        model,
+        tokenizer,
+        config,
+        device,
+        evaluator_bundle=evaluator_bundle,
+        run_quantitative=run_quantitative,
+        run_qualitative=run_qualitative,
+    )
 
     # Free GPU/MPS memory
     del model
@@ -325,7 +369,11 @@ def main():
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
 
-    from utils.checkpoint_manager import CheckpointManager
+    from utils.checkpoint_manager import (
+        CheckpointManager,
+        get_evaluation_schedule,
+        select_evaluation_checkpoints,
+    )
     ckpt_manager = CheckpointManager(config, config_path=args.config)
 
     # ── --list ───────────────────────────────────────────────────────────────
@@ -346,19 +394,42 @@ def main():
 
     # ── Resolve which checkpoints to evaluate ────────────────────────────────
     if args.all_checkpoints:
-        checkpoints = ckpt_manager.list_checkpoints()
-        if not checkpoints:
+        available_checkpoints = ckpt_manager.list_checkpoints()
+        if not available_checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(1)
-            
-        # Prepend the base model for a step 0 baseline
+
+        checkpoints = select_evaluation_checkpoints(available_checkpoints, config)
+        if not checkpoints:
+            _log(
+                "No checkpoints matched the configured decoupled evaluation cadence. "
+                "Check evaluation.eval_interval / testing_strategy.eval_interval."
+            )
+            sys.exit(1)
+
+        schedule = get_evaluation_schedule(config)
+        _log(
+            "Checkpoint selection for decoupled evaluation: "
+            f"{len(checkpoints)} of {len(available_checkpoints)} saved checkpoints selected "
+            f"(quantitative every {schedule['quantitative_interval']} step(s) if enabled, "
+            f"qualitative every {schedule['qualitative_interval']} step(s) if enabled, final always included)."
+        )
+
         checkpoints.insert(0, {
             "name": "base_model",
             "step": 0,
             "path": "base_model",
             "timestamp": None,
+            "run_quantitative": schedule["quantitative_enabled"],
+            "run_qualitative": schedule["qualitative_enabled"],
+            "evaluation_targets": [
+                target for target, enabled in (
+                    ("quantitative", schedule["quantitative_enabled"]),
+                    ("qualitative", schedule["qualitative_enabled"]),
+                ) if enabled
+            ],
         })
-        _log(f"Found {len(checkpoints) - 1} checkpoint(s). Added base_model for baseline comparison.")
+        _log(f"Added base_model for baseline comparison. Evaluating {len(checkpoints)} checkpoint target(s) total.")
     elif args.checkpoint_dir:
         if not os.path.isdir(args.checkpoint_dir):
             _log(f"ERROR: Checkpoint directory not found: {args.checkpoint_dir}")
@@ -400,16 +471,29 @@ def main():
 
     # ── Run evaluation for each checkpoint ───────────────────────────────────
     all_results = []  # list of {step, checkpoint, **metrics} for multi-ckpt plots
+    evaluator_bundle: dict = {}
 
     for ckpt in checkpoints:
         ckpt_path = ckpt["path"]
         ckpt_name = ckpt["name"]
+        run_quantitative = ckpt.get("run_quantitative", config.get("evaluation", {}).get("enabled", False))
+        run_qualitative = ckpt.get("run_qualitative", config.get("testing_strategy", {}).get("enabled", False))
+        targets = ckpt.get("evaluation_targets") or ((["quantitative"] if run_quantitative else []) + (["qualitative"] if run_qualitative else []))
         _log(f"\n{'='*60}")
         _log(f"Evaluating checkpoint: {ckpt_name}  ({ckpt_path})")
+        if targets:
+            _log(f"Active decoupled evaluators for this checkpoint: {', '.join(targets)}")
         _log(f"{'='*60}")
 
         try:
-            metrics = evaluate_checkpoint(ckpt_path, config, args.config)
+            metrics = evaluate_checkpoint(
+                ckpt_path,
+                config,
+                args.config,
+                evaluator_bundle=evaluator_bundle,
+                run_quantitative=run_quantitative,
+                run_qualitative=run_qualitative,
+            )
         except Exception as exc:
             _log(f"ERROR: Evaluation failed for '{ckpt_name}': {exc}")
             import traceback; traceback.print_exc()

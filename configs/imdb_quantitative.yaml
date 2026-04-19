@@ -154,7 +154,7 @@ evaluation:
 testing_strategy:
   enabled: false               # Set to true to enable soft semantic vetting
   method: "" # semantic_similarity | keyword_density | structural_cot | structured_slot_coverage
-  eval_interval: 50
+  eval_interval: 100
   eval_samples: 20
   eval_pool_size: 100
   max_new_tokens: 6            # Keep short to match the classification task

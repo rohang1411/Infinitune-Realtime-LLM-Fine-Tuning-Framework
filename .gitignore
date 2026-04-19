@@ -8,8 +8,12 @@ output/
 helper/
 .cursor/
 scratch/
+
+# Python bytecode / cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/

@@ -513,6 +513,16 @@ class Evaluator:
         self._eval_cursor = end % pool_size
         return window, start
 
+    def reset_runtime_state(self):
+        """Reset online evaluation state without reloading the dataset."""
+        self._eval_cursor = 0
+        self.past_sample_accuracies = {}
+        self._best_eval = {}
+        self._last_eval_end_wall = None
+        self._aauc_history = []
+        if hasattr(self, "_eval_cursor_by_class"):
+            self._eval_cursor_by_class = collections.defaultdict(int)
+
     def _generate_single_response(self, model, prompt_text: str, generation_config: GenerationConfig) -> str:
         inputs = self.tokenizer(
             prompt_text,
@@ -559,9 +569,10 @@ class Evaluator:
                     generated_ids = output_ids[:, prompt_token_len:]
                     responses = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-                    for prompt_text, sample, response in zip(prompt_texts, batch_samples, responses):
+                    for offset, (prompt_text, sample, response) in enumerate(zip(prompt_texts, batch_samples, responses)):
                         records.append(
                             {
+                                "sample_index": batch_start + offset,
                                 "prompt_text": prompt_text,
                                 "sample": sample,
                                 "response": response.strip(),
@@ -577,7 +588,7 @@ class Evaluator:
                         f"{batch_start}..{batch_start + len(batch_samples) - 1}: {exc}. "
                         f"Falling back to per-sample generation."
                     )
-                    for prompt_text, sample in zip(prompt_texts, batch_samples):
+                    for offset, (prompt_text, sample) in enumerate(zip(prompt_texts, batch_samples)):
                         try:
                             response = self._generate_single_response(model, prompt_text, generation_config)
                         except Exception as sample_exc:
@@ -585,6 +596,7 @@ class Evaluator:
                             continue
                         records.append(
                             {
+                                "sample_index": batch_start + offset,
                                 "prompt_text": prompt_text,
                                 "sample": sample,
                                 "response": response,
@@ -684,6 +696,7 @@ class Evaluator:
 
             for i, record in enumerate(generation_records):
                 try:
+                    sample_index = record["sample_index"]
                     sample = record["sample"]
                     prompt_text = record["prompt_text"]
                     response = record["response"]
@@ -720,11 +733,11 @@ class Evaluator:
                     if self.verbose:
                         mark = "\u2713" if pred == gold else "\u2717"
                         _log(
-                            f"  [{mark}] sample {i}: expected='{sample.get('target', '')}' "
+                            f"  [{mark}] sample {sample_index}: expected='{sample.get('target', '')}' "
                             f"got='{response[:80]}'"
                         )
                         verbose_samples.append({
-                            "sample_idx": i,
+                            "sample_idx": sample_index,
                             "input": prompt_text[:200].replace("\n", " "),
                             "target": str(sample.get("target", ""))[:200].replace("\n", " "),
                             "prediction": response[:200].replace("\n", " "),
@@ -766,8 +779,8 @@ class Evaluator:
                     if mf.get("compute_backward_transfer", False):
                         bwt_sum = 0.0
                         bwt_count = 0
-                        for i, is_correct in enumerate(correct_list):
-                            sample_idx = (window_start + i) % len(self.eval_data)
+                        for list_idx, is_correct in enumerate(correct_list):
+                            sample_idx = (window_start + generation_records[list_idx]["sample_index"]) % len(self.eval_data)
                             curr_acc = 1.0 if is_correct else 0.0
                             
                             if sample_idx in self.past_sample_accuracies:
