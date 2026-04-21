@@ -40,6 +40,13 @@ A distributed framework for **continuously fine-tuning Large Language Models in 
 
 ---
 
+## Documentation
+
+- Start with the [docs index](docs/README.md) for configuration guides and evaluation walkthroughs.
+- For a version-oriented summary of this major release, see [Infinitune v2 Release Notes](docs/releases/infinitune-v2.md).
+
+---
+
 ## What is InfiniTune?
 
 Traditional fine-tuning requires a static dataset, an offline training run, and a manual deployment step. **InfiniTune removes all three bottlenecks.**
