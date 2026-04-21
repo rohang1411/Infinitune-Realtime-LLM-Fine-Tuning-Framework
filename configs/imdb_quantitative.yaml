@@ -1,0 +1,169 @@
+# ============================================================
+# InfiniTune Configuration — IMDb Sentiment Analysis
+# Task Type : Qualitative / Classification (Causal LM head)
+# Model     : distilgpt2 (82M params) — chosen for fast testing
+# ============================================================
+
+project:
+  name: "infinitune-imdb-sentiment"
+  output_dir: "./output/imdb"
+
+# --- Model ---
+model:
+  name: "distilgpt2"
+  task_type: "CAUSAL_LM"
+  precision: "fp32"           # MPS (Apple Silicon) fp16 fallback enabled natively or via trainer
+  max_seq_length: 512          # IMDb reviews can be 2000+ chars; 256 was truncating heavily
+
+# --- LoRA Adapter ---
+lora:
+  r: 16
+  alpha: 32                    # ratio of 2 for better capacity and stable scaling
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "c_attn"
+    - "c_proj"
+
+# --- Dataset ---
+dataset:
+  name: "imdb"
+  config_name: null
+  split: "train"
+  eval_split: "test"
+  column_mapping:
+    input_col: "text" # raw dataset column for input
+    target_col: "label" # raw dataset column for target
+  label_map: # maps numeric IDs → human-readable strings
+    0: "negative"
+    1: "positive"
+  shuffle: true # shuffle before streaming (critical for sorted datasets)
+  shuffle_seed: 42 # null for non-deterministic shuffle
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "Review: {{ input }}\nSentiment:"
+  response_template: " {{ target }}"
+  hash_column: "input" # which standardized column to hash for dedup
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 15
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5 # Drops purely symbol-based garbage
+      max_repetition_ratio: 0.2 # (Compressed Size / Original Size) - Drops spam like "A A A A"
+    domain_specific:
+      require_numeric_content: null # Boolean
+      custom_regex_must_match: null # List of strings
+      custom_regex_must_not_match: null # List of strings
+      chat_structure:
+        min_turns: null # Integer
+        require_assistant_final: null # Boolean
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-imdb"
+  lora_updates_topic: "lora-updates-imdb"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
+  producer_send_interval: 0.1
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  test_mode: true # true = train entire dataset, stop all services on EOF
+  batch_size: 4
+  gradient_accumulation_steps: 4  # effective batch = 16
+  gradient_checkpointing: false   # disabled to maximize throughput speed (trades VRAM for compute speed)
+  learning_rate: 1e-4             # lower base LR for larger effective batch
+  max_steps: 1563 # spans exactly dataset_size (25k) / effective batch (16)
+  logging_steps: 1
+  weight_push_interval: 60 # seconds between LoRA pushes to Kafka
+  lr_scheduler:
+    type: "cosine_with_warmup"   # cosine_with_warmup | linear | constant
+    warmup_steps: 50             # linear warmup from 0 → learning_rate
+    min_lr_ratio: 0.01           # floor LR = learning_rate * min_lr_ratio
+    T_max: 1563                  # cosine period — must match max_steps for full decay curve
+  save_checkpoints:
+    enabled: true                # Save LoRA adapter to disk periodically
+    save_every_steps: 50         # Matches eval_interval natively completely independently organically safely mapping successfully
+    save_final: true             # Always save a 'final' checkpoint at training end
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 6 # classification: keep short to avoid rambling
+  do_sample: false # deterministic for class labels
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Evaluation (Polymorphic) ---
+evaluation:
+  enabled: true
+  decoupled: true # If true, disables inline eval during training (run evaluate.py later)
+  strategy: "class_match" # class_match | regex_extract | perplexity
+  eval_interval: 100 # evaluate every N optimizer steps
+  eval_pool_size: 4000 # total samples loaded from eval split (shuffled)
+  eval_batch_size: "full_pool" # evaluate the full shuffled pool each time to remove window-composition noise
+  verbose: false # if true, print per-sample predictions during eval
+  answer_regex: null # not used for class_match
+  other_label: "other" # fallback bucket for class_match generations that do not start with a known label
+  plotting:
+    rolling_average_enabled: true
+    rolling_average_window: 11
+    rolling_average_include:
+      - "accuracy"
+      - "f1"
+      - "mcc"
+      - "kappa"
+      - "exact_match"
+      - "continual_learning_stability"
+  # Optional: override which metrics run (defaults follow strategy; booleans only).
+  # classification (class_match) defaults: all generation + structure metrics on.
+  # regex_extract defaults: accuracy + exact_match only (F1/MCC/kappa off).
+  # perplexity strategy: only forward loss + perplexity.
+  metrics:
+    compute_loss: true # eval_loss + perplexity (recommended)
+    compute_accuracy: true
+    compute_exact_match: true
+    compute_f1: true # macro F1 after class_match predictions are normalized to known labels + other
+    compute_mcc: true
+    compute_kappa: true
+    compute_answer_overlap_f1: false # Token-level overlap (not used for discrete classification)
+    # If distinct gold/pred labels exceed this, F1/MCC/kappa are skipped (open-ended safety).
+    max_distinct_labels_for_structure_metrics: 32
+    # QAFactEval: factual consistency between source input and generated response.
+    # Opt-in (default false) — requires ~120 MB model download on first use.
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"  # optional override
+    # Online diagnostics (stable eval pool recommended; sliding window can mix distribution shift with true forgetting)
+    compute_forgetting: true # peak-vs-current on tracked scalars; see forgetting_track_metrics
+    compute_eval_cycle_time: true # wall seconds since previous eval ended (training + I/O between evals)
+    forgetting_track_metrics: ["accuracy", "f1", "exact_match", "eval_loss", "perplexity"] # subset of supported keys
+
+# --- Qualitative Evaluation ---
+# This block matches the structure of qualitative configs.
+# Strategy 'semantic_similarity' is used as a proxy for 'sentiment vibes' matching.
+testing_strategy:
+  enabled: false               # Set to true to enable soft semantic vetting
+  method: "" # semantic_similarity | keyword_density | structural_cot | structured_slot_coverage
+  eval_interval: 100
+  eval_samples: 20
+  eval_pool_size: 100
+  max_new_tokens: 6            # Keep short to match the classification task
+  consistency_runs: 1
+  consistency_temperature: 0.7
+  eval_batch_size: 16
+
+  # Method-specific superset fields (null if unused)
+  sentence_model: "sentence-transformers/all-MiniLM-L6-v2"
+  keywords: null
+  logic_anchors: null
+  e2e_nlg_options: null

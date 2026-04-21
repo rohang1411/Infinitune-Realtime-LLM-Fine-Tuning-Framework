@@ -1,0 +1,187 @@
+# ============================================================
+# InfiniTune Configuration — Qualitative: Structured Data Generation (E2E NLG)
+# Task Type   : Causal LM / Conditional Language Modeling
+# Dataset     : GEM/e2e_nlg
+# Model       : gpt2-medium (345M params base model)
+# Eval Method : Structured Data Slot Coverage & Consistency
+#
+# Objective:
+#   Prove the model has successfully absorbed structured generation routing.
+#   A base model zero-shot will fail to correctly verbalize a meaning
+#   representation (MR) completely. Post-training, it consistently covers all
+#   specified slots natively without an LLM Judge.
+#
+# Run:
+#   python producer.py --config configs/e2e_qualitative.yaml
+#   python trainer.py  --config configs/e2e_qualitative.yaml
+#   python evaluate.py --config configs/e2e_qualitative.yaml
+# ============================================================
+
+project:
+  name: "infinitune-e2e-nlg"
+  output_dir: "./output/e2e"
+
+# --- Model ---
+model:
+  name: "gpt2-medium"      # base model, not instruct
+  task_type: "CAUSAL_LM"
+  precision: "fp32"
+  max_seq_length: 128            # MR inputs + descriptions are very short
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules: ["c_attn", "c_proj"]
+
+# --- Dataset ---
+dataset:
+  name: "parquet"
+  data_files:
+    train: "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+    validation: "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet"
+  config_name: null
+  split: "train"
+  eval_split: "validation"
+  column_mapping:
+    input_col: "meaning_representation"
+    target_col: "target"
+  label_map: null
+  shuffle: true
+  shuffle_seed: 42
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "MR: {{ input }}\nDescription:"
+  response_template: " {{ target }}"
+  hash_column: "input"
+
+# --- Data & Filtering ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 5             # Remove empty MRs
+      max_chars: 1000
+      min_alphanumeric_ratio: 0.5
+      max_repetition_ratio: 0.5  # Sometimes descriptions say 'friendly family friendly' etc.
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-e2e"
+  lora_updates_topic: "lora-updates-e2e"
+  enable_lora_streaming: false
+  producer_send_interval: 0.05
+  consumer_group_trainer: "trainer-group-e2e"
+  consumer_group_inference: "inference-api-group-e2e"
+
+# --- Training ---
+training:
+  test_mode: true              # Train on full dataset
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true # Enabled to save VRAM by recomputing activations
+  learning_rate: 5e-5
+  max_steps: 2629              # 42,061 examples / (8 * 2) effective batch size ~= 2629 steps for 1 Full Epoch
+  logging_steps: 1
+  weight_push_interval: 60
+  lr_scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 2629                # Align with max_steps
+  save_checkpoints:
+    enabled: true
+    save_every_steps: 200      # Synced explicitly with eval_interval
+    save_final: true
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 60
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Quantitative Evaluation ---
+# We compute perplexity and answer_overlap_f1 (comparable to ROUGE/BLEU)
+# on the full validation pool.
+evaluation:
+  enabled: true
+  decoupled: true
+  strategy: "perplexity"
+  eval_interval: 200            # Synced explicitly with save_every_steps
+  eval_pool_size: 4672          # Full validation dataset (4,672 samples)
+  eval_batch_size: 334          # 334 samples * 14 evals (including final) = 4676 (perfectly covers the 4672 pool)
+  verbose: false
+  answer_regex: null
+  metrics:
+    compute_loss: true
+    compute_accuracy: false
+    compute_exact_match: false
+    compute_f1: false
+    compute_answer_overlap_f1: true   # token-level F1
+    compute_mcc: false
+    compute_kappa: false
+    compute_forgetting: false
+
+# --- Qualitative Evaluation ---
+# Evaluates slot representation visually and mathematically
+testing_strategy:
+  enabled: true
+  method: "structured_slot_coverage"
+  eval_interval: 200            # Synced explicitly with save_every_steps
+  eval_samples: 150             # Reduced from 334 to 150 to cut inference time by 55% during online training.
+  eval_pool_size: 4672          # Target the full validation dataset pool
+  max_new_tokens: 60
+  consistency_runs: 3           # Reduced from 10 to exactly 3 for lightning fast inline iterations
+  eval_batch_size: 32           # Target fast parallelized batched generator chunks
+  consistency_temperature: 0.7
+  slot_keywords: null           # Dynamic parsed from MR natively
+  logic_anchors: null
+  sentence_model: null
+
+  # ── E2E NLG specific options ─────────────────────────────────────────────────
+  # These keys are ONLY read when method == "structured_slot_coverage".
+  # They are fully optional — configs without this block behave identically.
+  e2e_nlg_options:
+    # Per-slot coverage tracking.
+    # Each name listed here produces a separate metric: qual_slot_<name>_coverage
+    # Slot names must match the keys used in the MR string, e.g. "familyFriendly"
+    track_per_slot:
+      - "name"
+      - "eatType"
+      - "food"
+      - "priceRange"
+      - "customer rating"
+      - "area"
+      - "familyFriendly"
+      - "near"
+
+    # Negation-aware slot checkers.
+    # Maps slot_name → checker_type.
+    # "boolean_negation": detects positive/negative phrasing rather than simple substring.
+    # Leave empty or omit for pure substring matching on all slots.
+    slot_checkers:
+      familyFriendly: "boolean_negation"
+
+    # Pinned anchor MRs — evaluated at EVERY checkpoint for direct cross-step comparison.
+    # Span difficulty: 2-slot easy → 7-slot hard, include familyFriendly yes/no variants.
+    # Add or remove anchors freely; metric names adjust automatically.
+    pinned_anchors:
+      - "name[The Punter], eatType[coffee shop], priceRange[less than £20], near[Café Sicilia]"
+      - "name[Aromi], eatType[coffee shop], priceRange[cheap], area[city centre]"
+      - "name[The Punter], customer rating[3 out of 5], area[riverside]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[cheap], customer rating[average]"
+      - "name[The Eagle], eatType[coffee shop], food[English], customer rating[average], area[riverside], familyFriendly[no], near[Burger King]"
+      - "name[The Punter], eatType[coffee shop], food[English], customer rating[high], familyFriendly[yes], near[Café Sicilia]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[high], customer rating[average], area[city centre], familyFriendly[yes]"
+      - "name[Browns Cambridge], eatType[coffee shop], food[English], customer rating[5 out of 5], area[city centre], familyFriendly[yes], near[Crowne Plaza Hotel]"
+      - "name[The Eagle], eatType[coffee shop], food[English], priceRange[cheap], customer rating[average], area[city centre], familyFriendly[yes], near[Burger King]"
+      - "name[Fitzbillies], eatType[coffee shop], food[Chinese], priceRange[moderate], customer rating[1 out of 5], area[riverside], familyFriendly[no]"

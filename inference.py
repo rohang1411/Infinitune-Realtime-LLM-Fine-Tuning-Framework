@@ -1,37 +1,32 @@
 import time
 import io
 import json
+import argparse
 import torch
 import threading
 import queue
+import os
+import yaml
 from kafka import KafkaConsumer
+from utils.checkpoint_manager import CheckpointManager
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig
 )
 from peft import LoraConfig, get_peft_model, PeftModel
-from flask import Flask, request, jsonify # Added Flask imports
+from flask import Flask, request, jsonify
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-KAFKA_BROKER = "localhost:9092"
-LORA_UPDATES_TOPIC = "lora-updates"
-BASE_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct" 
-LORA_CONFIG = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    target_modules=["self_attn.q_proj", "self_attn.v_proj"], # Must match trainer
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_NEW_TOKENS = 100 
-FLASK_HOST = "localhost" # Use '0.0.0.0' to make accessible on network
-FLASK_PORT = 5000
+def _ts():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def _log(msg):
+    print(f"[{_ts()}][INFERENCE] {msg}", flush=True)
+
+def load_config(config_path):
+    """Load configuration from a YAML file."""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
 
 # --------------------------------------------------
 # Helper Functions
@@ -45,109 +40,161 @@ def deserialize_tensor(value_bytes):
 # --------------------------------------------------
 # Kafka Consumer Thread
 # --------------------------------------------------
-def kafka_consumer_thread(update_queue: queue.Queue):
+_DONE_SENTINEL = ("__done__", None)
+
+def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
     Listens to the Kafka topic for LoRA weight updates and puts them in a queue.
-    (No changes from previous version)
+    Stops gracefully when it receives a '__done__' signal from the trainer.
     """
-    print(f"Consumer thread started, listening to topic '{LORA_UPDATES_TOPIC}'...")
-    consumer = None # Initialize consumer to None
+    kafka_cfg = config['kafka']
+    topic = kafka_cfg['lora_updates_topic']
+    _log(f"Consumer thread started, listening to topic '{topic}'...")
+    consumer = None
     try:
+        consumer_timeout_ms = int(kafka_cfg.get('consumer_timeout_ms', 1000))
+        poll_timeout_ms = int(kafka_cfg.get('poll_timeout_ms', 1000))
+        _log(f"Connecting KafkaConsumer: bootstrap_servers={kafka_cfg['bootstrap_servers']}, group_id='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}', consumer_timeout_ms={consumer_timeout_ms}, poll_timeout_ms={poll_timeout_ms}")
         consumer = KafkaConsumer(
-            LORA_UPDATES_TOPIC,
-            bootstrap_servers=[KAFKA_BROKER],
-            key_deserializer=lambda k: k.decode("utf-8") if k else None, 
-            value_deserializer=deserialize_tensor, 
-            group_id="inference-api-group", # Changed group ID slightly
-            auto_offset_reset="latest", 
-            consumer_timeout_ms=1000 
+            topic,
+            bootstrap_servers=kafka_cfg['bootstrap_servers'],
+            key_deserializer=lambda k: k.decode("utf-8") if k else None,
+            value_deserializer=deserialize_tensor,
+            group_id=kafka_cfg.get('consumer_group_inference', 'inference-api-group'),
+            auto_offset_reset="latest",
+            consumer_timeout_ms=consumer_timeout_ms
         )
         
-        while True: 
-            messages = consumer.poll(timeout_ms=1000) # Poll for messages
-            if not messages: # No messages, continue loop
+        received_count = 0
+        last_heartbeat_time = time.time()
+        heartbeat_every_s = 5.0
+
+        while True:
+            messages = consumer.poll(timeout_ms=poll_timeout_ms)
+            if not messages:
+                 now = time.time()
+                 if now - last_heartbeat_time >= heartbeat_every_s:
+                     _log(f"Waiting for LoRA updates... received_count={received_count}, queue_size={update_queue.qsize()}")
+                     last_heartbeat_time = now
                  time.sleep(0.1)
                  continue
 
+            done = False
             for tp, records in messages.items():
                 for message in records:
+                    # Trainer sends '__done__' after final weight push to signal
+                    # that training is over and no more updates will arrive.
+                    if message.key == "__done__":
+                        _log("Received training-done signal from trainer. Stopping LoRA listener.")
+                        done = True
+                        break
                     if message.key and message.value is not None:
-                        # print(f"Received update for layer: {message.key}") # Can be verbose
+                        received_count += 1
                         update_queue.put((message.key, message.value))
                     else:
-                        print(f"Warning: Received message with missing key or value.")
+                        _log("Warning: Received message with missing key or value.")
+                if done:
+                    break
+            if done:
+                # Put sentinel so the weight-application thread also stops.
+                update_queue.put(_DONE_SENTINEL)
+                break
 
     except Exception as e:
-        print(f"Error in Kafka consumer thread: {e}")
+        _log(f"Error in Kafka consumer thread: {e}")
     finally:
         if consumer:
             consumer.close()
-        print("Consumer thread finished.")
+        _log("Consumer thread finished.")
 
 
 # --------------------------------------------------
 # Weight Application Thread
 # --------------------------------------------------
-def weight_application_thread(model: PeftModel, update_queue: queue.Queue, model_lock: threading.Lock):
+def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
+                              model_lock: threading.Lock, device: str):
     """
     Applies LoRA weight updates from the queue to the model.
-    (No changes from previous version)
+    Stops when it receives the _DONE_SENTINEL from the consumer thread.
     """
-    print("Weight application thread started...")
+    _log("Weight application thread started...")
+    applied_batches = 0
     while True:
         try:
             # Wait for the first update (blocking)
-            layer_name, tensor = update_queue.get(block=True, timeout=None) 
-            
+            item = update_queue.get(block=True, timeout=None)
+
+            # Check for the done sentinel pushed by the consumer thread
+            if item == _DONE_SENTINEL:
+                _log("Weight application thread received done signal. Stopping.")
+                break
+
+            layer_name, tensor = item
             updates_to_apply = {layer_name: tensor}
             
-            # Process any other updates currently in the queue non-blockingly
+            # Drain any other updates currently in the queue non-blockingly
             while True:
                 try:
-                    layer_name, tensor = update_queue.get(block=False)
-                    updates_to_apply[layer_name] = tensor
+                    item = update_queue.get(block=False)
+                    if item == _DONE_SENTINEL:
+                        _log("Weight application thread received done signal. Applying remaining batch, then stopping.")
+                        # Apply what we have, then break both loops
+                        break
+                    name, t = item
+                    updates_to_apply[name] = t
                 except queue.Empty:
-                    break # No more updates in the queue for now
+                    break
             
             if updates_to_apply:
-                # print(f"Applying {len(updates_to_apply)} weight updates...") # Can be verbose
-                with model_lock: # Acquire lock before modifying model state
+                _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
+                with model_lock:
                     updates_to_apply_on_device = {
-                        k: v.to(DEVICE) for k, v in updates_to_apply.items()
+                        k: v.to(device) for k, v in updates_to_apply.items()
                     }
-                    model.load_state_dict(updates_to_apply_on_device, strict=False) 
-                # print("Weight updates applied successfully.") # Can be verbose
+                    model.load_state_dict(updates_to_apply_on_device, strict=False)
+                applied_batches += 1
+                _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
+
+            # If we hit the sentinel inside the drain loop, stop after this apply
+            if item == _DONE_SENTINEL:
+                break
                 
         except queue.Empty:
-             # This happens if the initial get times out (if timeout is set)
              continue
         except Exception as e:
-            print(f"Error applying weights: {e}")
-            time.sleep(1) 
+            _log(f"Error applying weights: {e}")
+            time.sleep(1)
 
 # --------------------------------------------------
-# Inference Function (Internal logic unchanged)
+# Inference Function
 # --------------------------------------------------
-def generate_text(prompt: str, model: PeftModel, tokenizer: AutoTokenizer, model_lock: threading.Lock):
+def generate_text(prompt: str, model: PeftModel, tokenizer: AutoTokenizer,
+                  model_lock: threading.Lock, device: str, inference_cfg: dict):
     """
     Generates text using the current state of the LoRA-adapted model.
+    Returns only the completion (new tokens), not the echoed prompt.
     """
-    # print(f"\nRunning inference for prompt: '{prompt[:50]}...'") # Logged in API route now
-    with model_lock: # Acquire lock to ensure model state is stable during generation
-        inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    with model_lock:
+        start = time.time()
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt_token_len = inputs['input_ids'].shape[1]
         
         generation_config = GenerationConfig(
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True, 
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id 
+            max_new_tokens=inference_cfg.get('max_new_tokens', 100),
+            do_sample=bool(inference_cfg.get('do_sample', True)),
+            temperature=inference_cfg.get('temperature', 0.7),
+            top_p=inference_cfg.get('top_p', 0.9),
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
         
         with torch.no_grad(): 
             outputs = model.generate(**inputs, generation_config=generation_config)
-            
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Slice off the prompt tokens and decode only the generated completion
+        generated_ids = outputs[0, prompt_token_len:]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        _log(f"generate_text completed in {time.time() - start:.2f}s (prompt_len={len(prompt)}, gen_tokens={len(generated_ids)})")
         
     return generated_text
 
@@ -156,11 +203,13 @@ def generate_text(prompt: str, model: PeftModel, tokenizer: AutoTokenizer, model
 # --------------------------------------------------
 app = Flask(__name__)
 
-# Global variables to hold the model, tokenizer, and lock
+# Global variables to hold the model, tokenizer, lock, and config
 # These will be initialized in the main block
 model_global = None
 tokenizer_global = None
 model_lock_global = None
+device_global = None
+config_global = None
 
 @app.route('/generate', methods=['POST'])
 def handle_generate():
@@ -183,7 +232,10 @@ def handle_generate():
     print(f"Received generation request for prompt: '{prompt[:80]}...'")
     try:
         # Call the existing generation function using global objects
-        generated_text = generate_text(prompt, model_global, tokenizer_global, model_lock_global)
+        generated_text = generate_text(
+            prompt, model_global, tokenizer_global, model_lock_global,
+            device_global, config_global['inference']
+        )
         end_time = time.time()
         print(f"Generation finished in {end_time - start_time:.2f} seconds.")
         return jsonify({"generated_text": generated_text})
@@ -201,34 +253,100 @@ def health_check():
 # Main Execution Block
 # --------------------------------------------------
 if __name__ == "__main__":
-    print("Initializing inference server with API endpoint...")
-    print(f"Using device: {DEVICE}")
+    parser = argparse.ArgumentParser(description="InfiniTune Inference Server")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="Path to configuration YAML file")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
+    args = parser.parse_args()
 
-    # 1. Load the base model and tokenizer
-    print(f"Loading base model: {BASE_MODEL_NAME}")
+    config = load_config(args.config)
+    config_global = config
+    _log(f"Loaded config: {args.config}")
+
+    # Resolve checkpoint path if provided
+    resolved_checkpoint_path = None
+    if args.checkpoint:
+        if os.path.isdir(args.checkpoint):
+            resolved_checkpoint_path = args.checkpoint
+        else:
+            ckpt_mgr = CheckpointManager(config)
+            if args.checkpoint.lower() == "latest":
+                ckpts = ckpt_mgr.list_checkpoints()
+                if not ckpts:
+                    _log("Warning: '--checkpoint latest' requested but no checkpoints found. Falling back to base model with empty LoRA adapter.")
+                    resolved_checkpoint_path = None
+                else:
+                    resolved_checkpoint_path = ckpts[-1]["path"]
+                    _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
+            else:
+                candidate_path = ckpt_mgr.resolve_checkpoint_path(args.checkpoint)
+                if candidate_path and os.path.exists(candidate_path):
+                    resolved_checkpoint_path = candidate_path
+                    _log(f"Resolved step '{args.checkpoint}' to: {resolved_checkpoint_path}")
+                else:
+                    _log(f"FATAL: Checkpoint '{args.checkpoint}' not found locally at '{candidate_path}' and is not a valid directory.")
+                    exit(1)
+
+    model_cfg = config['model']
+    lora_cfg = config['lora']
+    inference_cfg = config['inference']
+    kafka_cfg = config['kafka']
+
+    # Build LoRA config from YAML (must match trainer)
+    LORA_CONFIG = LoraConfig(
+        r=lora_cfg['r'],
+        lora_alpha=lora_cfg['alpha'],
+        target_modules=lora_cfg['target_modules'],
+        lora_dropout=lora_cfg.get('dropout', 0.05),
+        bias=lora_cfg.get('bias', 'none'),
+        task_type=model_cfg.get('task_type', 'CAUSAL_LM'),
+    )
+
+    # Determine device
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+    elif torch.backends.mps.is_available():
+        DEVICE = "mps"
+    else:
+        DEVICE = "cpu"
+    device_global = DEVICE
+
+    _log("Initializing inference server with API endpoint...")
+    _log(f"Using device: {DEVICE}")
+    _log(f"Kafka bootstrap_servers={kafka_cfg.get('bootstrap_servers')}, lora_updates_topic='{kafka_cfg.get('lora_updates_topic')}', consumer_group='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}'")
+
+    BASE_MODEL_NAME = model_cfg['name']
+    prec = model_cfg.get('precision', 'fp32')
+    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    
+    _log(f"Loading base model: {BASE_MODEL_NAME} with dtype {dtype}")
     # Use a try-except block for robustness during model loading
     try:
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME,
-            torch_dtype=torch.float16 if DEVICE != "cpu" else torch.float32, 
-            device_map="auto" # Let accelerate handle device mapping if multiple GPUs/MPS
-            # device_map={"" : DEVICE} # Simpler mapping if single device
+            torch_dtype=dtype,
+            device_map={"": device_global} # Simpler contiguous mapping (prevents arbitrary offload faults)
         )
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
         tokenizer.pad_token = tokenizer.eos_token 
     except Exception as e:
-        print(f"FATAL: Failed to load base model or tokenizer: {e}")
+        _log(f"FATAL: Failed to load base model or tokenizer: {e}")
         exit(1) # Exit if model loading fails
 
-    # 2. Apply the initial LoRA configuration to the base model
-    print("Applying initial LoRA configuration...")
+    # 2. Apply the initial LoRA configuration to the base model (or load from checkpoint)
+    _log("Applying initial LoRA configuration...")
     try:
-        model = get_peft_model(base_model, LORA_CONFIG)
+        if resolved_checkpoint_path:
+            _log(f"Loading standalone checkpoint from disk: {resolved_checkpoint_path}")
+            model = PeftModel.from_pretrained(base_model, resolved_checkpoint_path)
+            _log("Model checkpoint loaded successfully.")
+        else:
+            model = get_peft_model(base_model, LORA_CONFIG)
+            model.print_trainable_parameters() 
         model.eval() # Set the model to evaluation mode
-        print("Model loaded and LoRA configured.")
-        model.print_trainable_parameters() 
     except Exception as e:
-        print(f"FATAL: Failed to apply LoRA config: {e}")
+        _log(f"FATAL: Failed to apply LoRA config / checkpoint: {e}")
         exit(1)
 
     # Assign to global variables for access by Flask routes
@@ -238,26 +356,32 @@ if __name__ == "__main__":
     # 3. Create shared resources: update queue and model lock
     update_queue = queue.Queue()
     model_lock = threading.Lock()
-    model_lock_global = model_lock # Assign lock to global var
+    model_lock_global = model_lock
 
-    # 4. Start the background threads
-    consumer_thread = threading.Thread(
-        target=kafka_consumer_thread, 
-        args=(update_queue,), 
-        daemon=True 
-    )
-    applier_thread = threading.Thread(
-        target=weight_application_thread, 
-        args=(model_global, update_queue, model_lock_global), 
-        daemon=True
-    )
-    
-    consumer_thread.start()
-    applier_thread.start()
+    # 4. Start background Kafka threads for receiving LoRA weight updates.
+    #    We skip this entirely if a standalone checkpoint was provided and resolved.
+    if resolved_checkpoint_path:
+        _log("Standalone mode (checkpoint provided). Skipping Kafka consumer threads.")
+    else:
+        consumer_thread = threading.Thread(
+            target=kafka_consumer_thread,
+            args=(update_queue, config),
+            daemon=True
+        )
+        applier_thread = threading.Thread(
+            target=weight_application_thread,
+            args=(model_global, update_queue, model_lock_global, DEVICE),
+            daemon=True
+        )
+        consumer_thread.start()
+        applier_thread.start()
 
-    print(f"\nStarting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
-    print("Send POST requests to /generate with JSON body: {'prompt': 'your prompt here'}")
-    print("GET /health for health check.")
+    FLASK_HOST = inference_cfg.get('host', 'localhost')
+    FLASK_PORT = inference_cfg.get('port', 5000)
+
+    _log(f"Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
+    _log("Send POST requests to /generate with JSON body: {'prompt': 'your prompt here'}")
+    _log("GET /health for health check.")
     
     # 5. Start Flask server (blocking call)
     # Use 'threaded=True' explicitly if needed, though it's often default.
@@ -265,8 +389,8 @@ if __name__ == "__main__":
     try:
         app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True) 
     except Exception as e:
-         print(f"FATAL: Failed to start Flask server: {e}")
+         _log(f"FATAL: Failed to start Flask server: {e}")
          exit(1)
 
     # Code after app.run() executes only when the server stops (e.g., Ctrl+C)
-    print("Inference server stopped.")
+    _log("Inference server stopped.")

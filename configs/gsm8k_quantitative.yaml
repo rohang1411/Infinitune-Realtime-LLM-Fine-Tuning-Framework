@@ -1,0 +1,131 @@
+# ============================================================
+# InfiniTune Configuration — GSM8K Math Reasoning
+# Task Type : Quantitative / Generative (Causal LM)
+# Model     : distilgpt2 (82M params) — chosen for fast testing
+# ============================================================
+
+project:
+  name: "infinitune-gsm8k-math"
+  output_dir: "./output/gsm8k"
+
+# --- Model ---
+model:
+  name: "Qwen/Qwen2.5-3B"
+  task_type: "CAUSAL_LM"
+  precision: "fp32"          # MPS (Apple Silicon) natively leverages float16 for this config
+  max_seq_length: 512
+
+# --- LoRA Adapter ---
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+# --- Dataset ---
+dataset:
+  name: "gsm8k"
+  config_name: "main"        # gsm8k requires explicit config name
+  split: "train"
+  eval_split: "test"
+  column_mapping:
+    input_col: "question"     # raw dataset column for input
+    target_col: "answer"      # raw dataset column for target
+  label_map: null             # no label remapping needed for generative tasks
+  shuffle: true               # shuffle before streaming
+  shuffle_seed: 42            # null for non-deterministic shuffle
+
+# --- Preprocessing / Templating ---
+preprocessing:
+  prompt_template: "Question: {{ input }}\nAnswer:"
+  response_template: " {{ target }}"
+  hash_column: "input"        # which standardized column to hash for dedup
+
+# --- Data (SSoT superset) ---
+data:
+  ingestion: null
+  preprocessing: null
+  filtering:
+    universal:
+      min_chars: 15
+      max_chars: 4000
+      min_alphanumeric_ratio: 0.5  # Drops purely symbol-based garbage
+      max_repetition_ratio: 0.2    # (Compressed Size / Original Size) - Drops spam like "A A A A"
+    domain_specific:
+      require_numeric_content: null # Boolean
+      custom_regex_must_match: null # List of strings
+      custom_regex_must_not_match: null # List of strings
+      chat_structure:
+        min_turns: null             # Integer
+        require_assistant_final: null # Boolean
+
+# --- Kafka ---
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  training_topic: "training-data-gsm8k"
+  lora_updates_topic: "lora-updates-gsm8k"
+  enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
+  producer_send_interval: 0.1
+  consumer_group_trainer: "trainer-group"
+  consumer_group_inference: "inference-api-group"
+
+# --- Training ---
+training:
+  test_mode: true              # true = train entire dataset, stop all services on EOF
+  batch_size: 2               # smaller batch (longer sequences for math)
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  max_steps: 500               # ~26% of GSM8k train set with effective batch 8
+  logging_steps: 1
+  weight_push_interval: 60    # seconds between LoRA pushes to Kafka
+  lr_scheduler:
+    type: "cosine_with_warmup"   # cosine_with_warmup | linear | constant
+    warmup_steps: 50
+    min_lr_ratio: 0.01
+    T_max: 500                   # must match max_steps for full decay curve
+  save_checkpoints:
+    enabled: true                # Save LoRA adapter to disk periodically
+    save_every_steps: 100        # ~5 checkpoints over 500 steps
+    save_final: true             # Always save a 'final' checkpoint at training end
+
+# --- Inference ---
+inference:
+  host: "localhost"
+  port: 5000
+  max_new_tokens: 150         # longer output for step-by-step reasoning
+  do_sample: true             # generative reasoning benefits from sampling
+  temperature: 0.7
+  top_p: 0.9
+
+# --- Evaluation (Polymorphic) ---
+evaluation:
+  enabled: true
+  decoupled: false            # If true, disables inline eval during training (run evaluate.py later)
+  strategy: "regex_extract"   # class_match | regex_extract | perplexity
+  eval_interval: 50           # evaluate every N optimizer steps
+  eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)
+  eval_batch_size: 20          # samples evaluated per sliding window
+  answer_regex: "#### (\\d+)" # extracts final numeric answer from GSM8K format
+  # Generative / extractive: keep string metrics; disable structure metrics by default
+  # (many distinct numeric answers would make F1/MCC/kappa meaningless).
+  metrics:
+    compute_loss: true
+    compute_accuracy: true
+    compute_exact_match: true
+    compute_f1: false
+    compute_mcc: false
+    compute_kappa: false
+    max_distinct_labels_for_structure_metrics: 64
+    compute_forgetting: false # high-cardinality extracted answers: peak tracking is often uninterpretable
+    compute_update_latency: true
+    forgetting_track_metrics: ["exact_match", "eval_loss", "perplexity"]
+    # QAFactEval: factual consistency between source input and generated response.
+    # Opt-in (default false) — requires ~120 MB model download on first use.
+    compute_qafacteval: false
+    qafacteval_model: "deepset/minilm-uncased-squad2"  # optional override
