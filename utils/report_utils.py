@@ -200,8 +200,41 @@ def _parse_step(value: Any) -> Optional[int]:
         return None
 
 
+def _direct_row_plot_step(row: Dict[str, Any]) -> Optional[int]:
+    eval_step = _parse_step(row.get("eval_step"))
+    if eval_step is not None:
+        return eval_step
+    return _parse_step(row.get("step"))
+
+
+def _infer_final_plot_step(rows: Sequence[Dict[str, Any]]) -> Optional[int]:
+    numeric_steps = [_direct_row_plot_step(row) for row in rows]
+    numeric_steps = [step for step in numeric_steps if step is not None]
+    if not numeric_steps:
+        return None
+    if len(numeric_steps) == 1:
+        return numeric_steps[-1] + 1
+    deltas = [
+        curr - prev
+        for prev, curr in zip(numeric_steps, numeric_steps[1:])
+        if curr > prev
+    ]
+    step_size = deltas[-1] if deltas else 1
+    return numeric_steps[-1] + max(1, step_size)
+
+
+def _row_plot_step(row: Dict[str, Any], rows: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[int]:
+    """Return the numeric x-axis step for a row, preferring eval_step when present."""
+    direct = _direct_row_plot_step(row)
+    if direct is not None:
+        return direct
+    if rows is not None and str(row.get("step", "")).strip().lower() == "final":
+        return _infer_final_plot_step(rows)
+    return None
+
+
 def _numeric_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [row for row in rows if _parse_step(row.get("step")) is not None]
+    return [row for row in rows if _row_plot_step(row, rows) is not None]
 
 
 def _summary_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -217,13 +250,16 @@ def _initial_numeric_value(rows: Sequence[Dict[str, Any]], key: str) -> Optional
 
 
 def _final_checkpoint_row(rows: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    summaries = _summary_rows(rows)
+    if summaries:
+        return summaries[-1]
     numeric = _numeric_rows(rows)
     return numeric[-1] if numeric else (rows[-1] if rows else None)
 
 
 def _final_checkpoint_step(rows: Sequence[Dict[str, Any]]) -> Optional[int]:
     row = _final_checkpoint_row(rows)
-    return _parse_step((row or {}).get("step"))
+    return _row_plot_step(row or {}, rows)
 
 
 def _final_checkpoint_value(rows: Sequence[Dict[str, Any]], key: str) -> Optional[float]:
@@ -246,7 +282,7 @@ def _metric_series(rows: Sequence[Dict[str, Any]], key: str) -> Tuple[List[int],
     xs: List[int] = []
     ys: List[float] = []
     for row in rows:
-        step = _parse_step(row.get("step"))
+        step = _row_plot_step(row, rows)
         value = _safe_float(row.get(key))
         if step is None or value is None:
             continue
@@ -511,6 +547,8 @@ def detect_usecase(rows: Sequence[Dict[str, Any]], config: Optional[Dict[str, An
 
 
 def _classification_kpis(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
+    return _classification_kpis_v2(rows)
+
     peak_acc, peak_acc_step = _peak_value(rows, "accuracy", higher_better=True)
     peak_mcc, peak_mcc_step = _peak_value(rows, "mcc", higher_better=True)
     final_kappa = _pp(_final_value(rows, "kappa"))
@@ -684,7 +722,7 @@ def _classification_kpis_v2(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
         )
     if final_acc is not None:
         delta = None if base_acc is None else final_acc - base_acc
-        final_basis = f"last plotted checkpoint (step {final_step})" if final_step is not None else "last plotted checkpoint"
+        final_basis = f"final checkpoint row (eval step {final_step})" if final_step is not None else "final checkpoint row"
         kpis.append(
             KPI(
                 label="Final Checkpoint Accuracy",
@@ -694,9 +732,9 @@ def _classification_kpis_v2(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
                 delta_label="vs step 0 baseline",
                 comparison_basis=f"step 0 baseline = {_fmt_value(base_acc, '%')}" if base_acc is not None else "baseline unavailable",
                 comparison_value=base_acc,
-                delta_display=_delta_display(delta) if delta is not None else "accuracy at the last plotted checkpoint",
+                delta_display=_delta_display(delta) if delta is not None else "accuracy at the final checkpoint",
                 status=_status_from_delta(delta, "higher_better"),
-                supporting_caption=f"value taken from {final_basis}, matching the rightmost plotted Accuracy point",
+                supporting_caption=f"value taken directly from the {final_basis}",
                 metric_key="accuracy",
                 source_kind="final_checkpoint",
                 source_step=final_step,
@@ -704,7 +742,7 @@ def _classification_kpis_v2(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
             )
         )
     if final_kappa is not None:
-        final_basis = f"last plotted checkpoint (step {final_step})" if final_step is not None else "last plotted checkpoint"
+        final_basis = f"final checkpoint row (eval step {final_step})" if final_step is not None else "final checkpoint row"
         delta = None if base_kappa is None or final_kappa_raw is None else final_kappa - base_kappa
         kpis.append(
             KPI(
@@ -716,9 +754,9 @@ def _classification_kpis_v2(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
                 direction="higher_better",
                 comparison_basis=f"step 0 baseline = {_fmt_value(base_kappa, '%')}" if base_kappa is not None else "baseline unavailable",
                 comparison_value=base_kappa,
-                delta_display=_delta_display(delta) if delta is not None else "agreement score at the last plotted checkpoint",
+                delta_display=_delta_display(delta) if delta is not None else "agreement score at the final checkpoint",
                 status="good" if final_kappa >= 60 else "neutral",
-                supporting_caption=f"value taken from {final_basis}, matching the rightmost plotted Kappa point",
+                supporting_caption=f"value taken directly from the {final_basis}",
                 metric_key="kappa",
                 source_kind="final_checkpoint",
                 source_step=final_step,
@@ -828,8 +866,8 @@ def _math_quant_kpis(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
 
 def _math_cot_kpis(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
     anchor = _pp(_final_checkpoint_value(rows, "qual_cot_coverage") or _final_checkpoint_value(rows, "qual_cot_anchor_coverage"))
-    anchor_count = _final_value(rows, "qual_cot_anchor_count")
-    step_length = _final_value(rows, "qual_cot_step_length")
+    anchor_count = _final_checkpoint_value(rows, "qual_cot_anchor_count")
+    step_length = _final_checkpoint_value(rows, "qual_cot_step_length")
     exact_match = _pp(_final_checkpoint_value(rows, "exact_match"))
     non_empty = _pp(_final_checkpoint_value(rows, "qual_non_empty_rate"))
     return [
@@ -883,7 +921,7 @@ def _structured_nlg_kpis(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
 def _semantic_kpis(rows: Sequence[Dict[str, Any]]) -> List[KPI]:
     similarity = _pp(_final_checkpoint_value(rows, "qual_semantic_similarity"))
     non_empty = _pp(_final_checkpoint_value(rows, "qual_non_empty_rate"))
-    response_len = _final_value(rows, "qual_mean_response_length")
+    response_len = _final_checkpoint_value(rows, "qual_mean_response_length")
     repetition = _pp(_final_checkpoint_value(rows, "qual_repetition_rate"))
     perplexity = _final_checkpoint_value(rows, "perplexity")
     return [
@@ -940,7 +978,7 @@ def select_kpis(rows: Sequence[Dict[str, Any]], profile: UsecaseProfile) -> List
         return _semantic_kpis(rows)
     if profile.slug == "domain_adaptation_keyword":
         return _keyword_kpis(rows)
-    return _classification_kpis(rows) if any(col in (rows[0].keys() if rows else []) for col in ("accuracy", "mcc")) else _semantic_kpis(rows)
+    return _classification_kpis_v2(rows) if any(col in (rows[0].keys() if rows else []) for col in ("accuracy", "mcc")) else _semantic_kpis(rows)
 
 
 def _classification_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
@@ -981,10 +1019,10 @@ def _math_quant_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
 
 
 def _math_cot_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
-    coverage = _pp(_final_value(rows, "qual_cot_coverage") or _final_value(rows, "qual_cot_anchor_coverage"))
-    anchors = _final_value(rows, "qual_cot_anchor_count")
-    step_length = _final_value(rows, "qual_cot_step_length")
-    exact_match = _pp(_final_value(rows, "exact_match"))
+    coverage = _pp(_final_checkpoint_value(rows, "qual_cot_coverage") or _final_checkpoint_value(rows, "qual_cot_anchor_coverage"))
+    anchors = _final_checkpoint_value(rows, "qual_cot_anchor_count")
+    step_length = _final_checkpoint_value(rows, "qual_cot_step_length")
+    exact_match = _pp(_final_checkpoint_value(rows, "exact_match"))
     return [
         TakeawayCard("Reasoning structure adoption", "structure learned" if (coverage or 0) >= 50 else "partial structure", f"Final CoT coverage reaches {_fmt_value(coverage, '%')}, showing whether the model has actually adopted multi-step reasoning markers.", "good" if (coverage or 0) >= 50 else "neutral"),
         TakeawayCard("Reasoning density", "not just prefixes" if (anchors or 0) >= 2 and (step_length or 0) >= 6 else "shallow chains", f"Anchor count {_fmt_value(anchors)} with step length {_fmt_value(step_length)} helps separate genuine chain-of-thought behavior from short templated prefixes.", "good" if (anchors or 0) >= 2 and (step_length or 0) >= 6 else "warning"),
@@ -1036,9 +1074,9 @@ def _structured_nlg_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCa
 
 
 def _semantic_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
-    similarity = _pp(_final_value(rows, "qual_semantic_similarity"))
-    repetition = _pp(_final_value(rows, "qual_repetition_rate"))
-    length = _final_value(rows, "qual_mean_response_length")
+    similarity = _pp(_final_checkpoint_value(rows, "qual_semantic_similarity"))
+    repetition = _pp(_final_checkpoint_value(rows, "qual_repetition_rate"))
+    length = _final_checkpoint_value(rows, "qual_mean_response_length")
     return [
         TakeawayCard("Task-fit signal", "semantic alignment" if (similarity or 0) >= 70 else "weak alignment", f"Semantic similarity reaches {_fmt_value(similarity, '%')}, which is the best single summary of whether the model is responding in the intended style/content space.", "good" if (similarity or 0) >= 70 else "neutral"),
         TakeawayCard("Response health", "healthy outputs" if (repetition or 100) <= 10 else "watch repetition", f"Mean response length is {_fmt_value(length)} with repetition at {_fmt_value(repetition, '%')}, helping distinguish useful adaptation from degenerate verbosity.", "good" if (repetition or 100) <= 10 else "warning"),
@@ -1046,9 +1084,9 @@ def _semantic_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
 
 
 def _keyword_takeaways(rows: Sequence[Dict[str, Any]]) -> List[TakeawayCard]:
-    density = _pp(_final_value(rows, "qual_keyword_density"))
-    ttr = _pp(_final_value(rows, "qual_type_token_ratio"))
-    repetition = _pp(_final_value(rows, "qual_repetition_rate"))
+    density = _pp(_final_checkpoint_value(rows, "qual_keyword_density"))
+    ttr = _pp(_final_checkpoint_value(rows, "qual_type_token_ratio"))
+    repetition = _pp(_final_checkpoint_value(rows, "qual_repetition_rate"))
     return [
         TakeawayCard("Specialization signal", "domain vocabulary learned" if (density or 0) >= 10 else "light specialization", f"Keyword density reaches {_fmt_value(density, '%')}, which is the best direct sign that the model is adopting the target domain language.", "good" if (density or 0) >= 10 else "neutral"),
         TakeawayCard("Vocabulary quality", "diverse enough" if (ttr or 0) >= 25 else "too templated", f"Type/token ratio is {_fmt_value(ttr, '%')} with repetition at {_fmt_value(repetition, '%')}, so we can judge whether specialization still looks natural.", "good" if (ttr or 0) >= 25 and (repetition or 100) <= 10 else "warning"),
@@ -1254,7 +1292,7 @@ def _structured_nlg_sections(rows: Sequence[Dict[str, Any]]) -> List[SectionSpec
         ],
         "Score (%)",
     )
-    slot_pairs = [(slot, _pp(_final_value(rows, key))) for key, slot in _find_per_slot_columns(rows)]
+    slot_pairs = [(slot, _pp(_final_checkpoint_value(rows, key))) for key, slot in _find_per_slot_columns(rows)]
     slot_pairs = [(slot, value) for slot, value in slot_pairs if value is not None]
     slot_pairs.sort(key=lambda item: item[1], reverse=True)
     slot_bar = None
@@ -1555,8 +1593,8 @@ def _validate_presentation_spec(rows: Sequence[Dict[str, Any]], spec: Presentati
             warnings.append(f"KPI '{kpi.label}' still uses the ambiguous 'pp' shorthand.")
         if source_kind == "final_checkpoint" and final_step is not None:
             source_note = getattr(kpi, "source_note", "") or ""
-            if str(final_step) not in source_note and "last plotted checkpoint" not in source_note.lower():
-                warnings.append(f"KPI '{kpi.label}' should state that it comes from the last plotted checkpoint (step {final_step}).")
+            if str(final_step) not in source_note and "final checkpoint" not in source_note.lower():
+                warnings.append(f"KPI '{kpi.label}' should state that it comes from the final checkpoint row (eval step {final_step}).")
 
     for chart in spec.chart_specs:
         if chart.chart_type != "barh" and not chart.x_label:
@@ -1568,6 +1606,35 @@ def _validate_presentation_spec(rows: Sequence[Dict[str, Any]], spec: Presentati
         if chart.chart_type == "line" and chart.x_label == "Value":
             warnings.append(f"Chart '{chart.title}' uses the generic x-axis label 'Value'; it should name the actual scale.")
 
+    series_keys = {
+        "accuracy",
+        "mcc",
+        "kappa",
+        "f1",
+        "exact_match",
+        "perplexity",
+        "eval_loss",
+        "qual_slot_coverage_mean",
+        "qual_consistency_score_mean",
+        "qual_pinned_consistency",
+        "qual_pinned_consistency_score",
+        "qual_semantic_similarity",
+        "qual_keyword_density",
+        "qual_cot_coverage",
+        "qual_cot_anchor_coverage",
+    }
+    for key, _slot in _find_per_slot_columns(rows):
+        series_keys.add(key)
+    for key in sorted(series_keys):
+        xs, ys = _metric_series(rows, key)
+        final_val = _final_checkpoint_value(rows, key)
+        if not ys or final_val is None:
+            continue
+        if abs(ys[-1] - final_val) > 1e-6:
+            warnings.append(
+                f"Series resolution mismatch for '{key}'; rendered plots must end at the CSV final checkpoint row exactly."
+            )
+
     if summary_present and final_step is not None:
         for key in ("accuracy", "mcc", "kappa", "f1", "perplexity"):
             summary_val = _summary_value(rows, key)
@@ -1576,7 +1643,7 @@ def _validate_presentation_spec(rows: Sequence[Dict[str, Any]], spec: Presentati
                 continue
             if abs(summary_val - final_val) > 1e-6:
                 warnings.append(
-                    f"Summary row differs from last plotted checkpoint for '{key}' (step {final_step}); UI should label source rows clearly."
+                    f"Final checkpoint resolution mismatch for '{key}' at eval step {final_step}; rendered outputs must use the CSV final row exactly."
                 )
     return warnings
 

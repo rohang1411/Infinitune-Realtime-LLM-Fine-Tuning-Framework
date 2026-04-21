@@ -86,6 +86,15 @@ def _normalize_step_value(step):
     return int(step)
 
 
+def _coerce_positive_interval(value, default: int = 1) -> int:
+    """Return *value* as a positive integer interval."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
 def _step_dir_name(step) -> str:
     """Return the directory name for a given step. 'final' stays as-is."""
     normalized_step = _normalize_step_value(step)
@@ -94,10 +103,110 @@ def _step_dir_name(step) -> str:
     return f"step_{normalized_step:0{_PAD_WIDTH}d}"
 
 
+def _numeric_checkpoint_step(step) -> Optional[int]:
+    """Best-effort conversion of checkpoint step identifiers to an int."""
+    if isinstance(step, int):
+        return step
+    if isinstance(step, float) and step.is_integer():
+        return int(step)
+    if isinstance(step, str):
+        step = step.strip().lower()
+        if step == "final":
+            return None
+        if step.startswith("step_"):
+            step = step[len("step_"):]
+        if step.isdigit():
+            return int(step)
+    return None
+
+
 def _slugify(text: str) -> str:
     """Replace characters that are problematic in directory names with '_'."""
     # Keep alphanumeric, dash, dot; replace everything else (including '/')
     return re.sub(r"[^A-Za-z0-9.\-]", "_", text)
+
+
+def get_evaluation_schedule(config: dict) -> dict:
+    """
+    Return the configured checkpoint-evaluation cadence for each evaluator.
+
+    Inline evaluation already respects these intervals in trainer.py.
+    Decoupled evaluation should use the same cadence when deciding which
+    saved checkpoints to evaluate.
+    """
+    eval_cfg = config.get("evaluation", {})
+    test_cfg = config.get("testing_strategy", {})
+
+    quant_enabled = bool(eval_cfg.get("enabled", False))
+    qual_enabled = bool(test_cfg.get("enabled", False))
+
+    quant_interval = _coerce_positive_interval(eval_cfg.get("eval_interval", 1), 1)
+    qual_interval = _coerce_positive_interval(
+        test_cfg.get("eval_interval", quant_interval),
+        quant_interval,
+    )
+
+    return {
+        "quantitative_enabled": quant_enabled,
+        "quantitative_interval": quant_interval,
+        "qualitative_enabled": qual_enabled,
+        "qualitative_interval": qual_interval,
+    }
+
+
+def select_evaluation_checkpoints(checkpoints: list, config: dict) -> list:
+    """
+    Filter/annotate checkpoints for decoupled evaluation using the same
+    cadence rules as inline evaluation.
+
+    Each returned checkpoint dict includes:
+      - run_quantitative: whether quantitative eval should run here
+      - run_qualitative: whether qualitative eval should run here
+      - evaluation_targets: list[str] for logging/debugging
+
+    The special "final" checkpoint is always included for any enabled
+    evaluator so that post-training reporting still has a final score.
+    """
+    schedule = get_evaluation_schedule(config)
+    quant_enabled = schedule["quantitative_enabled"]
+    qual_enabled = schedule["qualitative_enabled"]
+
+    if not checkpoints:
+        return []
+
+    selected = []
+    for checkpoint in checkpoints:
+        step = checkpoint.get("step")
+        name = str(checkpoint.get("name", ""))
+        is_final = str(step).strip().lower() == "final" or name.lower() == "final"
+        numeric_step = _numeric_checkpoint_step(step)
+
+        run_quantitative = bool(
+            quant_enabled
+            and (is_final or (numeric_step is not None and numeric_step % schedule["quantitative_interval"] == 0))
+        )
+        run_qualitative = bool(
+            qual_enabled
+            and (is_final or (numeric_step is not None and numeric_step % schedule["qualitative_interval"] == 0))
+        )
+
+        if not quant_enabled and not qual_enabled:
+            run_quantitative = False
+            run_qualitative = False
+
+        if run_quantitative or run_qualitative or is_final:
+            entry = dict(checkpoint)
+            entry["run_quantitative"] = run_quantitative
+            entry["run_qualitative"] = run_qualitative
+            targets = []
+            if run_quantitative:
+                targets.append("quantitative")
+            if run_qualitative:
+                targets.append("qualitative")
+            entry["evaluation_targets"] = targets
+            selected.append(entry)
+
+    return selected
 
 
 # ---------------------------------------------------------------------------

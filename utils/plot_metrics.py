@@ -67,18 +67,52 @@ def read_metrics_csv(csv_path: str) -> list:
     return rows
 
 
+def _parse_plot_step(value: Any) -> Optional[int]:
+    if value in ("", None, "final"):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_final_plot_step(rows: list) -> Optional[int]:
+    numeric_steps = []
+    for row in rows:
+        eval_step = _parse_plot_step(row.get("eval_step", ""))
+        step = eval_step if eval_step is not None else _parse_plot_step(row.get("step", ""))
+        if step is not None:
+            numeric_steps.append(step)
+    if not numeric_steps:
+        return None
+    if len(numeric_steps) == 1:
+        return numeric_steps[-1] + 1
+    deltas = [
+        curr - prev
+        for prev, curr in zip(numeric_steps, numeric_steps[1:])
+        if curr > prev
+    ]
+    step_size = deltas[-1] if deltas else 1
+    return numeric_steps[-1] + max(1, step_size)
+
+
 def _extract_series_raw(rows: list, key: str) -> tuple:
     """Extract (steps, values) for a given column, skipping blanks."""
     xs, ys = [], []
+    inferred_final_step = _infer_final_plot_step(rows)
     for r in rows:
         val = r.get(key, "")
         if val in ("", None):
             continue
         try:
-            step_raw = r.get("step", "0")
-            if step_raw == "final":
-                continue  # handled separately in dashboard
-            xs.append(int(step_raw))
+            eval_step_raw = r.get("eval_step", "")
+            step_raw = eval_step_raw if eval_step_raw not in ("", None) else r.get("step", "0")
+            step = _parse_plot_step(step_raw)
+            if step is None and str(r.get("step", "")).strip().lower() == "final":
+                step = inferred_final_step
+            if step is None:
+                continue
+            xs.append(step)
             ys.append(float(val))
         except (ValueError, TypeError):
             continue
@@ -102,19 +136,19 @@ def _get_plotting_cfg(config: dict) -> dict:
     plotting_cfg = evaluation_cfg.get("plotting") or {}
 
     try:
-        window = int(plotting_cfg.get("rolling_average_window", 1))
+        window = int(plotting_cfg.get("display_rolling_average_window", plotting_cfg.get("rolling_average_window", 1)))
     except (TypeError, ValueError):
         window = 1
     window = max(1, window)
 
-    include = plotting_cfg.get("rolling_average_include")
+    include = plotting_cfg.get("display_rolling_average_include", plotting_cfg.get("rolling_average_include"))
     include_keys = None
     if isinstance(include, (list, tuple)):
         include_keys = {
             str(key).strip() for key in include if str(key).strip()
         } or None
 
-    enabled = bool(plotting_cfg.get("rolling_average_enabled", False) or window > 1)
+    enabled = bool(plotting_cfg.get("display_rolling_average_enabled", False))
     return {
         "enabled": enabled and window > 1,
         "window": window,
@@ -162,9 +196,6 @@ def extract_series(rows: list, key: str, config: dict = None) -> tuple:
         xs, ys = _derive_continual_learning_stability(rows)
     else:
         xs, ys = _extract_series_raw(rows, key)
-
-    if xs and _should_smooth_metric(key, config):
-        ys = _apply_centered_rolling_average(ys, _get_plotting_cfg(config)["window"])
     return xs, ys
 
 
@@ -1579,10 +1610,9 @@ def _render_chart_spec(ax, chart_spec, theme: dict) -> None:
         if trace.trace_type == "bar":
             target_ax.bar(trace.x, trace.y, color=color, alpha=0.7, label=trace.name)
         else:
-            smooth_x, smooth_y = _smooth_series_for_display(trace.x, trace.y) if linestyle == "-" else (trace.x, trace.y)
             target_ax.plot(
-                smooth_x,
-                smooth_y,
+                trace.x,
+                trace.y,
                 color=color,
                 linewidth=3.0,
                 linestyle=linestyle,
@@ -1602,7 +1632,7 @@ def _render_chart_spec(ax, chart_spec, theme: dict) -> None:
                 alpha=0.95,
             )
             if trace.fill:
-                target_ax.fill_between(smooth_x, smooth_y, color=color, alpha=0.12)
+                target_ax.fill_between(trace.x, trace.y, color=color, alpha=0.12)
 
     for threshold in chart_spec.thresholds:
         target_ax = ax2 if threshold.axis == "secondary" and ax2 is not None else ax

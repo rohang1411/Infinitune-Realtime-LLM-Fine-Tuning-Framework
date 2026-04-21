@@ -461,8 +461,8 @@ def render_html_report(rows: List[Dict[str, Any]], artifact_root: str, config: O
             color: resolveColor(themeName, trace.color_key || 'neutral'),
             width: 3.4,
             dash: trace.style === 'dashed' ? 'dash' : trace.style === 'dotted' ? 'dot' : 'solid',
-            shape: trace.style === 'dashed' ? 'linear' : 'spline',
-            smoothing: trace.style === 'dashed' ? 0 : 0.72
+            shape: 'linear',
+            smoothing: 0
           }},
           marker: {{size: 6.4}},
           fill: trace.fill ? 'tozeroy' : 'none',

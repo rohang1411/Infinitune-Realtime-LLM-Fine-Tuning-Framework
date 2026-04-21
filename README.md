@@ -1,13 +1,13 @@
 <div align="center">
 
-# ♾️ InfiniTune
+# InfiniTune
 ### Realtime LLM Fine-Tuning Framework
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=flat)](https://github.com/rohang1411/Infinitune-Realtime-LLM-Fine-Tuning-Framework)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![Kafka](https://img.shields.io/badge/Apache_Kafka-231F20?style=flat&logo=apache-kafka&logoColor=white)](https://kafka.apache.org/)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-FFD21E)](https://huggingface.co/)
+[![HuggingFace](https://img.shields.io/badge/HuggingFace-Models-FFD21E)](https://huggingface.co/)
 [![Code style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://makeapullrequest.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -16,11 +16,7 @@ A distributed framework for **continuously fine-tuning Large Language Models in 
 
 <br>
 
-[**Architecture**](#architecture) • [**Getting Started**](#running-infinitune) • [**Configurations**](#available-configs) • [**Testing Guides**](docs/README.md)
-
-<br>
-
-**🚀 Zero-Downtime Hot-Swaps** &nbsp;|&nbsp; **🧠 Consumer Hardware Friendly** &nbsp;|&nbsp; **⚡ Live Streaming Data** &nbsp;|&nbsp; **📊 Qualitative & Quantitative Eval**
+**Zero-Downtime Hot-Swaps** &nbsp;|&nbsp; **Consumer Hardware Friendly** &nbsp;|&nbsp; **Live Streaming Data** &nbsp;|&nbsp; **Qualitative & Quantitative Eval**
 
 </div>
 
@@ -53,8 +49,8 @@ It is built around three decoupled services that communicate over Kafka:
 | Service | Script | Role |
 |---|---|---|
 | **Producer** | `producer.py` | Streams training samples from a HuggingFace dataset to a Kafka topic |
-| **Trainer** | `trainer.py` | Consumes data from Kafka, fine-tunes the model with LoRA, saves checkpoints, and pushes updated LoRA adapter weights back to Kafka |
-| **Inference Server** | `inference.py` | Loads the base model + LoRA adapter, serves a REST API, and hot-swaps adapter weights in real time as the trainer pushes updates |
+| **Trainer** | `trainer.py` | Consumes data from Kafka, fine-tunes with LoRA, saves checkpoints, and pushes updated adapter weights back to Kafka |
+| **Inference Server** | `inference.py` | Loads the base model and LoRA adapter, serves a REST API, and hot-swaps adapter weights in real time |
 
 A fourth standalone script handles post-training evaluation:
 
@@ -62,10 +58,10 @@ A fourth standalone script handles post-training evaluation:
 |---|---|
 | `evaluate.py` | Loads any saved checkpoint and runs the full evaluation suite (quantitative + qualitative) without re-training |
 
-Key properties:
+**Key properties:**
 - **Online (streaming) learning** — the model improves continuously as data flows in
-- **Memory-efficient** — uses LoRA adapters (only a fraction of model parameters are trained)
-- **Config-driven** — all hyperparameters, dataset settings, and evaluation logic are defined in a single YAML file
+- **Memory-efficient** — LoRA adapters only train a fraction of model parameters
+- **Config-driven** — all hyperparameters, dataset settings, and evaluation logic defined in a single YAML file
 - **Multi-task** — pre-built configs for IMDb, GSM8K, and Alpaca spanning quantitative and qualitative evaluation
 - **Dual evaluation modes** — inline (during training) and decoupled (after training via `evaluate.py`)
 - **Versioned outputs** — training logs, checkpoints, and evaluation results are all versioned and never overwrite previous runs
@@ -74,49 +70,71 @@ Key properties:
 
 ## Architecture
 
-```
-┌─────────────┐   training data    ┌────────────────────┐   LoRA weights    ┌───────────────────┐
-│  Producer   │ ─────────────────► │   Kafka Broker     │ ────────────────► │  Inference Server │
-│ producer.py │                    │  (localhost:9092)  │                   │  inference.py     │
-└─────────────┘                    └──────────┬─────────┘                   └───────────────────┘
-                                              │ training data
-                                              ▼
-                                   ┌───────────────────────────┐
-                                   │        Trainer             │
-                                   │       trainer.py           │
-                                   │      (LoRA + AdamW)        │
-                                   │                            │
-                                   │  ┌─────────────────────┐  │
-                                   │  │  Inline: Quant.Eval  │  │  ← eval_metrics_train.py
-                                   │  └─────────────────────┘  │
-                                   │  ┌─────────────────────┐  │
-                                   │  │  Inline: Qual. Eval  │  │  ← eval_qualitative.py
-                                   │  └─────────────────────┘  │
-                                   │  ┌─────────────────────┐  │
-                                   │  │  CheckpointManager   │  │  ← utils/checkpoint_manager.py
-                                   │  └──────────┬──────────┘  │
-                                   └─────────────┼─────────────┘
-                                                 │ saves LoRA adapter
-                                                 ▼
-                                      output/<project>/checkpoints/
-                                                 │
-                                    ┌────────────┘ loads checkpoint
-                                    ▼
-                           ┌─────────────────┐
-                           │   evaluate.py    │
-                           │  (standalone,    │
-                           │   no Kafka)      │
-                           └────────┬────────┘
-                                    │ saves versioned results
-                                    ▼
-                           output/<project>/eval_results/
+```mermaid
+flowchart LR
+    subgraph INPUT["Data Ingestion"]
+        direction TB
+        P["producer.py\nProducer"]
+    end
+
+    subgraph KAFKA1["Kafka Broker · localhost:9092"]
+        direction TB
+        T1["topic: training-data"]
+    end
+
+    subgraph TRAIN["Trainer"]
+        direction TB
+        TR["trainer.py\nLoRA + AdamW"]
+        QE["Inline Quantitative Eval"]
+        QL["Inline Qualitative Eval"]
+        CM["Checkpoint Manager"]
+        SF["Stream Filter"]
+        TR --> QE
+        TR --> QL
+        TR --> CM
+        TR --> SF
+    end
+
+    subgraph KAFKA2["Kafka Broker · localhost:9092"]
+        direction TB
+        T2["topic: lora-weights"]
+    end
+
+    subgraph SERVE["Inference"]
+        direction TB
+        INF["inference.py\nREST API · :5000/generate"]
+    end
+
+    subgraph PERSIST["Persistence"]
+        direction TB
+        CK["output/checkpoints/\nLoRA adapter weights"]
+        EV["evaluate.py\nStandalone · No Kafka"]
+        CK --> EV
+    end
+
+    P -->|"1  stream samples"| T1
+    T1 -->|"2  consume batches"| TR
+    CM -->|"3  save adapters"| CK
+    TR -->|"4  push LoRA weights"| T2
+    T2 -->|"5  hot-swap"| INF
+
+    style INPUT fill:#0d1b2a,stroke:#1e3a5f,color:#93c5fd
+    style KAFKA1 fill:#1c1200,stroke:#3d2e00,color:#fcd34d
+    style TRAIN  fill:#0a1f0a,stroke:#1a3a1a,color:#6ee7b7
+    style KAFKA2 fill:#1c1200,stroke:#3d2e00,color:#fcd34d
+    style SERVE  fill:#0a1f0a,stroke:#1a3a1a,color:#6ee7b7
+    style PERSIST fill:#160d2a,stroke:#2e1a4a,color:#c4b5fd
 ```
 
-**Data flow:**
-1. `producer.py` reads a HuggingFace dataset, applies filtering and templating, and publishes samples to a Kafka topic.
-2. `trainer.py` consumes samples, runs a forward+backward pass, saves LoRA checkpoints every N steps, and pushes updated weights to Kafka.
-3. `inference.py` hot-applies weight updates while serving generation requests at `http://localhost:5000`.
-4. After training, `evaluate.py` loads any checkpoint and runs the full evaluation suite without re-training.
+### Data Flow
+
+| Step | Service | What happens |
+|:---:|---|---|
+| **1** | Producer | Reads a HuggingFace dataset, applies filtering and prompt templating, publishes samples to `training-data` topic |
+| **2** | Trainer | Consumes batches from Kafka, runs forward + backward passes with LoRA, evaluates inline |
+| **3** | Checkpoint Manager | Serialises LoRA adapter weights to disk every N steps and at training end |
+| **4** | Trainer | Publishes updated adapter weights to `lora-weights` Kafka topic |
+| **5** | Inference Server | Pulls new weights from Kafka and applies them in-place — zero downtime, requests continue uninterrupted |
 
 ---
 
@@ -168,9 +186,11 @@ InfiniTune/
 
 ### System Requirements
 
-- **Python** 3.9+
-- **Apache Kafka** 3.3+ (KRaft mode) or 4.x
-- **Java JDK** 11+ (required by Kafka)
+| Requirement | Version |
+|---|---|
+| Python | 3.9+ |
+| Apache Kafka | 3.3+ (KRaft mode) or 4.x |
+| Java JDK | 11+ (required by Kafka) |
 
 ### Python Packages
 
@@ -211,17 +231,15 @@ source ~/.zshrc
 KAFKA_CLUSTER_ID="$(kafka-storage random-uuid)"
 kafka-storage format -t $KAFKA_CLUSTER_ID -c /opt/homebrew/etc/kafka/server.properties
 
-# Start
+# Start / stop
 brew services start kafka
+brew services stop kafka
 
 # Verify
 kafka-topics --bootstrap-server localhost:9092 --list
-
-# Stop
-brew services stop kafka
 ```
 
-> If you get `"Log directory is already formatted"` during format, skip that step — the storage is already initialized.
+> If you see `"Log directory is already formatted"` during the format step, skip it — storage is already initialised.
 
 ---
 
@@ -269,7 +287,7 @@ Copy the UUID output, then:
 
 ## Running InfiniTune
 
-Open **3 terminals** in the project root. **Start them in this order.**
+Open **3 terminals** in the project root and start them in this order.
 
 **Terminal 1 — Inference Server** *(start first — listens for weight updates)*
 ```bash
@@ -288,7 +306,7 @@ python trainer.py --config configs/imdb_quantitative.yaml
 python producer.py --config configs/imdb_quantitative.yaml
 ```
 
-**Optional — Test the API:**
+**Test the API:**
 ```bash
 curl -s -X POST http://localhost:5000/generate \
   -H "Content-Type: application/json" \
@@ -296,20 +314,20 @@ curl -s -X POST http://localhost:5000/generate \
   | python3 -m json.tool
 ```
 
-Replace `imdb_quantitative.yaml` with any config file from the table below.
+Replace `imdb_quantitative.yaml` with any config from the table below.
 
 ---
 
 ## Available Configs
 
-| Config | Task | Model | Eval Type | Detailed Guide |
+| Config | Task | Model | Eval Type | Guide |
 |---|---|---|---|---|
-| `configs/imdb_quantitative.yaml` | Sentiment classification | `distilgpt2` | Accuracy · F1 · MCC | [Guide](docs/imdb_quantitative_guide.md) |
-| `configs/gsm8k_quantitative.yaml` | Math reasoning | `Qwen/Qwen2.5-3B` | Exact Match | [Guide](docs/gsm8k_quantitative_guide.md) |
-| `configs/alpaca_qualitative.yaml` | Instruction following | `Qwen/Qwen2.5-1.5B` | Semantic Similarity | [Guide](docs/alpaca_qualitative_guide.md) |
-| `configs/imdb_qualitative.yaml` | Domain review generation | `Qwen/Qwen2.5-1.5B` | Keyword Density + TTR | [Guide](docs/imdb_qualitative_guide.md) |
-| `configs/gsm8k_qualitative.yaml` | Math + CoT structure | `Qwen/Qwen2.5-3B` | Exact Match + CoT Anchors | [Guide](docs/gsm8k_qualitative_guide.md) |
-| `configs/e2e_qualitative.yaml` | Structured NLG | `gpt2-medium` | Slot Coverage + Consistency | [Guide](docs/e2e_qualitative_guide.md) |
+| `imdb_quantitative.yaml` | Sentiment classification | `distilgpt2` | Accuracy · F1 · MCC | [Guide](docs/imdb_quantitative_guide.md) |
+| `gsm8k_quantitative.yaml` | Math reasoning | `Qwen/Qwen2.5-3B` | Exact Match | [Guide](docs/gsm8k_quantitative_guide.md) |
+| `alpaca_qualitative.yaml` | Instruction following | `Qwen/Qwen2.5-1.5B` | Semantic Similarity | [Guide](docs/alpaca_qualitative_guide.md) |
+| `imdb_qualitative.yaml` | Domain review generation | `Qwen/Qwen2.5-1.5B` | Keyword Density + TTR | [Guide](docs/imdb_qualitative_guide.md) |
+| `gsm8k_qualitative.yaml` | Math + CoT structure | `Qwen/Qwen2.5-3B` | Exact Match + CoT Anchors | [Guide](docs/gsm8k_qualitative_guide.md) |
+| `e2e_qualitative.yaml` | Structured NLG | `gpt2-medium` | Slot Coverage + Consistency | [Guide](docs/e2e_qualitative_guide.md) |
 
 > Each guide contains step-by-step run instructions, metric definitions, learning curve interpretation, decoupled eval commands, and troubleshooting notes. Read the relevant guide before running a config for the first time.
 
@@ -319,10 +337,13 @@ Replace `imdb_quantitative.yaml` with any config file from the table below.
 
 During training, **only the LoRA adapter weights** are saved (~5–20 MB per checkpoint, not the full model).
 
-**What each checkpoint contains:**
-- `adapter_model.safetensors` — LoRA adapter weights
-- `adapter_config.json` — PEFT adapter config
-- `checkpoint_meta.json` — step, timestamp, model name, dataset, loss
+**Each checkpoint contains:**
+
+| File | Contents |
+|---|---|
+| `adapter_model.safetensors` | LoRA adapter weights |
+| `adapter_config.json` | PEFT adapter configuration |
+| `checkpoint_meta.json` | Step, timestamp, model name, dataset, loss |
 
 **Directory layout:**
 ```
@@ -330,10 +351,10 @@ output/<project>/checkpoints/<model>__<dataset>/
     step_000100/
     step_000200/
     ...
-    final/          ← always saved at training end
+    final/          # always saved at training end
 ```
 
-**No-overwrite policy:** Step directories are never overwritten. The `final/` checkpoint always reflects the latest run endpoint.
+> Step directories are **never overwritten**. The `final/` checkpoint always reflects the latest run endpoint.
 
 **Config:**
 ```yaml
@@ -352,50 +373,26 @@ InfiniTune has two independent evaluation modes:
 
 ### Inline Evaluation (during training)
 
-Runs automatically inside `trainer.py` at configurable step intervals.
+Runs automatically inside `trainer.py` at configurable step intervals. Writes results to `metrics.csv` and generates versioned plot and dashboard bundles at training end.
 
-Inline evaluation writes quantitative results to:
-- `output/<project>/logs/<run...>/metrics.csv`
-
-At training end, plots + a report are generated into a versioned artifact bundle under:
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/dashboards/dashboard_dark.png`
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/dashboards/dashboard_light.png`
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/insights/<theme>/...`
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/plots/<theme>/...`
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/report.html`
-- `evaluation_artifacts/index.json` keeps a history of all bundles for that run directory
-
-**Config control:**
 ```yaml
 evaluation:
   enabled: true
-  decoupled: false   # false = run inline during training, true = skip inline
+  decoupled: false   # false = inline | true = skip inline for maximum speed
 ```
-
-**To disable inline evaluation entirely for maximum speed:**
-```yaml
-evaluation:
-  decoupled: true
-```
-*(Alternatively, you can set `enabled: false` to disable evaluation completely in both modes.)*
 
 ### Decoupled Evaluation (after training)
 
-Run `evaluate.py` against any saved checkpoint. No Kafka required. Evaluates the full pool (not a sliding window) for definitive scores.
-
-Decoupled evaluation writes versioned artifacts under:
-- `eval_results.json` and `eval_config.json` (full metric payload)
-- `evaluation_artifacts/artifact_<timestamp>_<uid>/...` (dashboards, plots, insights, `report.html`, copied metrics snapshot)
-- `evaluation_artifacts/index.json` (bundle history for that eval directory)
+Run `evaluate.py` against any saved checkpoint. No Kafka required. Evaluates the full pool for definitive scores.
 
 ```bash
 # Evaluate final checkpoint
 python evaluate.py --config configs/imdb_quantitative.yaml
 
-# Evaluate specific step
+# Evaluate a specific step
 python evaluate.py --config configs/imdb_quantitative.yaml --step 500
 
-# Evaluate ALL checkpoints + produce combined CSV + plots
+# Evaluate ALL checkpoints and produce combined CSV + plots
 python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
 
 # List available checkpoints
@@ -404,30 +401,28 @@ python evaluate.py --config configs/imdb_quantitative.yaml --list
 
 Results saved to: `output/<project>/eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>_<uid>/`
 
-> See the per-config guide in [`docs/`](docs/README.md) for the exact commands and expected output for each configuration.
+> See the per-config guide in [`docs/`](docs/README.md) for exact commands and expected output for each configuration.
 
-**PowerShell copy-paste helpers**
-
-Use these when you want to regenerate artifacts from the most recent run without manually finding timestamps:
+**PowerShell helpers — regenerate artifacts from the latest run:**
 
 ```powershell
-# Latest INLINE training run -> full artifact bundle (plots + dashboards + report.html)
-$Config  = "configs/imdb_quantitative.yaml"                 # change per config
-$LogRoot = "output/imdb/logs/infinitune-imdb-sentiment"     # change per config
+# Latest inline training run
+$Config  = "configs/imdb_quantitative.yaml"
+$LogRoot = "output/imdb/logs/infinitune-imdb-sentiment"
 $Run = Get-ChildItem $LogRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $Csv = Join-Path $Run.FullName "metrics_clean.csv"
 if (-not (Test-Path $Csv)) { $Csv = Join-Path $Run.FullName "metrics.csv" }
 python utils/plot_metrics.py $Csv --config $Config
 
-# Latest single-checkpoint DECOUPLED eval -> full artifact bundle
-$Config   = "configs/imdb_quantitative.yaml"                # change per config
-$EvalRoot = "output/imdb/eval_results/distilgpt2__imdb"     # change per config
+# Latest single-checkpoint decoupled eval
+$Config   = "configs/imdb_quantitative.yaml"
+$EvalRoot = "output/imdb/eval_results/distilgpt2__imdb"
 $EvalRun = Get-ChildItem $EvalRoot -Directory -Recurse | Where-Object { $_.Name -like "eval_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $Csv = Join-Path $EvalRun.FullName "plots\eval_metrics.csv"
 python utils/plot_metrics.py $Csv --config $Config
 
-# Latest ALL-CHECKPOINTS comparison -> full artifact bundle
-$Config   = "configs/imdb_quantitative.yaml"                # change per config
+# Latest all-checkpoints comparison
+$Config   = "configs/imdb_quantitative.yaml"
 $EvalRoot = "output/imdb/eval_results/distilgpt2__imdb\all_checkpoints"
 $EvalRun = Get-ChildItem $EvalRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $Csv = Join-Path $EvalRun.FullName "all_checkpoints_results.csv"
@@ -438,89 +433,48 @@ python utils/plot_metrics.py $Csv --config $Config
 
 ## Output Directory Structure
 
-```text
+```
 output/<project>/
-|
-|-- checkpoints/<model>__<dataset>/
-|   |-- step_000100/
-|   |   |-- adapter_model.safetensors
-|   |   |-- adapter_config.json
-|   |   `-- checkpoint_meta.json
-|   `-- final/
-|
-|-- logs/<project-name>/<timestamp>_<uuid>/
-|   |-- metrics.csv
-|   |-- metrics_clean.csv
-|   |-- run_params.json
-|   `-- evaluation_artifacts/
-|       |-- index.json
-|       `-- artifact_<timestamp>_<uid>/
-|           |-- manifest.json
-|           |-- generation_log.json
-|           |-- metrics/
-|           |   |-- source_metrics.csv
-|           |   `-- resolved_metrics.csv
-|           |-- dashboards/
-|           |   |-- dashboard_dark.png
-|           |   `-- dashboard_light.png
-|           |-- insights/
-|           |   |-- dark/
-|           |   `-- light/
-|           |-- plots/
-|           |   |-- dark/
-|           |   `-- light/
-|           `-- report.html
-|
-`-- eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>_<uid>/
-    |-- eval_results.json
-    |-- eval_config.json
-    `-- evaluation_artifacts/
-        |-- index.json
-        `-- artifact_<timestamp>_<uid>/
-            |-- manifest.json
-            |-- generation_log.json
-            |-- metrics/
-            |-- dashboards/
-            |-- insights/
-            |-- plots/
-            `-- report.html
+│
+├── checkpoints/<model>__<dataset>/
+│   ├── step_000100/
+│   │   ├── adapter_model.safetensors
+│   │   ├── adapter_config.json
+│   │   └── checkpoint_meta.json
+│   └── final/
+│
+├── logs/<project-name>/<timestamp>_<uuid>/
+│   ├── metrics.csv
+│   ├── metrics_clean.csv
+│   ├── run_params.json
+│   └── evaluation_artifacts/
+│       ├── index.json
+│       └── artifact_<timestamp>_<uid>/
+│           ├── manifest.json
+│           ├── generation_log.json
+│           ├── metrics/
+│           ├── dashboards/
+│           │   ├── dashboard_dark.png
+│           │   └── dashboard_light.png
+│           ├── insights/
+│           ├── plots/
+│           └── report.html
+│
+└── eval_results/<model>__<dataset>/<checkpoint>/eval_<timestamp>_<uid>/
+    ├── eval_results.json
+    ├── eval_config.json
+    └── evaluation_artifacts/
+        ├── index.json
+        └── artifact_<timestamp>_<uid>/
+            ├── manifest.json
+            ├── metrics/
+            ├── dashboards/
+            ├── insights/
+            ├── plots/
+            └── report.html
 ```
 
 **No-overwrite guarantees:**
-- Training logs: unique `<timestamp>_<uuid>` directories per run
-- Step checkpoints: never overwritten
-- Eval results: new timestamped+UUID directory per `evaluate.py` run
-
----
-
-## Regenerating Evaluation Artifacts
-
-```bash
-# Regenerate a full artifact bundle from an existing metrics CSV (INLINE EVAL)
-# Important: pass the same config YAML so the dashboard can choose the correct
-# usecase/KPIs (otherwise it may show "No plottable data for dashboard.").
-python utils/plot_metrics.py output/<project>/logs/<run...>/metrics.csv --config configs/imdb_quantitative.yaml
-
-# Save the new bundle to a custom directory
-python utils/plot_metrics.py path/to/metrics.csv --out-dir ./my_plots --config configs/imdb_quantitative.yaml
-
-# Regenerate from a decoupled single-checkpoint eval CSV
-python utils/plot_metrics.py path/to/eval_results/<scope>/<checkpoint>/eval_<timestamp>_<uid>/plots/eval_metrics.csv --config configs/imdb_quantitative.yaml
-
-# Regenerate from an all-checkpoints comparison CSV
-python utils/plot_metrics.py path/to/eval_results/<scope>/all_checkpoints/eval_<timestamp>_<uid>/all_checkpoints_results.csv --config configs/imdb_quantitative.yaml
-```
-
-`python utils/plot_metrics.py ...` now generates the full evaluation bundle:
-- `plots/<theme>/...`
-- `insights/<theme>/...`
-- `dashboards/dashboard_dark.png`
-- `dashboards/dashboard_light.png`
-- `report.html`
-
-If you specifically want to trigger the same artifact pipeline from Python instead of the CLI, you can also run:
-```bash
-python -c "from utils.report_html import generate_html_report; import yaml; cfg=yaml.safe_load(open('configs/imdb_quantitative.yaml')); generate_html_report('path/to/metrics.csv', out_dir='path/to/out_dir', config=cfg)"
-```
-That helper also creates a fresh versioned bundle inside `path/to/out_dir/evaluation_artifacts/`, but `python utils/plot_metrics.py ...` is the recommended user-facing command.
-
+- Training logs use a unique `<timestamp>_<uuid>` directory per run
+- Step checkpoints are never overwritten
+- Each `evaluate.py` invocation creates a new timestamped directory
