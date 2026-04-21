@@ -2,6 +2,8 @@
 
 This directory contains detailed per-config testing guides for every InfiniTune configuration. Each guide covers what to run, what the model is expected to learn, how to interpret the metrics, and how to regenerate the full evaluation artifact bundle after training or offline evaluation.
 
+For a version-oriented summary of the current major release, see the [Infinitune v2 Release Notes](releases/infinitune-v2.md).
+
 ---
 
 ## Quick Reference
