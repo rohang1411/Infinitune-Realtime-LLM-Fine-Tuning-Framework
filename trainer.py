@@ -264,23 +264,71 @@ class LoRAProducer:
         self.topic = kafka_cfg['lora_updates_topic']
         self.producer = KafkaProducer(
             bootstrap_servers=kafka_cfg['bootstrap_servers'],
-            value_serializer=lambda v: self.serialize_tensor(v),
-            key_serializer=lambda k: k  # identity — key is pre-encoded to bytes in send_weights
+            value_serializer=lambda v: self.serialize_payload(v),
+            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None)
         )
 
-    def serialize_tensor(self, tensor):
+    def serialize_payload(self, value):
+        """Serializes tensor, dictionary metadata, or bytes safely using safetensors / JSON."""
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, dict):
+            return json.dumps(value).encode("utf-8")
+        if isinstance(value, torch.Tensor):
+            try:
+                from safetensors.torch import save
+                return save({"weight": value.contiguous().cpu()})
+            except Exception:
+                buffer = io.BytesIO()
+                torch.save(value.cpu(), buffer)
+                return buffer.getvalue()
         buffer = io.BytesIO()
-        torch.save(tensor, buffer)
+        torch.save(value, buffer)
         return buffer.getvalue()
-    
-    def send_weights(self, adapter_weights):
-        _log(f"Sending weights update... tensors={len(adapter_weights)} topic='{self.topic}'")
+
+    def serialize_tensor(self, tensor):
+        return self.serialize_payload(tensor)
+
+    def send_weights(self, adapter_weights, step_id=None):
+        """
+        Sends adapter weights with versioning, step_id, and commit markers to prevent torn updates.
+        """
+        num_tensors = len(adapter_weights)
+        step_tag = str(step_id) if step_id is not None else str(int(time.time()))
+        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}'")
+
+        # 1. Send manifest / header marker
+        manifest_meta = {
+            "step_id": step_tag,
+            "num_tensors": num_tensors,
+            "tensor_names": list(adapter_weights.keys()),
+            "timestamp": time.time(),
+        }
+        self.producer.send(
+            topic=self.topic,
+            key=f"__manifest__:{step_tag}".encode("utf-8"),
+            value=manifest_meta
+        )
+
+        # 2. Send each tensor with step-prefixed key
         for name, param in adapter_weights.items():
             self.producer.send(
                 topic=self.topic,
-                key=name.encode("utf-8") if isinstance(name, str) else name,
+                key=f"{step_tag}:{name}".encode("utf-8"),
                 value=param
             )
+
+        # 3. Send commit marker
+        commit_meta = {
+            "step_id": step_tag,
+            "status": "committed",
+            "timestamp": time.time(),
+        }
+        self.producer.send(
+            topic=self.topic,
+            key=f"__commit__:{step_tag}".encode("utf-8"),
+            value=commit_meta
+        )
         self.producer.flush()
 
     def send_done_signal(self):
@@ -928,7 +976,7 @@ def train_model(config, config_path: str = "(unknown)"):
             if time.time() - last_send_time >= weight_push_interval:
                 if kafka_cfg.get('enable_lora_streaming', True):
                     _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
-                    lora_producer.send_weights(get_peft_model_state_dict(model))
+                    lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
                 last_send_time = time.time()
 
     except KeyboardInterrupt:
@@ -968,7 +1016,7 @@ def train_model(config, config_path: str = "(unknown)"):
     try:
         if kafka_cfg.get('enable_lora_streaming', True):
             _log("Training complete. Sending final adapter weights.")
-            lora_producer.send_weights(get_peft_model_state_dict(model))
+            lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
             lora_producer.send_done_signal()
         else:
             _log("Training complete. LoRA streaming disabled, skipping final Kafka push.")

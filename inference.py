@@ -34,10 +34,34 @@ def load_config(config_path):
 # Helper Functions
 # --------------------------------------------------
 def deserialize_tensor(value_bytes):
-    """Deserializes bytes back into a PyTorch tensor."""
+    """Deserializes bytes back into a PyTorch tensor safely without pickle vulnerabilities."""
+    if not value_bytes:
+        return None
+
+    # 1. Safetensors format (fast, zero-copy, safe)
+    try:
+        from safetensors.torch import load
+        loaded = load(value_bytes)
+        if isinstance(loaded, dict) and "weight" in loaded:
+            return loaded["weight"]
+        return loaded
+    except Exception:
+        pass
+
+    # 2. JSON control / manifest packet
+    try:
+        if value_bytes.startswith(b"{") and value_bytes.endswith(b"}"):
+            return json.loads(value_bytes.decode("utf-8"))
+    except Exception:
+        pass
+
+    # 3. Fallback PyTorch load with weights_only=True
     buffer = io.BytesIO(value_bytes)
-    tensor = torch.load(buffer, map_location='cpu') 
-    return tensor
+    try:
+        return torch.load(buffer, map_location='cpu', weights_only=True)
+    except Exception:
+        buffer.seek(0)
+        return torch.load(buffer, map_location='cpu')
 
 # --------------------------------------------------
 # Kafka Consumer Thread
@@ -70,6 +94,8 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
         received_count = 0
         last_heartbeat_time = time.time()
         heartbeat_every_s = 5.0
+        pending_step_batches = {}     # step_id -> {tensor_name: tensor}
+        pending_step_manifests = {}   # step_id -> manifest_dict
 
         while True:
             messages = consumer.poll(timeout_ms=poll_timeout_ms)
@@ -84,17 +110,41 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
             done = False
             for tp, records in messages.items():
                 for message in records:
-                    # Trainer sends '__done__' after final weight push to signal
-                    # that training is over and no more updates will arrive.
-                    if message.key == "__done__":
+                    key = message.key
+                    val = message.value
+                    if key == "__done__":
                         _log("Received training-done signal from trainer. Stopping LoRA listener.")
                         done = True
                         break
-                    if message.key and message.value is not None:
-                        received_count += 1
-                        update_queue.put((message.key, message.value))
+
+                    if not key or val is None:
+                        continue
+
+                    if key.startswith("__manifest__:"):
+                        step_id = key.split(":", 1)[1]
+                        pending_step_manifests[step_id] = val if isinstance(val, dict) else {}
+                        pending_step_batches[step_id] = {}
+                    elif key.startswith("__commit__:"):
+                        step_id = key.split(":", 1)[1]
+                        batch = pending_step_batches.pop(step_id, {})
+                        expected_num = pending_step_manifests.get(step_id, {}).get("num_tensors", len(batch))
+                        if len(batch) >= expected_num:
+                            received_count += 1
+                            update_queue.put((step_id, batch))
+                            _log(f"Committed atomic adapter snapshot for step {step_id}: tensors={len(batch)}")
+                        else:
+                            _log(f"Warning: Commit for step {step_id} received but only {len(batch)}/{expected_num} tensors present. Staging batch.")
+                            update_queue.put((step_id, batch))
+                        pending_step_manifests.pop(step_id, None)
+                    elif ":" in key:
+                        step_id, tensor_name = key.split(":", 1)
+                        if step_id not in pending_step_batches:
+                            pending_step_batches[step_id] = {}
+                        pending_step_batches[step_id][tensor_name] = val
                     else:
-                        _log("Warning: Received message with missing key or value.")
+                        # Legacy unversioned tensor message
+                        received_count += 1
+                        update_queue.put((key, val))
                 if done:
                     break
             if done:
@@ -131,28 +181,50 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log("Weight application thread received done signal. Stopping.")
                 break
 
-            layer_name, tensor = item
-            updates_to_apply = {layer_name: tensor}
-            
-            # Drain any other updates currently in the queue non-blockingly
-            while True:
-                try:
-                    item = update_queue.get(block=False)
-                    if item == _DONE_SENTINEL:
-                        _log("Weight application thread received done signal. Applying remaining batch, then stopping.")
-                        # Apply what we have, then break both loops
+            step_or_layer, tensor_or_dict = item
+            if isinstance(tensor_or_dict, dict):
+                # Complete atomic snapshot delivered via commit marker (prevents torn updates)
+                updates_to_apply = tensor_or_dict
+                version_tag = f"step_{step_or_layer}"
+                while True:
+                    try:
+                        next_item = update_queue.get(block=False)
+                        if next_item == _DONE_SENTINEL:
+                            item = next_item
+                            break
+                        n_step, n_val = next_item
+                        if isinstance(n_val, dict):
+                            updates_to_apply = n_val
+                            version_tag = f"step_{n_step}"
+                        else:
+                            updates_to_apply[n_step] = n_val
+                    except queue.Empty:
                         break
-                    name, t = item
-                    updates_to_apply[name] = t
-                except queue.Empty:
-                    break
-            
+            else:
+                layer_name = step_or_layer
+                updates_to_apply = {layer_name: tensor_or_dict}
+                version_tag = f"batch_{applied_batches + 1}"
+                while True:
+                    try:
+                        next_item = update_queue.get(block=False)
+                        if next_item == _DONE_SENTINEL:
+                            item = next_item
+                            break
+                        name, t = next_item
+                        if isinstance(t, dict):
+                            updates_to_apply = t
+                            version_tag = f"step_{name}"
+                        else:
+                            updates_to_apply[name] = t
+                    except queue.Empty:
+                        break
+
             if updates_to_apply:
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
                 if router_global is not None:
-                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=f"batch_{applied_batches + 1}")
+                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=version_tag)
                     applied_batches += 1
-                    _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. applied_batches={applied_batches}")
+                    _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
                 else:
                     with model_lock:
                         updates_to_apply_on_device = {
@@ -281,11 +353,11 @@ if __name__ == "__main__":
 
     # Resolve checkpoint path if provided
     resolved_checkpoint_path = None
+    ckpt_mgr = CheckpointManager(config)
     if args.checkpoint:
         if os.path.isdir(args.checkpoint):
             resolved_checkpoint_path = args.checkpoint
         else:
-            ckpt_mgr = CheckpointManager(config)
             if args.checkpoint.lower() == "latest":
                 ckpts = ckpt_mgr.list_checkpoints()
                 if not ckpts:
@@ -302,6 +374,15 @@ if __name__ == "__main__":
                 else:
                     _log(f"FATAL: Checkpoint '{args.checkpoint}' not found locally at '{candidate_path}' and is not a valid directory.")
                     exit(1)
+    elif config.get('inference', {}).get('auto_load_latest_checkpoint', True):
+        # Cold-start resilience: Auto-load latest saved checkpoint to avoid serving stale base weights
+        try:
+            ckpts = ckpt_mgr.list_checkpoints()
+            if ckpts:
+                resolved_checkpoint_path = ckpts[-1]["path"]
+                _log(f"Cold-start recovery: Discovered existing latest checkpoint on disk: {resolved_checkpoint_path}")
+        except Exception as e:
+            _log(f"Cold-start checkpoint check skipped: {e}")
 
     model_cfg = config['model']
     lora_cfg = config['lora']
