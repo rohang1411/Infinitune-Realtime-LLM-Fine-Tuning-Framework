@@ -24,6 +24,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
 from utils.checkpoint_manager import CheckpointManager
+from utils.precision_manager import PrecisionManager
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -494,6 +495,13 @@ def train_model(config, config_path: str = "(unknown)"):
     # Ensure there is a pad token
     tokenizer.pad_token = tokenizer.eos_token
     
+    precision_mgr = PrecisionManager(
+        precision=model_cfg.get('precision', 'fp32'),
+        device=str(device),
+        enable_compile=training_cfg.get('enable_compile', False),
+        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
+    )
+    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, compile={precision_mgr.enable_compile}")
     _log("Loaded model; applying PEFT and LoRA adapter configuration...")
 
     model = get_peft_model(model, lora_config)
@@ -510,6 +518,7 @@ def train_model(config, config_path: str = "(unknown)"):
     else:
         _log("Gradient checkpointing disabled.")
 
+    model = precision_mgr.compile_model_if_enabled(model)
     # Set the model to training mode.
     model.train()
     
@@ -812,13 +821,17 @@ def train_model(config, config_path: str = "(unknown)"):
                 for s in batch_samples
             )
 
-            # Forward pass
-            outputs = model(**batch)
-            loss = outputs.loss
+            # Forward pass with precision autocasting
+            with precision_mgr.autocast_context():
+                outputs = model(**batch)
+                loss = outputs.loss
             accumulated_loss += loss.item()
             # Scale loss for gradient accumulation before backward
             scaled_loss = loss / training_args.gradient_accumulation_steps
-            scaled_loss.backward()
+            if precision_mgr.scaler is not None:
+                precision_mgr.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             grad_accum_counter += 1
 
             # CRITICAL MEMORY OPTIMIZATION:
