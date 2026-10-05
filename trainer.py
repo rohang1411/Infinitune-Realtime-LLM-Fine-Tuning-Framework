@@ -108,6 +108,11 @@ class MetricsLogger:
         "qual_pinned_slot_coverage_mean",
         "qual_pinned_perfect_coverage_rate",
         "qual_pinned_consistency_score",
+        # ── Extended Classification & Calibration metrics ─────────────────────
+        "other_rate",
+        "f1_macro",
+        "f1_with_other",
+        "ece",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
