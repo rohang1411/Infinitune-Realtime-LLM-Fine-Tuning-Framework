@@ -1,3 +1,4 @@
+from typing import Optional
 import time
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import yaml
 from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
+from utils.serving_router import DoubleBufferedAdapterRouter
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -147,13 +149,18 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
             
             if updates_to_apply:
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
-                with model_lock:
-                    updates_to_apply_on_device = {
-                        k: v.to(device) for k, v in updates_to_apply.items()
-                    }
-                    model.load_state_dict(updates_to_apply_on_device, strict=False)
-                applied_batches += 1
-                _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
+                if router_global is not None:
+                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=f"batch_{applied_batches + 1}")
+                    applied_batches += 1
+                    _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. applied_batches={applied_batches}")
+                else:
+                    with model_lock:
+                        updates_to_apply_on_device = {
+                            k: v.to(device) for k, v in updates_to_apply.items()
+                        }
+                        model.load_state_dict(updates_to_apply_on_device, strict=False)
+                    applied_batches += 1
+                    _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
 
             # If we hit the sentinel inside the drain loop, stop after this apply
             if item == _DONE_SENTINEL:
@@ -210,6 +217,7 @@ tokenizer_global = None
 model_lock_global = None
 device_global = None
 config_global = None
+router_global: Optional[DoubleBufferedAdapterRouter] = None
 
 @app.route('/generate', methods=['POST'])
 def handle_generate():
@@ -248,6 +256,13 @@ def health_check():
     """Simple health check endpoint."""
     # Could add more checks here (e.g., Kafka connection)
     return jsonify({"status": "ok"}), 200
+
+@app.route('/metrics', methods=['GET'])
+def get_metrics():
+    """Returns real-time serving SLAs, latency percentiles, and hot-swap telemetry."""
+    if router_global is not None:
+        return jsonify(router_global.get_metrics()), 200
+    return jsonify({"status": "router_not_initialized"}), 200
 
 # --------------------------------------------------
 # Main Execution Block
@@ -357,6 +372,10 @@ if __name__ == "__main__":
     update_queue = queue.Queue()
     model_lock = threading.Lock()
     model_lock_global = model_lock
+    router_global = DoubleBufferedAdapterRouter(model, tokenizer, device=device_global)
+    if resolved_checkpoint_path:
+        router_global.active_version = os.path.basename(resolved_checkpoint_path)
+    _log("DoubleBufferedAdapterRouter initialized for lock-free concurrent inference.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
     #    We skip this entirely if a standalone checkpoint was provided and resolved.
