@@ -51,6 +51,26 @@ def compute_file_sha256(filepath: str, chunk_size: int = 65536) -> str:
     return hasher.hexdigest()
 
 
+def compute_hmac_sha256(filepath: str, secret_key: bytes, chunk_size: int = 65536) -> str:
+    """Compute HMAC-SHA256 signature for a file using a secret key."""
+    import hmac
+    mac = hmac.new(secret_key, digestmod=hashlib.sha256)
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            mac.update(chunk)
+    return mac.hexdigest()
+
+
+def verify_hmac_sha256(filepath: str, secret_key: bytes, expected_signature: str) -> bool:
+    """Verify HMAC-SHA256 signature using constant-time comparison."""
+    import hmac
+    actual = compute_hmac_sha256(filepath, secret_key)
+    return hmac.compare_digest(actual.lower(), expected_signature.lower())
+
+
 def save_adapter_weights(
     state_dict: Dict[str, torch.Tensor],
     target_path: str,
@@ -85,6 +105,8 @@ def save_adapter_weights(
 def load_adapter_weights(
     weight_path: str,
     expected_checksum: Optional[str] = None,
+    secret_key: Optional[bytes] = None,
+    expected_hmac: Optional[str] = None,
     device: str = "cpu"
 ) -> Dict[str, torch.Tensor]:
     """
@@ -100,6 +122,12 @@ def load_adapter_weights(
             raise ChecksumMismatchError(
                 f"Checksum mismatch for {weight_path}: "
                 f"expected {expected_checksum}, got {actual_checksum}"
+            )
+
+    if secret_key is not None and expected_hmac is not None:
+        if not verify_hmac_sha256(weight_path, secret_key, expected_hmac):
+            raise ChecksumMismatchError(
+                f"HMAC authentication failed for {weight_path}: signature mismatch."
             )
 
     if weight_path.endswith(".safetensors") and HAS_SAFETENSORS:
@@ -139,6 +167,7 @@ class AdapterManifest:
         manifest_version: str = "1.0",
         timestamp: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        hmac_signature: Optional[str] = None,
     ):
         self.manifest_version = manifest_version
         self.adapter_version = adapter_version
@@ -150,6 +179,18 @@ class AdapterManifest:
         self.canary_metrics = canary_metrics or {}
         self.status = status
         self.extra_metadata = extra_metadata or {}
+        self.hmac_signature = hmac_signature
+
+    def sign_with_hmac(self, secret_key: bytes) -> str:
+        """Compute and attach HMAC-SHA256 signature to the manifest."""
+        self.hmac_signature = compute_hmac_sha256(self.artifact_path, secret_key)
+        return self.hmac_signature
+
+    def verify_hmac(self, secret_key: bytes) -> bool:
+        """Verify HMAC-SHA256 signature against the artifact file."""
+        if not self.hmac_signature:
+            return False
+        return verify_hmac_sha256(self.artifact_path, secret_key, self.hmac_signature)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert manifest to serializable dictionary."""
@@ -164,6 +205,7 @@ class AdapterManifest:
             "canary_metrics": self.canary_metrics,
             "status": self.status,
             "extra_metadata": self.extra_metadata,
+            "hmac_signature": self.hmac_signature,
         }
 
     def to_json(self, indent: int = 2) -> str:

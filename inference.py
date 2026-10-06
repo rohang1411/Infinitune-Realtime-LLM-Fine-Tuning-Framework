@@ -221,18 +221,23 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
 
             if updates_to_apply:
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
-                if router_global is not None:
+                global active_version_global
+                if serving_mode_global == "router" and router_global is not None:
                     swap_ms = router_global.swap_weights(updates_to_apply, version_tag=version_tag)
+                    active_version_global = version_tag
                     applied_batches += 1
                     _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
                 else:
+                    swap_start = time.perf_counter()
                     with model_lock:
                         updates_to_apply_on_device = {
                             k: v.to(device) for k, v in updates_to_apply.items()
                         }
                         model.load_state_dict(updates_to_apply_on_device, strict=False)
+                        active_version_global = version_tag
+                    swap_ms = (time.perf_counter() - swap_start) * 1000.0
                     applied_batches += 1
-                    _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
+                    _log(f"Weight updates applied via legacy model_lock in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
 
             # If we hit the sentinel inside the drain loop, stop after this apply
             if item == _DONE_SENTINEL:
@@ -290,6 +295,8 @@ model_lock_global = None
 device_global = None
 config_global = None
 router_global: Optional[DoubleBufferedAdapterRouter] = None
+serving_mode_global: str = "router"
+active_version_global: str = "v0_base" 
 
 @app.route('/generate', methods=['POST'])
 def handle_generate():
@@ -309,16 +316,35 @@ def handle_generate():
          print("Error: Model not initialized when request received.")
          return jsonify({"error": "Model not initialized yet. Please wait."}), 503 # Service Unavailable
 
-    print(f"Received generation request for prompt: '{prompt[:80]}...'")
+    print(f"Received generation request for prompt: '{prompt[:80]}...' [mode={serving_mode_global}]")
     try:
-        # Call the existing generation function using global objects
-        generated_text = generate_text(
-            prompt, model_global, tokenizer_global, model_lock_global,
-            device_global, config_global['inference']
-        )
-        end_time = time.time()
-        print(f"Generation finished in {end_time - start_time:.2f} seconds.")
-        return jsonify({"generated_text": generated_text})
+        if serving_mode_global == "router" and router_global is not None:
+            res = router_global.generate(prompt, config_global['inference'])
+            end_time = time.time()
+            resp = jsonify({
+                "generated_text": res["response"],
+                "adapter_version": res["version"],
+                "latency_ms": res["latency_ms"],
+                "serving_mode": "router",
+            })
+            resp.headers["X-Adapter-Version"] = res["version"]
+            return resp, 200
+        else:
+            generated_text = generate_text(
+                prompt, model_global, tokenizer_global, model_lock_global,
+                device_global, config_global['inference']
+            )
+            end_time = time.time()
+            print(f"Generation finished in {end_time - start_time:.2f} seconds.")
+            v = active_version_global
+            resp = jsonify({
+                "generated_text": generated_text,
+                "adapter_version": v,
+                "latency_ms": round((end_time - start_time) * 1000.0, 2),
+                "serving_mode": "legacy_lock",
+            })
+            resp.headers["X-Adapter-Version"] = v
+            return resp, 200
     except Exception as e:
         print(f"Error during generation endpoint: {e}")
         return jsonify({"error": "Internal server error during generation"}), 500
@@ -345,11 +371,17 @@ if __name__ == "__main__":
                         help="Path to configuration YAML file")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
+    parser.add_argument("--serving-mode", type=str, choices=["router", "legacy_lock"], default="router",
+                        help="Serving mode: 'router' uses DoubleBufferedAdapterRouter with ReadWriteLock; 'legacy_lock' uses global mutex")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Port to bind the Flask HTTP server to (default: 8000)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config_global = config
+    serving_mode_global = args.serving_mode
     _log(f"Loaded config: {args.config}")
+    _log(f"Serving mode configured: '{serving_mode_global}'")
 
     # Resolve checkpoint path if provided
     resolved_checkpoint_path = None
@@ -476,8 +508,8 @@ if __name__ == "__main__":
         consumer_thread.start()
         applier_thread.start()
 
-    FLASK_HOST = inference_cfg.get('host', 'localhost')
-    FLASK_PORT = inference_cfg.get('port', 5000)
+    FLASK_HOST = inference_cfg.get('host', '0.0.0.0')
+    FLASK_PORT = args.port or inference_cfg.get('port', 8000)
 
     _log(f"Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
     _log("Send POST requests to /generate with JSON body: {'prompt': 'your prompt here'}")

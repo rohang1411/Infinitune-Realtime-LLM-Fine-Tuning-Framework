@@ -129,3 +129,44 @@ def test_create_and_save_adapter_artifact_e2e(dummy_weights):
         assert loaded_manifest.base_model == "distilgpt2"
         weights = loaded_manifest.load_weights()
         assert len(weights) == 2
+
+
+def test_hmac_signing_and_verification(dummy_weights):
+    from utils.adapter_manifest import compute_hmac_sha256, verify_hmac_sha256
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "adapter.safetensors")
+        saved_path = save_adapter_weights(dummy_weights, path, use_safetensors=True)
+        secret_key = b"super_secret_infinitune_key"
+
+        sig = compute_hmac_sha256(saved_path, secret_key)
+        assert len(sig) == 64
+        assert verify_hmac_sha256(saved_path, secret_key, sig) is True
+        assert verify_hmac_sha256(saved_path, b"wrong_key", sig) is False
+
+        # Test manifest signing
+        manifest = AdapterManifest(
+            adapter_version="step_100",
+            base_model="distilgpt2",
+            step=100,
+            artifact_path=saved_path,
+            checksum_sha256=compute_file_sha256(saved_path),
+        )
+        manifest.sign_with_hmac(secret_key)
+        assert manifest.verify_hmac(secret_key) is True
+        assert manifest.verify_hmac(b"wrong_key") is False
+
+        # Load weights with HMAC verification
+        loaded = load_adapter_weights(
+            saved_path,
+            secret_key=secret_key,
+            expected_hmac=manifest.hmac_signature
+        )
+        assert len(loaded) == 2
+
+        with pytest.raises(ChecksumMismatchError):
+            load_adapter_weights(
+                saved_path,
+                secret_key=secret_key,
+                expected_hmac="a" * 64
+            )
