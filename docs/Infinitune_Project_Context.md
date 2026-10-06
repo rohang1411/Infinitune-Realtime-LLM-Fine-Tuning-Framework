@@ -74,7 +74,7 @@
     - [UUID Run Isolation](#127-uuid-run-isolation)
     - [Producer Topic Hygiene](#128-producer-topic-hygiene)
     - [Decoupled Flag — Removing Eval from the Hot Path](#129-decoupled-flag--removing-eval-from-the-hot-path)
-    - [Balanced Sliding-Window Evaluation](#1210-balanced-sliding-window-evaluation)
+    - [Full-Pool and Structured Evaluation Windows](#1210-full-pool-and-structured-evaluation-windows)
     - [Left-Padding for Batched Generation](#1211-left-padding-for-batched-generation)
     - [Lazy-Loaded Heavy Models](#1212-lazy-loaded-heavy-models)
 13. [Production Forensic Audit, Metrics Deep Dive & External Audit Reference](#13-production-forensic-audit-metrics-deep-dive--external-audit-reference)
@@ -177,10 +177,10 @@ InfiniTune is designed for scenarios where:
 │                                  │                  │  │              │ │
 │                                  │ Base Model       │  │ Base Model   │ │
 │                                  │ + LoRA Adapter   │  │ + LoRA       │ │
-│                                  │ (QLoRA training) │  │   (hot-swap) │ │
+│                                  │ (LoRA training)  │  │   (hot-swap) │ │
 │                                  │                  │  │              │ │
 │                                  │ → Saves checkpts │  │ Flask REST   │ │
-│                                  │ → Pushes weights │  │ API :5000    │ │
+│                                  │ → Pushes weights │  │ API :8000    │ │
 │                                  └────────┬─────────┘  └──────────────┘ │
 │                                           │                              │
 │                                    output/checkpoints/                   │
@@ -1258,7 +1258,7 @@ Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C inte
 
 ### 6.11 `utils/adapter_manifest.py` — Signed Adapter Manifest Protocol & Safetensors
 
-**Role:** Provides a cryptographically verified, zero-copy serialization protocol for LoRA adapter weights, completely eliminating Python pickle vulnerabilities and detecting data tampering or torn updates.
+**Role:** Provides a cryptographically verified, safe serialization protocol for LoRA adapter weights, completely eliminating Python pickle vulnerabilities and detecting data tampering, signature mismatch, or torn updates.
 
 #### Core Capabilities
 - **`AdapterManifest` Dataclass:** Encapsulates complete provenance metadata:
@@ -1272,10 +1272,10 @@ Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C inte
       tensors: Dict[str, Dict]   # Tensor name -> {"shape": list, "dtype": str}
       total_parameters: int      # Sum of trainable adapter parameters
       sha256_checksum: str       # Cryptographic SHA-256 digest of safetensors payload
-      signature: Optional[str]   # Cryptographic authentication signature
+      signature: Optional[str]   # HMAC-SHA256 digital signature
   ```
-- **Zero-Copy Safetensors I/O:** Serializes state dictionaries via `safetensors.torch.save()` into contiguous byte buffers, avoiding pickle code execution vectors.
-- **Integrity & Tamper Verification:** `load_adapter_weights()` recomputes the SHA-256 hash of the received bytes and validates it against the manifest before returning tensors. Raises `ValueError` upon corruption or signature mismatch.
+- **Safe Safetensors I/O:** Serializes state dictionaries via `safetensors.torch.save()` into raw byte buffers, eliminating arbitrary code execution vectors.
+- **Integrity & HMAC Authentication:** `load_adapter_weights()` verifies the HMAC-SHA256 signature against a pre-shared secret key and recomputes the SHA-256 checksum of received bytes before deserializing tensors. Raises `ValueError` upon tampering, truncation, or signature failure.
 - **Atomic File Artifact Bundling:** `create_adapter_artifact()` creates self-contained directories with `adapter_model.safetensors` and `manifest.json`.
 
 ---
@@ -1290,17 +1290,20 @@ Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C inte
   - When an adapter update arrives, `writer_acquire()` sets a `waiting_writers` flag, preventing new readers from entering. Once active readers drain, the writer executes exclusively.
   - Prevents writer starvation under sustained high-throughput inference traffic.
 - **Double-Buffered State Architecture:**
-  - Holds an `active_adapter` (currently serving traffic) and a `shadow_adapter` (pre-allocated buffer).
-  - Background weight updates deserialize incoming tensors and populate the shadow buffer on the device.
-  - The hot-swap executes an instantaneous pointer swap:
+  - Holds model state and prepares incoming weight dictionaries on the execution device in background threads before acquiring synchronization locks.
+  - The hot-swap applies device-prepared tensors under an exclusive write lock:
     ```python
-    with self._rwlock.write_lock(timeout=5.0):
-        self._active_weights, self._shadow_weights = self._shadow_weights, self._active_weights
-        self._active_version = version_tag
-        self._swap_count += 1
+    prepared_weights = {k: v.to(self.device) for k, v in new_state_dict.items()}
+    self.rw_lock.acquire_write()
+    try:
+        self.model.load_state_dict(prepared_weights, strict=False)
+        self.active_version = version_tag
+        self.swap_count += 1
+    finally:
+        self.rw_lock.release_write()
     ```
-  - **Measured Pause Time:** Swap executes in **`< 2.5ms`** (vs 180ms with the legacy model lock), guaranteeing zero dropped requests under concurrency.
-- **Real-Time Latency Telemetry:** Tracks rolling distributions of inference latencies (p50, p95, p99 TTFT) and swap durations, exposed directly via the `/metrics` endpoint.
+  - **Zero Request Dropping:** Live generation requests run concurrently under shared read locks; incoming writer requests yield priority to drain active readers without dropping in-flight traffic.
+- **Real-Time Latency Telemetry:** Tracks rolling distributions of request latencies (p50, p95, p99) and swap durations, exposed directly via the `/metrics` endpoint (verified in `reports/serving_ab/run_manifest.json`).
 
 ---
 
@@ -1360,13 +1363,13 @@ Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C inte
 **Role:** Asynchronous, multi-threaded stress-testing harness measuring serving latency SLAs, throughput ceilings, and hot-swap pause times under concurrent HTTP traffic.
 
 #### Operational Workflow
-- Spawns $N$ concurrent client threads (concurrency sweep: 1, 4, 8, 16, 32, 64) issuing POST requests to `/generate`.
-- Records per-request wall-clock latency, Time to First Token (TTFT), HTTP response status codes, and network errors.
-- Forces multiple live adapter hot-swaps during active generation load.
-- Outputs structured JSON/markdown report containing:
-  - Total requests, successful requests, dropped requests (target: 0.00%)
-  - Sustained throughput (Requests Per Second - RPS)
-  - Latency percentiles: p50, p95, p99 TTFT in steady-state vs during live swaps.
+- Spawns $N$ concurrent client worker threads issuing POST requests to `/generate`.
+- Records client-side end-to-end wall-clock latency, server-reported processing latency, adapter versions (`X-Adapter-Version` header), and HTTP response status codes.
+- Measures throughput under continuous load and during live adapter hot-swaps.
+- Outputs structured JSON report and run manifest containing:
+  - Total requests, successful requests, dropped requests (achieved 0.00% failure rate)
+  - Sustained throughput (Queries Per Second - QPS)
+  - Client and server latency percentiles: p50, p95, p99, and arithmetic mean.
 
 ---
 
@@ -1431,7 +1434,7 @@ model:
   name: "distilgpt2"      # HuggingFace model ID
                           # e.g., "Qwen/Qwen2.5-1.5B", "gpt2-medium"
   task_type: "CAUSAL_LM"  # CAUSAL_LM | SEQ_2_SEQ_LM | TOKEN_CLS | SEQ_CLS
-  precision: "fp32"       # fp32 | fp16 | bf16 | 4bit
+  precision: "fp32"       # fp32 | fp16 | bf16
                           # fp32 is the stable default (prevents NaN on MPS)
   max_seq_length: 512     # Max tokens per sample (prompt + response)
 
@@ -2250,9 +2253,9 @@ The synchronization primitive is a custom **`ReadWriteLock` with Writer Priority
 
 > **Previously:** The inference server deserialized Kafka records via raw `torch.load(buffer, map_location='cpu')`, introducing critical Python pickle Remote Code Execution (RCE) vulnerabilities.
 >
-> **Now:** Deserialization is hardened via zero-copy safetensors:
-- Payload serialization defaults to `safetensors.torch.save()` with SHA-256 integrity verification.
-- Deserializer parses safetensors zero-copy buffers directly into PyTorch tensors.
+> **Now:** Deserialization is hardened via safetensors and HMAC authentication:
+- Payload serialization defaults to `safetensors.torch.save()` with SHA-256 integrity verification and HMAC-SHA256 signature enforcement.
+- Deserializer parses safetensors byte buffers directly into PyTorch tensors without invoking Python pickle.
 - Legacy PyTorch fallback strictly enforces `weights_only=True` to reject arbitrary executable bytecodes.
 
 ### 11.5 Cold-Start Staleness Elimination & Auto-Discovery
@@ -2282,21 +2285,24 @@ Response:
 {"status": "ok"}
 ```
 
-**`GET /metrics`** (New Prometheus/SLA Observability Endpoint)
-Exposes live operational metrics:
+**`GET /metrics`** (Serving SLA Telemetry Endpoint)
+Exposes real-time operational telemetry from `DoubleBufferedAdapterRouter.get_metrics()`:
 ```json
 {
-  "active_version": "step_1000",
-  "swap_count": 42,
-  "last_swap_duration_ms": 2.14,
-  "total_swap_duration_ms": 94.62,
-  "inference_count": 15840,
-  "latency_p50_ms": 28.4,
-  "latency_p95_ms": 52.1,
-  "latency_p99_ms": 84.6,
-  "active_readers": 4
+  "active_version": "final",
+  "swap_count": 0,
+  "last_swap_duration_ms": 0.0,
+  "avg_swap_duration_ms": 0.0,
+  "requests_served": 20,
+  "in_flight_requests": 0,
+  "dropped_requests": 0,
+  "p50_latency_ms": 332.54,
+  "p95_latency_ms": 875.16,
+  "p99_latency_ms": 875.16,
+  "avg_latency_ms": 365.61
 }
 ```
+*(Values above reflect actual measured metrics from `reports/serving_ab/router_results.json` on distilgpt2).*
 
 ---
 
@@ -2461,17 +2467,17 @@ All three are configurable in the `kafka:` YAML block and default to the above v
 
 ---
 
-### 12.10 Balanced Sliding-Window Evaluation
+### 12.10 Full-Pool and Structured Evaluation Windows
 
-**Context:** The original sliding window advanced by `eval_batch_size` samples on each call. For class-imbalanced datasets (e.g., a window that happened to contain 95% "positive" reviews), accuracy could spike or crash due to window composition rather than model quality.
+**Context:** The original sliding window advanced by `eval_batch_size` samples on each call. For datasets evaluated on small windows, accuracy could fluctuate due to window composition rather than true model learning dynamics.
 
 **Implementation:**
-- `eval_batch_size: "full_pool"` alias (also accepts `"full"`, `"all"`, `"entire_pool"`) evaluates the entire shuffled pool at once — eliminating window noise.
-- `other_label` fallback bucket absorbs off-label predictions instead of incorrectly assigning them to the nearest known label.
-- `_normalize_class_match_labels()` collapses unexpected predicted labels back into the known label space before confusion matrix computation.
+- `eval_batch_size: "full_pool"` alias (also accepts `"full"`, `"all"`, `"entire_pool"`) evaluates the entire shuffled pool at once — eliminating window composition noise.
+- `other_label` fallback bucket absorbs off-label predictions instead of incorrectly assigning them to valid target classes.
+- `_normalize_class_match_labels()` maps predicted labels into the known label space before confusion matrix computation.
 - `max_distinct_labels_for_structure_metrics` guard prevents confusion-matrix metrics from running on open-ended generative tasks.
 
-**Impact:** Stable, comparable accuracy measurements across eval calls. No false accuracy spikes from lucky window sampling.
+**Impact:** Stable, comparable accuracy measurements across eval calls. Eliminates sliding-window composition artifacts.
 
 ---
 
@@ -2704,6 +2710,8 @@ For third-party technical auditors verifying the system:
 | `hashlib` | (stdlib) | SHA-256 hashing for Kafka message keys |
 | `scipy` | (transitive) | Statistics utilities (transitive via transformers/datasets) |
 | `numpy` | (transitive) | Array operations for confusion matrix metrics |
+| `safetensors` | >= 0.4.0 | Safe tensor serialization protocol with SHA-256 / HMAC support |
+| `scikit-learn` | >= 1.3.0 | Confusion matrix, Macro F1, and classification metrics |
 | `trl` | Any | In `requirements.txt`; not directly used in current code (available for future SFT trainers) |
 | `wandb` | Any | In `requirements.txt`; not integrated in current codebase (available for future experiment tracking) |
 
@@ -2713,9 +2721,9 @@ For third-party technical auditors verifying the system:
 
 | Platform | Status | Notes |
 |---|---|---|
-| **CUDA GPU (Linux/Windows)** | Fully supported | Primary target. `fp16`/`bf16` training available. |
-| **Apple Silicon MPS (macOS)** | Fully supported | Officially tested with memory sweep (§12.1). Stable at ~10 GB for 3B models. `fp32` recommended. |
-| **CPU** | Fallback | Functional but slow. Not recommended for models > 500M params. |
+| **CUDA GPU (Linux/Windows)** | Fully supported | Primary target. `fp16`/`bf16` training and `torch.compile` available. |
+| **Apple Silicon MPS (macOS)** | Fully supported | Tested with memory sweep (§12.1). Stable at ~10 GB unified memory for 1.5B models (fp16/fp32) and ~6-8 GB for distilgpt2 (fp32). 3B models in fp32 require 16GB+ RAM. |
+| **CPU** | Supported | Functional benchmark and inference platform. Used for local serving SLA verification. |
 
 ---
 
@@ -2956,14 +2964,14 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | 18 | Eval sample balance | Sliding window could be class-imbalanced | `full_pool` alias, `other_label` bucket, `_normalize_class_match_labels()` |
 | 19 | Heavy eval models | Eager loading at evaluator init | Lazy-load on first `score()`/`compute()` call, CPU-only, ~120 MB / ~90 MB |
 | 20 | Report surface | PNG dashboard embedded in `report.html`; KPI text overlapped | Independent Plotly HTML + reconstructed card-based PNG dashboard; usecase-aware KPIs |
-| 21 | F1 metric dilution | Unmapped outputs added as 3rd class `other`, diluting binary Macro F1 to 0.576 | Evaluated valid target classes strictly (`f1_macro`), unmasking true 0.825 F1; isolated format errors into `other_rate` |
-| 22 | Model weight serialization | Insecure Python `torch.load` pickle deserialization over network Kafka streams | Zero-copy `safetensors.torch.save` / `load` with SHA-256 checksums and `weights_only=True` fallback |
+| 21 | F1 metric dilution | Unmapped outputs added as 3rd class `other`, diluting binary Macro F1 to 0.5758 | Evaluated target classes strictly (`f1_macro`), reconciling true 0.8638 binary F1; isolated format errors into `other_rate` |
+| 22 | Model weight serialization | Insecure Python `torch.load` pickle deserialization over network Kafka streams | `safetensors.torch.save` / `load` with HMAC-SHA256 signatures, SHA-256 checksums, and `weights_only=True` fallback |
 | 23 | Stream update atomicity | Layers pushed independently without commit markers, risking torn model states | Manifest header + step-tagged layer keys + `__commit__` sentinel protocol buffering full atomic snapshots |
 | 24 | Serving concurrency | Global `model_lock` serializing all requests to concurrency=1 | `DoubleBufferedAdapterRouter` + `ReadWriteLock`; concurrent parallel reads; non-blocking live adapter swaps |
 | 25 | Cold-start staleness | `auto_offset_reset="latest"` caused restarted servers to serve base weights for up to 60s | Cold-start auto-discovery pre-loads latest disk checkpoint on boot before opening HTTP port |
-| 26 | Hardware acceleration & MFU | Naive FP32 execution capped throughput and memory bandwidth | `PrecisionManager` with CUDA BF16 AMP, FP16 GradScaler, `torch.compile`, and continuous MFU profiling |
+| 26 | Hardware acceleration & MFU | Naive FP32 execution capped throughput on capable hardware | `PrecisionManager` supporting CUDA BF16 AMP, FP16 GradScaler, `torch.compile`, and device MFU profiling |
 | 27 | Continual learning rigor | Within-task variance claimed as BWT without domain shift | Formal 3-phase domain shift benchmark (`run_streaming_cl.py`), reservoir replay buffer ($N=1,000$), ADWIN detector |
-| 28 | Observability & SLAs | Zero serving latency or swap telemetry | Added `/metrics` endpoint with p50/p95/p99 TTFT percentiles and automated load tester (`load_test_serving.py`) |
+| 28 | Observability & SLAs | Zero serving latency or swap telemetry | Added `/metrics` endpoint with p50/p95/p99 request latency percentiles and automated load tester (`load_test_serving.py`) |
 
 ---
 
@@ -2971,7 +2979,6 @@ A chronological record of all major "old → new" transitions. Each entry corres
 
 | Term | Definition |
 |---|---|
-| **LoRA** | Low-Rank Adaptation — fine-tuning method that inserts small trainable matrices into frozen model layers |
 | **LoRA** | Low-Rank Adaptation: freezes pre-trained LLM weights and injects trainable rank decomposition matrices ($r=16, \alpha=32$). InfiniTune trains LoRA in full (fp32) or mixed (bf16) precision. |
 | **QLoRA** | LoRA applied to a 4-bit NF4 quantized base model. (Not used in the active streaming pipeline to preserve numerical precision and avoid dequantization hot-swap overhead). |
 | **PEFT** | Parameter-Efficient Fine-Tuning — umbrella term for methods like LoRA that train far fewer parameters than the full model |
@@ -3026,16 +3033,16 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | **Evaluation Artifact Bundle** | Versioned directory (`artifact_<timestamp>_<uid>/`) containing `report.html`, PNG dashboards, per-metric plots, `manifest.json`, and `generation_log.json` |
 | **Left-padding** | Tokenizer mode where padding tokens are added to the left of sequences; required for correct batch generation with decoder-only causal models |
 | **PeftModel.from_pretrained** | PEFT library function that loads a LoRA adapter from a checkpoint directory onto an existing base model |
-| **DoubleBufferedAdapterRouter** | High-performance serving router maintaining active and shadow adapter buffers for sub-2.5ms zero-downtime hot-swaps |
+| **DoubleBufferedAdapterRouter** | High-performance serving router using reader-writer locking with writer priority for atomic weight application without dropping requests |
 | **ReadWriteLock** | Synchronization primitive providing shared concurrent access for readers with writer-priority to prevent starvation |
 | **Torn Update** | Corrupted model state occurring when an inference engine applies a partial subset of adapter layers across consecutive steps |
-| **Safetensors** | High-performance, zero-copy serialization format for deep learning tensors with total immunity from pickle exploits |
+| **Safetensors** | Fast, secure serialization format for deep learning tensors with total immunity from Python pickle exploits |
 | **AdapterManifest** | Cryptographically verified JSON metadata envelope containing step ID, parameter counts, and SHA-256 payload digest |
-| **Time to First Token (TTFT)** | Wall-clock latency from request arrival until generation of the initial response token |
+| **Request Latency** | Wall-clock latency from request arrival to complete HTTP generation response delivery |
 | **Expected Calibration Error (ECE)** | Difference between model predicted confidence probabilities and actual empirical accuracy across confidence bins |
 | **Model FLOPs Utilization (MFU)** | Ratio of observed floating-point operations per second to the theoretical peak capability of the underlying accelerator |
 | **Reservoir Sampling (Algorithm R)** | Bounded-memory algorithm guaranteeing uniform probability of retention across an unbounded data stream |
-| **Golden Canary Benchmark** | Stationary held-out evaluation set used to automatically gate model promotion and trigger sub-50ms rollbacks |
+| **Golden Canary Benchmark** | Stationary held-out evaluation set used to automatically gate model promotion and trigger rollbacks upon regression |
 | **ADWIN (Adaptive Windowing)** | Statistical concept drift detection algorithm that dynamically splits observation windows using Hoeffding bounds |
 | **Backward Transfer (BWT)** | Continual learning metric quantifying performance changes on previously learned tasks after training on new tasks |
 | **Forward Transfer (FWT)** | Continual learning metric quantifying positive zero-shot transfer onto future tasks prior to explicit training |
