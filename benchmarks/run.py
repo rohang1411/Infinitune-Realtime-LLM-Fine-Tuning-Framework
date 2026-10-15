@@ -1494,7 +1494,7 @@ def suite_swap_stress(run, args):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from peft import get_peft_model_state_dict
     from benchmarks.repro_eval import load_model
-    from utils.serving_router import DoubleBufferedAdapterRouter
+    from utils.serving_router import DoubleBufferedAdapterRouter, nearest_rank_percentile
 
     adapter = args.checkpoint or str(ROOT / "output/imdb/checkpoints/distilgpt2__imdb/final")
     if not Path(adapter).exists():
@@ -1504,68 +1504,157 @@ def suite_swap_stress(run, args):
 
     def measure():
         model, tokenizer, device = load_model(args.model, adapter)
-        router = DoubleBufferedAdapterRouter(model, tokenizer, device)
         weights = get_peft_model_state_dict(model)
         raw_path = run.directory / "raw_requests" / "swap_stress.jsonl"
         raw_path.parent.mkdir(exist_ok=True)
         swaps = {"smoke": 5, "standard": 100, "full": 500}[args.profile]
         requests = PROFILES[args.profile]["requests"]
-        progress = Progress("swap_stress")
-        swap_latencies = []
-        failures = []
 
-        def swap_worker():
-            start_deadline = time.monotonic() + 30
-            while router.in_flight_requests == 0 and time.monotonic() < start_deadline:
-                time.sleep(.005)
-            if router.in_flight_requests == 0:
-                failures.append({"kind": "swap", "error": "No in-flight requests observed"})
-                return
-            for index in range(swaps):
-                try:
-                    elapsed = router.swap_weights(weights, f"stress_{index+1}")
-                    swap_latencies.append(elapsed)
-                except Exception as exc:
-                    failures.append({"kind": "swap", "index": index, "error": str(exc)})
-                    break
-                time.sleep(.1)
+        concurrency_levels = args.concurrency_levels or ([2] if args.profile == "smoke" else [1, 2, 4, 8])
+        suite_summary = {}
 
-        began = time.perf_counter()
-        import threading
-        writer = threading.Thread(target=swap_worker, daemon=True)
-        writer.start()
-        results = []
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool, \
-             raw_path.open("w", encoding="utf-8", buffering=1) as raw:
-            futures = [pool.submit(router.generate,
-                "Review: Excellent film.\nSentiment:",
-                {"max_new_tokens": 6, "do_sample": False}) for _ in range(requests)]
-            for index, future in enumerate(as_completed(futures), 1):
-                try:
-                    result = future.result()
-                    results.append(result)
-                    raw.write(json.dumps({"completion_index": index, **result}) + "\n")
-                except Exception as exc:
-                    failures.append({"kind": "request", "index": index, "error": str(exc)})
-                    raw.write(json.dumps(failures[-1]) + "\n")
-                progress(index, requests)
-        writer.join(timeout=120)
-        if writer.is_alive():
-            raise TimeoutError("Swap writer did not finish")
-        if len(swap_latencies) != swaps:
-            raise RuntimeError(f"Only {len(swap_latencies)}/{swaps} swaps completed: {failures}")
-        if failures:
-            raise RuntimeError(f"Swap stress had {len(failures)} failures; see {raw_path}")
-        latencies = sorted(swap_latencies)
-        return {"requests": requests, "swaps": swaps, "failures": 0,
-                "duration_s": time.perf_counter()-began,
-                "swap_median_ms": latencies[len(latencies)//2],
-                "swap_p95_ms": latencies[math.ceil(.95*len(latencies))-1],
-                "swap_max_ms": latencies[-1],
-                "versions_observed": sorted(set(x["version"] for x in results)),
-                "router_metrics": router.get_metrics(), "raw_path": str(raw_path),
-                "raw_sha256": file_sha256(raw_path),
-                "method": "single-model read/write lock; no two-replica double buffer"}
+        with raw_path.open("w", encoding="utf-8", buffering=1) as raw_file:
+            for concurrency in concurrency_levels:
+                router = DoubleBufferedAdapterRouter(model, tokenizer, device)
+                progress = Progress(f"swap_stress_c{concurrency}")
+
+                # --- 1. Control Window (no-swap) ---
+                control_latencies = []
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [
+                        pool.submit(router.generate, "Review: Excellent film.\nSentiment:", {"max_new_tokens": 6, "do_sample": False})
+                        for _ in range(requests // 2 or 1)
+                    ]
+                    for f in as_completed(futures):
+                        res = f.result()
+                        control_latencies.append(res["latency_ms"])
+
+                # --- 2. Active Swap Window ---
+                swap_latencies = []
+                failures = []
+                committed_versions = [("v0_base", time.perf_counter())]
+                committed_lock = threading.Lock()
+
+                def swap_worker():
+                    start_deadline = time.monotonic() + 30
+                    while router.in_flight_requests == 0 and time.monotonic() < start_deadline:
+                        time.sleep(0.005)
+                    if router.in_flight_requests == 0:
+                        failures.append({"kind": "swap", "error": "No in-flight requests observed"})
+                        return
+                    for index in range(swaps):
+                        v_tag = f"stress_{concurrency}_{index+1}"
+                        try:
+                            w_copy = {k: v.clone() for k, v in weights.items()}
+                            elapsed = router.swap_weights(w_copy, v_tag, run_id="stress_run", seq=index+1)
+                            swap_latencies.append(elapsed)
+                            with committed_lock:
+                                committed_versions.append((v_tag, time.perf_counter()))
+                        except Exception as exc:
+                            failures.append({"kind": "swap", "index": index, "error": str(exc)})
+                            break
+                        time.sleep(0.05)
+
+                import threading
+                writer = threading.Thread(target=swap_worker, daemon=True)
+                writer.start()
+
+                results = []
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [
+                        pool.submit(router.generate, "Review: Excellent film.\nSentiment:", {"max_new_tokens": 6, "do_sample": False})
+                        for _ in range(requests)
+                    ]
+                    for index, future in enumerate(as_completed(futures), 1):
+                        t_finish = time.perf_counter()
+                        try:
+                            result = future.result()
+                            resp_version = result["version"]
+                            with committed_lock:
+                                valid_versions = {v for v, t_c in committed_versions if t_c <= t_finish + 0.05}
+                            if resp_version not in valid_versions:
+                                failures.append({
+                                    "kind": "version_validity",
+                                    "index": index,
+                                    "version": resp_version,
+                                    "error": f"Version {resp_version!r} not in valid committed set {valid_versions}",
+                                })
+                            results.append(result)
+                            raw_file.write(json.dumps({"concurrency": concurrency, "completion_index": index, **result}) + "\n")
+                        except Exception as exc:
+                            failures.append({"kind": "request", "index": index, "error": str(exc)})
+                            raw_file.write(json.dumps({"concurrency": concurrency, "completion_index": index, "error": str(exc)}) + "\n")
+                        progress(index, requests)
+
+                writer.join(timeout=120)
+                if writer.is_alive():
+                    raise TimeoutError(f"Swap writer did not finish for concurrency {concurrency}")
+                if len(swap_latencies) != swaps:
+                    raise RuntimeError(f"Only {len(swap_latencies)}/{swaps} swaps completed: {failures}")
+                if failures:
+                    raise RuntimeError(f"Swap stress had {len(failures)} failures at concurrency {concurrency}: {failures[:3]}")
+
+                # Verify digest match on router at end of run
+                live_digest = router.adapter_state_digest()
+                exp_digest = router.expected_state_sha256
+                match = bool(live_digest and exp_digest and live_digest == exp_digest)
+                if not match:
+                    raise RuntimeError(f"Adapter digest mismatch after swap stress at concurrency {concurrency}")
+
+                metrics = router.get_metrics()
+                req_latencies = sorted([r["latency_ms"] for r in results])
+                ctrl_sorted = sorted(control_latencies)
+                swap_sorted = sorted(swap_latencies)
+
+                suite_summary[f"concurrency_{concurrency}"] = {
+                    "concurrency": concurrency,
+                    "requests": len(results),
+                    "swaps": swaps,
+                    "request_failures": len([f for f in failures if f["kind"] == "request"]),
+                    "dropped_requests": metrics["dropped_requests"],
+                    "match": match,
+                    "swap_total_ms": {
+                        "p50": nearest_rank_percentile(swap_sorted, 0.50),
+                        "p95": nearest_rank_percentile(swap_sorted, 0.95),
+                        "max": swap_sorted[-1],
+                    },
+                    "swap_lock_held_ms": {
+                        "p50": metrics.get("swap_lock_held_ms_p50", 0.0),
+                        "p95": metrics.get("swap_lock_held_ms_p95", 0.0),
+                        "max": metrics.get("swap_lock_held_ms_max", 0.0),
+                    },
+                    "swap_lock_wait_ms": {
+                        "p50": metrics.get("swap_lock_wait_ms_p50", 0.0),
+                        "p95": metrics.get("swap_lock_wait_ms_p95", 0.0),
+                        "max": metrics.get("swap_lock_wait_ms_max", 0.0),
+                    },
+                    "request_latency_during_swaps_ms": {
+                        "p50": nearest_rank_percentile(req_latencies, 0.50),
+                        "p95": nearest_rank_percentile(req_latencies, 0.95),
+                        "p99": nearest_rank_percentile(req_latencies, 0.99),
+                    },
+                    "control_latency_ms": {
+                        "p50": nearest_rank_percentile(ctrl_sorted, 0.50),
+                        "p95": nearest_rank_percentile(ctrl_sorted, 0.95),
+                        "p99": nearest_rank_percentile(ctrl_sorted, 0.99),
+                    },
+                    "router_metrics": metrics,
+                }
+
+        summary_path = run.directory / "swap_stress" / "summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        out_summary = {
+            "profile": args.profile,
+            "concurrency_levels": concurrency_levels,
+            "swaps_per_level": swaps,
+            "results": suite_summary,
+            "raw_path": str(raw_path),
+            "raw_sha256": file_sha256(raw_path),
+            "boundary": "Single-model read/write lock adapter swap stress during concurrent generation",
+        }
+        summary_path.write_text(json.dumps(out_summary, indent=2), encoding="utf-8")
+        return out_summary
+
     run.stage("swap_stress/concurrent", measure)
 
 
