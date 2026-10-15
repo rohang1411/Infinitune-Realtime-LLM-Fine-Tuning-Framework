@@ -127,7 +127,9 @@ def compute_expected_calibration_error(confidences, predictions, ground_truth, n
 
 
 def _normalized_aauc_from_history(history):
-    """Trapezoidal area under accuracy vs training step, divided by step span.
+    """Normalized area under the accuracy-vs-step curve between the first and
+    last evaluated steps (trapezoidal), divided by that step span.
+    Equals mean accuracy for uniformly spaced checkpoints with linear interpolation.
     history is a list of (step, accuracy) in chronological order.
     Single point: returns that accuracy. Two or more: normalized AUC.
     """
@@ -142,6 +144,7 @@ def _normalized_aauc_from_history(history):
             return None
 
     raw = 0.0
+    first_step = None
     last_step = None
     last_acc = None
     for i in range(len(history) - 1):
@@ -155,17 +158,37 @@ def _normalized_aauc_from_history(history):
             continue
         ds = s1f - s0f
         if ds > 0:
+            if first_step is None:
+                first_step = s0f
             raw += 0.5 * (a0f + a1f) * ds
             last_step = s1f
             last_acc = a1f
 
-    if last_step is None:
+    if last_step is None or first_step is None:
         return float(history[-1][1])
 
-    span = last_step - 0.0
+    span = last_step - first_step
     if span <= 0:
         return last_acc if last_acc is not None else float(history[-1][1])
     return raw / float(span)
+
+
+def aauc_uniform_mean(history) -> float:
+    """Plain mean of accuracies across evaluation points (Koh et al., 2022).
+    history is a list of (step, accuracy) tuples.
+    """
+    if not history:
+        return 0.0
+    valid_accs = []
+    for item in history:
+        try:
+            acc = float(item[1])
+            valid_accs.append(acc)
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not valid_accs:
+        return 0.0
+    return sum(valid_accs) / len(valid_accs)
 
 # Forgetting: higher is better vs lower is better (used only when compute_forgetting is on).
 _HIGHER_IS_BETTER = frozenset(
