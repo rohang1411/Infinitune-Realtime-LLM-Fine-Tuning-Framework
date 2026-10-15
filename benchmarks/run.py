@@ -1385,6 +1385,12 @@ def suite_cold_start(run, args):
     run.stage("cold_start/execute", execute_arms)
 
 
+def suite_fault_injection(run, args):
+    """Fault injection suite covering F01 through F16 on stream protocol v2."""
+    from benchmarks.fault_injection import run_fault_injection_suite
+    run.stage("fault_injection/execute", lambda: run_fault_injection_suite(run, args))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1791,6 +1797,7 @@ def main():
         "swap_stress": lambda: suite_swap_stress(run, args),
         "propagation": lambda: suite_propagation(run, args),
         "cold_start": lambda: suite_cold_start(run, args),
+        "fault_injection": lambda: suite_fault_injection(run, args),
     }
     for suite in suites:
         try:

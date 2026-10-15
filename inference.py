@@ -12,7 +12,7 @@ import yaml
 from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
 from utils.serving_router import DoubleBufferedAdapterRouter
-from utils.stream_protocol import SnapshotAssembler, deserialize_tensor
+from utils.stream_protocol import SnapshotAssembler, deserialize_tensor, classify_rejection_reason
 from utils.serving_policy import should_listen_for_updates
 from utils.kafka_config import build_client_kwargs, redact_client_kwargs
 from transformers import (
@@ -91,6 +91,9 @@ def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional
             by_reason = counters.setdefault("rejected_by_reason", {})
             reason_name = type(exc).__name__
             by_reason[reason_name] = by_reason.get(reason_name, 0) + 1
+            granular = classify_rejection_reason(exc)
+            if granular and granular != reason_name:
+                by_reason[granular] = by_reason.get(granular, 0) + 1
         msg = f"REJECTED adapter frame key={key!r} reason={type(exc).__name__}: {exc}"
         if len(msg) > 300:
             msg = msg[:300]

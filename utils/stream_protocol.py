@@ -37,6 +37,36 @@ def compute_manifest_hmac(manifest: dict, key: Union[str, bytes]) -> str:
     return hmac.new(key_bytes, canonical_json(manifest_without_hmac), hashlib.sha256).hexdigest()
 
 
+def classify_rejection_reason(exc: Union[Exception, str]) -> str:
+    """Map an exception or error string to a canonical rejection reason code."""
+    msg = str(exc).lower()
+    if "sha256_mismatch" in msg:
+        return "sha256_mismatch"
+    if "incomplete adapter step" in msg or "incomplete_snapshot" in msg:
+        return "incomplete_snapshot"
+    if "duplicate adapter tensor" in msg or "duplicate_tensor" in msg:
+        return "duplicate_tensor"
+    if "undeclared adapter tensor" in msg or "undeclared_tensor" in msg:
+        return "undeclared_tensor"
+    if "shape_or_dtype_mismatch" in msg or "shape_mismatch" in msg or "nbytes mismatch" in msg:
+        return "shape_mismatch"
+    if "unknown or expired step" in msg or "unknown_step" in msg:
+        return "unknown_step"
+    if "commit manifest_sha256 mismatch" in msg or "manifest_digest_mismatch" in msg:
+        return "manifest_digest_mismatch"
+    if "malformed manifest json" in msg or "bad_manifest" in msg or "manifest must be dict" in msg:
+        return "bad_manifest"
+    if "stale_version" in msg:
+        return "stale_version"
+    if "invalid manifest hmac signature" in msg or "hmac_sha256" in msg or "hmac" in msg:
+        return "hmac_mismatch"
+    if "rejected v1 manifest" in msg or "protocol_version 2 required" in msg or "protocol_version" in msg:
+        return "protocol_version"
+    if isinstance(exc, Exception):
+        return type(exc).__name__
+    return "unknown_error"
+
+
 def deserialize_tensor(value_bytes: bytes):
     """Decode safetensors or JSON metadata; never unpickle broker bytes."""
     if not value_bytes:
