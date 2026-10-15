@@ -12,6 +12,7 @@ from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
 from utils.serving_router import DoubleBufferedAdapterRouter
 from utils.stream_protocol import SnapshotAssembler
+from utils.serving_policy import should_listen_for_updates
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -368,11 +369,15 @@ if __name__ == "__main__":
                         help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
     parser.add_argument("--listen-updates", action="store_true",
                         help="Continue consuming Kafka adapter snapshots after loading a checkpoint")
+    parser.add_argument("--no-listen-updates", action="store_true",
+                        help="Disable consuming Kafka adapter snapshots even if auto-loading checkpoints")
     parser.add_argument("--serving-mode", type=str, choices=["router", "legacy_lock"], default="router",
                         help="Serving mode: 'router' uses DoubleBufferedAdapterRouter with ReadWriteLock; 'legacy_lock' uses global mutex")
     parser.add_argument("--port", type=int, default=8000,
                         help="Port to bind the Flask HTTP server to (default: 8000)")
     args = parser.parse_args()
+    if args.listen_updates and args.no_listen_updates:
+        parser.error("Cannot specify both --listen-updates and --no-listen-updates.")
 
     config = load_config(args.config)
     config_global = config
@@ -382,8 +387,10 @@ if __name__ == "__main__":
 
     # Resolve checkpoint path if provided
     resolved_checkpoint_path = None
+    checkpoint_source = None
     ckpt_mgr = CheckpointManager(config)
     if args.checkpoint:
+        checkpoint_source = "explicit"
         if os.path.isdir(args.checkpoint):
             resolved_checkpoint_path = args.checkpoint
         else:
@@ -392,6 +399,7 @@ if __name__ == "__main__":
                 if not latest_ckpt:
                     _log("Warning: '--checkpoint latest' requested but no checkpoints found. Falling back to base model with empty LoRA adapter.")
                     resolved_checkpoint_path = None
+                    checkpoint_source = None
                 else:
                     resolved_checkpoint_path = latest_ckpt["path"]
                     _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
@@ -409,6 +417,7 @@ if __name__ == "__main__":
             latest_ckpt = ckpt_mgr.latest_checkpoint()
             if latest_ckpt:
                 resolved_checkpoint_path = latest_ckpt["path"]
+                checkpoint_source = "auto"
                 _log(f"Cold-start recovery: Discovered existing latest checkpoint on disk: {resolved_checkpoint_path}")
         except Exception as e:
             _log(f"Cold-start checkpoint check skipped: {e}")
@@ -492,10 +501,15 @@ if __name__ == "__main__":
     _log("Adapter router initialized with single-model read/write locking.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
-    #    We skip this entirely if a standalone checkpoint was provided and resolved.
-    if resolved_checkpoint_path and not args.listen_updates:
-        _log("Standalone mode (checkpoint provided). Skipping Kafka consumer threads.")
+    listen_updates = should_listen_for_updates(
+        checkpoint_source=checkpoint_source,
+        listen_flag=args.listen_updates,
+        no_listen_flag=args.no_listen_updates,
+    )
+    if not listen_updates:
+        _log(f"Kafka update listener disabled (checkpoint_source='{checkpoint_source}'). Skipping Kafka consumer threads.")
     else:
+        _log(f"Kafka update listener enabled (checkpoint_source='{checkpoint_source}'). Starting Kafka consumer and applier threads.")
         stream_state_global["enabled"] = True
         consumer_thread = threading.Thread(
             target=kafka_consumer_thread,
