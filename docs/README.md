@@ -4,6 +4,8 @@ This directory contains detailed per-config testing guides for every InfiniTune 
 
 For a version-oriented summary of the current major release, see the [Infinitune v2 Release Notes](releases/infinitune-v2.md).
 
+For measured benchmark claims, selectable suites, the local web dashboard, raw evidence, and resume steps, use [Project Context §13](Infinitune_Project_Context.md#13-reproducible-evaluation-evidence-ledger-and-external-audit). Config guides may contain historical expectations; Section 13 records what was actually measured.
+
 ---
 
 ## Quick Reference
@@ -45,16 +47,9 @@ I want to demonstrate...
 
 ---
 
-## Estimated Runtimes
+## Runtime evidence
 
-| Config | Training Steps | Inline Eval Time | Decoupled Eval / Checkpoint |
-|---|---|---|---|
-| `imdb_quantitative.yaml` | 1,000 | ~45 min | ~2 min |
-| `gsm8k_quantitative.yaml` | 500 | ~60 min | ~8 min |
-| `alpaca_qualitative.yaml` | 500 | ~30 min | ~4 min |
-| `imdb_qualitative.yaml` | 1,000 | ~45 min | ~5 min |
-| `gsm8k_qualitative.yaml` | 500 | ~65 min | ~10 min |
-| `e2e_qualitative.yaml` | 2,100 | ~3-4 hr on Colab T4 | ~15-25 min |
+The former per-config time table had no run logs or hardware provenance and has been removed. The only verified local stage durations in this audit are the Windows CPU smoke observations in [Project Context §13.5](Infinitune_Project_Context.md#135-measured-runtimes-and-unmeasured-hardware). Standard/full and Mac runtimes have not been measured.
 
 ---
 

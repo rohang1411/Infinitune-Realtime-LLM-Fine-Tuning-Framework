@@ -3,13 +3,9 @@ benchmarks/load_test_serving.py
 ─────────────────────────────────────────────────────────────────────────────
 Concurrent Serving Load Tester & Latency SLA Benchmark Harness for InfiniTune.
 
-Measures:
-1. p50, p95, p99 Time-To-First-Token / End-to-End latency under concurrency.
-2. Failure / dropped request rate across active adapter hot-swaps (Target: 0.00%).
-3. Max sustainable Queries Per Second (QPS) and saturation knee.
-4. Server-side hot-swap pause time telemetry via /metrics.
-5. Adapter version consistency verification (via X-Adapter-Version header).
-6. Generates verifiable run_manifest.json with git commit and hardware telemetry.
+Measures closed-loop HTTP end-to-end latency and achieved throughput at a fixed
+client concurrency. It does not measure TTFT, saturation knee, or active swaps;
+those require streaming/open-loop or dedicated swap experiments.
 """
 
 import time
@@ -24,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 import urllib.request
 import urllib.error
+import math
 
 
 def get_git_info() -> Dict[str, str]:
@@ -110,7 +107,10 @@ def run_load_test(
     endpoint_url: str,
     num_requests: int = 100,
     concurrency: int = 10,
-    prompt: str = "Review: Outstanding film with brilliant acting.\nSentiment:"
+    prompt: str = "Review: Outstanding film with brilliant acting.\nSentiment:",
+    raw_output: Optional[str] = None,
+    progress=None,
+    timeout_s: float = 60.0,
 ) -> Dict[str, Any]:
     """Execute concurrent load test across worker threads."""
     print(f"Starting load test on {endpoint_url} with {num_requests} requests (concurrency={concurrency})...")
@@ -118,13 +118,26 @@ def run_load_test(
     results: List[Dict[str, Any]] = []
     start_wall = time.perf_counter()
 
+    if num_requests < 1 or concurrency < 1:
+        raise ValueError("requests and concurrency must be positive")
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
-            executor.submit(send_generation_request, endpoint_url, prompt)
+            executor.submit(send_generation_request, endpoint_url, prompt, timeout_s)
             for _ in range(num_requests)
         ]
-        for f in as_completed(futures):
-            results.append(f.result())
+        raw_file = open(raw_output, "w", encoding="utf-8", buffering=1) if raw_output else None
+        try:
+            for index, f in enumerate(as_completed(futures), 1):
+                result = f.result()
+                result["completion_index"] = index
+                results.append(result)
+                if raw_file:
+                    raw_file.write(json.dumps(result) + "\n")
+                if progress:
+                    progress(index, num_requests)
+        finally:
+            if raw_file:
+                raw_file.close()
 
     total_duration_s = time.perf_counter() - start_wall
 
@@ -135,10 +148,18 @@ def run_load_test(
     server_latencies = sorted(r["server_latency_ms"] for r in successful if r.get("server_latency_ms", 0.0) > 0)
     n = len(client_latencies)
 
+    def percentile(values, fraction):
+        if not values:
+            return 0.0
+        position = (len(values) - 1) * fraction
+        low = math.floor(position)
+        high = math.ceil(position)
+        return values[low] + (values[high] - values[low]) * (position - low)
+
     if n > 0:
-        p50 = client_latencies[int(n * 0.50)]
-        p95 = client_latencies[int(n * 0.95)]
-        p99 = client_latencies[min(int(n * 0.99), n - 1)]
+        p50 = percentile(client_latencies, .50)
+        p95 = percentile(client_latencies, .95)
+        p99 = percentile(client_latencies, .99)
         avg_lat = sum(client_latencies) / n
         min_lat = client_latencies[0]
         max_lat = client_latencies[-1]
@@ -147,9 +168,9 @@ def run_load_test(
 
     sn = len(server_latencies)
     if sn > 0:
-        srv_p50 = server_latencies[int(sn * 0.50)]
-        srv_p95 = server_latencies[int(sn * 0.95)]
-        srv_p99 = server_latencies[min(int(sn * 0.99), sn - 1)]
+        srv_p50 = percentile(server_latencies, .50)
+        srv_p95 = percentile(server_latencies, .95)
+        srv_p99 = percentile(server_latencies, .99)
         srv_avg = sum(server_latencies) / sn
     else:
         srv_p50 = srv_p95 = srv_p99 = srv_avg = 0.0
@@ -180,6 +201,9 @@ def run_load_test(
         "serving_modes_detected": detected_modes,
         "unique_adapter_versions": unique_versions,
         "total_requests": len(results),
+        "raw_requests_path": raw_output,
+        "latency_definition": "client end-to-end; TTFT is unavailable from non-streaming /generate",
+        "p99_reliable": len(successful) >= 1000,
         "successful_requests": len(successful),
         "failed_requests": len(failed),
         "failure_rate_percent": failure_rate,
@@ -213,6 +237,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=10, help="Concurrent workers")
     parser.add_argument("--prompt", type=str, default="Review: Excellent film.\nSentiment:", help="Test prompt")
     parser.add_argument("--output_json", type=str, default=None, help="Save report to JSON file")
+    parser.add_argument("--raw-output", type=str, default=None, help="JSONL for every request")
     args = parser.parse_args()
 
     summary = run_load_test(
@@ -220,6 +245,7 @@ def main():
         num_requests=args.requests,
         concurrency=args.concurrency,
         prompt=args.prompt,
+        raw_output=args.raw_output,
     )
 
     print("\n" + "=" * 60)

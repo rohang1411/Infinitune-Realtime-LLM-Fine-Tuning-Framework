@@ -4,9 +4,9 @@ benchmarks/canary_freshness_probe.py
 End-to-End Pipeline Freshness Probe for InfiniTune.
 
 Measures the headline ML Systems latency:
-Exact wall-clock duration from the moment a training record is published
-by the producer to the moment the corresponding behavior change is observable
-on the live /generate inference endpoint.
+Diagnostic keyword observation only. This module does not publish a training
+record and cannot establish end-to-end freshness. Use the `pipeline` suite in
+`benchmarks.run` for record-to-adapter-version measurement.
 """
 
 import time
@@ -49,7 +49,7 @@ def poll_endpoint_for_keyword(
                         elapsed = time.time() - t0
                         return {
                             "success": True,
-                            "freshness_latency_s": round(elapsed, 2),
+                            "keyword_observation_latency_s": round(elapsed, 2),
                             "attempts": attempts,
                             "observed_response": generated,
                             "active_version": data.get("version", "unknown"),
@@ -61,7 +61,7 @@ def poll_endpoint_for_keyword(
 
     return {
         "success": False,
-        "freshness_latency_s": round(time.time() - t0, 2),
+        "keyword_observation_latency_s": round(time.time() - t0, 2),
         "attempts": attempts,
         "observed_response": "TIMEOUT",
         "active_version": "unknown",

@@ -5,6 +5,9 @@ wandb/
 outputs/
 .vscode/Docs/
 output/
+data/benchmark_cache/
+reports/benchmark_runs/
+.venv-eval/
 helper/
 .cursor/
 scratch/

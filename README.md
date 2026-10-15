@@ -3,8 +3,7 @@
 # InfiniTune
 ### Realtime LLM Fine-Tuning Framework
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=flat)](https://github.com/rohang1411/Infinitune-Realtime-LLM-Fine-Tuning-Framework)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![Kafka](https://img.shields.io/badge/Apache_Kafka-231F20?style=flat&logo=apache-kafka&logoColor=white)](https://kafka.apache.org/)
 [![HuggingFace](https://img.shields.io/badge/HuggingFace-Models-FFD21E)](https://huggingface.co/)
@@ -12,11 +11,11 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://makeapullrequest.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A distributed framework for **continuously fine-tuning Large Language Models in real time** using Kafka data streams and LoRA (Low-Rank Adaptation). As new training data arrives, the model adapts on-the-fly and the inference server receives updated adapter weights automatically — no restarts required.
+A decoupled streaming LoRA framework using one Kafka broker, one trainer process, and an inference service. The trainer can publish complete adapter snapshots to the inference server without restarting it; latency and model-quality claims require a measured run.
 
 <br>
 
-**Zero-Downtime Hot-Swaps** &nbsp;|&nbsp; **Consumer Hardware Friendly** &nbsp;|&nbsp; **Live Streaming Data** &nbsp;|&nbsp; **Qualitative & Quantitative Eval**
+**Versioned Adapter Updates** &nbsp;|&nbsp; **Local Laptop Support** &nbsp;|&nbsp; **Live Streaming Data** &nbsp;|&nbsp; **Reproducible Evaluation**
 
 </div>
 
@@ -43,13 +42,38 @@ A distributed framework for **continuously fine-tuning Large Language Models in 
 ## Documentation
 
 - Start with the [docs index](docs/README.md) for configuration guides and evaluation walkthroughs.
+- Read the [current evaluation evidence and runbook](docs/Infinitune_Project_Context.md#13-reproducible-evaluation-evidence-ledger-and-external-audit) before citing any metric.
 - For a version-oriented summary of this major release, see [Infinitune v2 Release Notes](docs/releases/infinitune-v2.md).
+
+## Reproducible benchmarks
+
+The benchmark runner prepares pinned, checksummed datasets, offers selectable `smoke`/`standard`/`full` suites, and saves raw outputs, progress, stage manifests, and failure tracebacks. First use creates a private Python environment and downloads required packages/models.
+
+For a local web form with validated settings, past-run charts, short measured summaries, and live logs:
+
+```powershell
+.\run_evaluation.ps1 dashboard
+```
+
+The browser opens at `http://127.0.0.1:7860/`. Starting a run opens a visible log terminal on Windows. Actual outputs are saved under `reports/benchmark_runs/`, not under `benchmarks/`. This directory is Git ignored. The previously verified 66-stage local smoke run is in `reports/benchmark_runs/verified_smoke_20261006/`; earlier CLI runs have stage logs and manifests but no unified `console.log`.
+
+```powershell
+.\run_evaluation.ps1 list
+.\run_evaluation.ps1 run --suites integrity classification serving --profile smoke
+```
+
+```bash
+bash run_evaluation.sh list
+bash run_evaluation.sh run --suites integrity classification serving --profile smoke
+```
+
+Kafka-dependent `freshness` and `pipeline` suites require a running broker. Saved adapter comparisons require a local checkpoint or `--checkpoint`; clean clones do not contain the ignored historical checkpoints. Use the [runbook](docs/Infinitune_Project_Context.md#132-evaluation-dashboard-and-command-line-runner) for data provenance, resume commands, limitations, and measured local runtime evidence. No Mac, standard-profile, or full-profile runtime has been measured here.
 
 ---
 
 ## What is InfiniTune?
 
-Traditional fine-tuning requires a static dataset, an offline training run, and a manual deployment step. **InfiniTune removes all three bottlenecks.**
+InfiniTune separates data publication, LoRA training, and inference so an adapter can be updated from a stream and delivered without restarting the serving process. The benchmark runner measures whether a particular update improves quality and how long delivery takes.
 
 It is built around three decoupled services that communicate over Kafka:
 
@@ -57,7 +81,7 @@ It is built around three decoupled services that communicate over Kafka:
 |---|---|---|
 | **Producer** | `producer.py` | Streams training samples from a HuggingFace dataset to a Kafka topic |
 | **Trainer** | `trainer.py` | Consumes data from Kafka, fine-tunes with LoRA, saves checkpoints, and pushes updated adapter weights back to Kafka |
-| **Inference Server** | `inference.py` | Loads the base model and LoRA adapter, serves a REST API, and hot-swaps adapter weights in real time |
+| **Inference Server** | `inference.py` | Loads the base model and LoRA adapter, serves a REST API, and applies complete adapter snapshots under a write lock |
 
 A fourth standalone script handles post-training evaluation:
 
@@ -66,7 +90,7 @@ A fourth standalone script handles post-training evaluation:
 | `evaluate.py` | Loads any saved checkpoint and runs the full evaluation suite (quantitative + qualitative) without re-training |
 
 **Key properties:**
-- **Online (streaming) learning** — the model improves continuously as data flows in
+- **Streaming training** — the trainer can update from arriving records; quality changes require fixed-set evaluation
 - **Memory-efficient** — LoRA adapters only train a fraction of model parameters
 - **Config-driven** — all hyperparameters, dataset settings, and evaluation logic defined in a single YAML file
 - **Multi-task** — pre-built configs for IMDb, GSM8K, and Alpaca spanning quantitative and qualitative evaluation
@@ -141,7 +165,7 @@ flowchart LR
 | **2** | Trainer | Consumes batches from Kafka, runs forward + backward passes with LoRA, evaluates inline |
 | **3** | Checkpoint Manager | Serialises LoRA adapter weights to disk every N steps and at training end |
 | **4** | Trainer | Publishes updated adapter weights to `lora-weights` Kafka topic |
-| **5** | Inference Server | Pulls new weights from Kafka and applies them in-place — zero downtime, requests continue uninterrupted |
+| **5** | Inference Server | Reads complete adapter snapshots from Kafka and applies them under a write lock; requests can wait during an update |
 
 ---
 

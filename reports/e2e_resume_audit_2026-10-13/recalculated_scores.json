@@ -1,0 +1,145 @@
+{
+  "recalculation_date": "2026-10-13",
+  "n_unique_mrs": 4,
+  "source_predictions": "C:\\Users\\rohan\\Documents\\Projects\\Infinitune-Realtime-LLM-Fine-Tuning-Framework\\reports\\benchmark_runs\\verified_smoke_20261006\\predictions\\e2e.jsonl",
+  "predictions_sha256": "b45ac2c271baf81a4824421a272eeb179885d60c799f2a92b3e41bfef4380c82",
+  "source_manifest_code_fingerprint": "f28aee1cb3f0c2a4ab790eb3997855a0683151e886b6b1d345948b458521c88a",
+  "rouge_score_version": "0.1.2",
+  "aggregation": "mean per-MR score; best-F1 reference selected independently per ROUGE variant",
+  "tokenization": "rouge-score default normalization, Porter stemming enabled",
+  "scores": {
+    "rouge1": {
+      "precision": 0.8871758380771664,
+      "recall": 0.8392857142857143,
+      "f1": 0.8590445924132365
+    },
+    "rouge2": {
+      "precision": 0.5796091137123746,
+      "recall": 0.5449701619778345,
+      "f1": 0.5611848296630905
+    },
+    "rougeL": {
+      "precision": 0.6782608204572151,
+      "recall": 0.6574900793650794,
+      "f1": 0.6663740920096852
+    }
+  },
+  "per_example": [
+    {
+      "id": "name[Fitzbillies], eatType[coffee shop], food[English], priceRange[cheap], customer rating[5 out of 5], area[riverside], familyFriendly[yes]",
+      "scores": {
+        "rouge1": {
+          "precision": 0.8333333333333334,
+          "recall": 0.8333333333333334,
+          "f1": 0.8333333333333334,
+          "reference_index": 0
+        },
+        "rouge2": {
+          "precision": 0.43478260869565216,
+          "recall": 0.43478260869565216,
+          "f1": 0.43478260869565216,
+          "reference_index": 0
+        },
+        "rougeL": {
+          "precision": 0.5833333333333334,
+          "recall": 0.5833333333333334,
+          "f1": 0.5833333333333334,
+          "reference_index": 0
+        }
+      }
+    },
+    {
+      "id": "name[Cotto], eatType[coffee shop], food[English], priceRange[high], customer rating[average], area[city centre], near[The Portland Arms]",
+      "scores": {
+        "rouge1": {
+          "precision": 0.7741935483870968,
+          "recall": 0.8571428571428571,
+          "f1": 0.8135593220338982,
+          "reference_index": 2
+        },
+        "rouge2": {
+          "precision": 0.6,
+          "recall": 0.6,
+          "f1": 0.6,
+          "reference_index": 3
+        },
+        "rougeL": {
+          "precision": 0.6129032258064516,
+          "recall": 0.6785714285714286,
+          "f1": 0.6440677966101694,
+          "reference_index": 2
+        }
+      }
+    },
+    {
+      "id": "name[The Punter], eatType[coffee shop], priceRange[cheap], familyFriendly[yes], near[Café Sicilia]",
+      "scores": {
+        "rouge1": {
+          "precision": 1.0,
+          "recall": 0.7777777777777778,
+          "f1": 0.8750000000000001,
+          "reference_index": 2
+        },
+        "rouge2": {
+          "precision": 0.8461538461538461,
+          "recall": 0.7333333333333333,
+          "f1": 0.7857142857142856,
+          "reference_index": 1
+        },
+        "rougeL": {
+          "precision": 0.9285714285714286,
+          "recall": 0.8125,
+          "f1": 0.8666666666666666,
+          "reference_index": 1
+        }
+      }
+    },
+    {
+      "id": "name[The Cambridge Blue], eatType[coffee shop], area[city centre], familyFriendly[yes], near[Burger King]",
+      "scores": {
+        "rouge1": {
+          "precision": 0.9411764705882353,
+          "recall": 0.8888888888888888,
+          "f1": 0.9142857142857143,
+          "reference_index": 0
+        },
+        "rouge2": {
+          "precision": 0.4375,
+          "recall": 0.4117647058823529,
+          "f1": 0.42424242424242425,
+          "reference_index": 0
+        },
+        "rougeL": {
+          "precision": 0.5882352941176471,
+          "recall": 0.5555555555555556,
+          "f1": 0.5714285714285715,
+          "reference_index": 0
+        }
+      }
+    }
+  ],
+  "existing_sacrebleu": 51.4368280694607,
+  "limits": [
+    "Four-example smoke diagnostic; not resume-ready quality evidence",
+    "ROUGE precision/recall/F1 measure reference-text overlap, not factual correctness",
+    "Mean F1 is the mean of per-example F1, not F1 reconstructed from averaged P/R",
+    "No base-vs-adapter E2E generations are retained for a matched quality-improvement claim"
+  ],
+  "historical_aggregates": {
+    "source_csv": "C:\\Users\\rohan\\Documents\\Projects\\Infinitune-Realtime-LLM-Fine-Tuning-Framework\\output\\e2e\\outputs\\run5\\metrics_clean.csv",
+    "csv_sha256": "0df67f2d6c8c26fff6b5206502a990ced4a84f844c97b8701f186ca4e595014e",
+    "initial_mean_coverage": 0.1958174603174603,
+    "final_mean_coverage": 0.8987857142857143,
+    "final_perfect_coverage_rate": 0.1733333333333333,
+    "initial_family_friendly_inversion_rate": 0.0,
+    "peak_family_friendly_inversion_step": "400",
+    "peak_family_friendly_inversion_rate": 0.1573033707865168,
+    "final_family_friendly_inversion_rate": 0.0120481927710843,
+    "limits": [
+      "Aggregate CSV with changing evaluation windows and no retained per-example predictions",
+      "Coverage is heuristic; boolean no checker treats omission as satisfied",
+      "Family-friendliness inversion is a narrow majority-vote proxy, not an all-facts error rate",
+      "Observed peak is not the untrained baseline; monitoring did not establish the cause of improvement"
+    ]
+  }
+}

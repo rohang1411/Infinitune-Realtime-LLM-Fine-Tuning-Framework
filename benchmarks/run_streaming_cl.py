@@ -81,20 +81,13 @@ def generate_markdown_report(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="InfiniTune Continual Learning Benchmark Evaluator")
-    parser.add_argument("--tasks", nargs="+", default=["IMDb", "Yelp", "FiQA"], help="Task names")
-    args = parser.parse_args()
-
-    # Sample reference demonstration matrix for self-test
-    sample_matrix = [
-        [0.8265, 0.6500, 0.4500],  # After Task 1
-        [0.7920, 0.8650, 0.4800],  # After Task 2
-        [0.7610, 0.8210, 0.8150],  # After Task 3
-    ]
-
-    report = generate_markdown_report(sample_matrix, args.tasks)
-    print(report)
+    # Retain the pure metric helpers for callers, but never print a fabricated
+    # demonstration matrix as if it were a completed experiment.
+    parser = argparse.ArgumentParser(description="Continual-learning metric helpers")
+    parser.parse_args()
+    print("Run measured experiments with: python -m benchmarks.run run --suites continual --profile smoke", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

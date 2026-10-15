@@ -1,16 +1,14 @@
 """
 utils/serving_router.py
 ─────────────────────────────────────────────────────────────────────────────
-Double-Buffered Adapter Router & High-Concurrency Serving Engine for InfiniTune.
+Read/Write Locked Adapter Router & Concurrent Serving Engine for InfiniTune.
 
 Key Production Architectural Improvements:
 1. Lock-Free Concurrent Inference: Replaces global model generation locks with
    a high-throughput Read-Write Lock pattern. Arbitrary concurrent inference
    requests generate in parallel without serializing to concurrency=1.
-2. Sub-Millisecond Atomic Hot-Swapping: Weight preparation, deserialization,
-   and SHA-256 validation occur completely off the critical serving path. The
-   exclusive write lock is held solely for the microsecond duration of
-   `load_state_dict`.
+2. Snapshot validation happens before a write lock. The lock is held while all
+   adapter tensors are copied; swap time is measured, never promised.
 3. SLA Observability & Telemetry: Captures real-time latency distributions
    (p50, p95, p99 TTFT / end-to-end latency), swap pause time (ms), and
    guarantees zero dropped requests during active updates.
@@ -70,7 +68,10 @@ class ReadWriteLock:
 
 class DoubleBufferedAdapterRouter:
     """
-    Manages live model adapter serving, atomic hot-swapping, and SLA metrics.
+    Manages one live model with read/write locking and swap telemetry.
+
+    The historical class name is retained for API compatibility. This is a
+    single-model router, not a two-replica double buffer.
     """
 
     def __init__(self, model: PeftModel, tokenizer: AutoTokenizer, device: str = "cpu"):
@@ -163,19 +164,53 @@ class DoubleBufferedAdapterRouter:
         version_tag: str
     ) -> float:
         """
-        Apply pre-loaded weights into the live model.
-        The exclusive write lock is held ONLY for the microsecond duration of load_state_dict.
+        Apply one complete adapter state to the live model.
+
+        PEFT's exported keys omit adapter names such as `.default.`; resolve
+        those against live state before mutation. Reject missing, extra, or
+        shape-mismatched tensors so partial updates cannot be published.
         Returns swap duration in milliseconds.
         """
-        # Ensure tensors are prepared on the target device before acquiring write lock
-        prepared_weights = {
-            k: v.to(self.device) for k, v in new_state_dict.items()
-        }
+        from peft import get_peft_model_state_dict
+
+        if not new_state_dict or not version_tag:
+            raise ValueError("A swap requires a non-empty snapshot and version")
+        if isinstance(self.model, PeftModel):
+            expected = get_peft_model_state_dict(self.model)
+            if set(new_state_dict) != set(expected):
+                raise ValueError(
+                    f"Adapter key mismatch: missing={sorted(set(expected)-set(new_state_dict))}, "
+                    f"extra={sorted(set(new_state_dict)-set(expected))}"
+                )
+            live_state = self.model.state_dict()
+            destinations = {}
+            for key, tensor in new_state_dict.items():
+                matches = [name for name in live_state
+                           if name == key or name.replace(".default.", ".") == key]
+                if len(matches) != 1:
+                    raise ValueError(f"Cannot uniquely resolve live tensor for {key}")
+                target = live_state[matches[0]]
+                if not isinstance(tensor, torch.Tensor) or tensor.shape != target.shape:
+                    raise ValueError(f"Adapter tensor shape/type mismatch for {key}")
+                destinations[key] = target
+            prepared_weights = {k: v.to(device=destinations[k].device,
+                                        dtype=destinations[k].dtype)
+                                for k, v in new_state_dict.items()}
+        else:
+            # Generic models are useful for isolated lock tests. Production
+            # inference always takes the validated PEFT branch above.
+            destinations = None
+            prepared_weights = {k: v.to(self.device) for k, v in new_state_dict.items()}
 
         swap_start = time.perf_counter()
         self.rw_lock.acquire_write()
         try:
-            self.model.load_state_dict(prepared_weights, strict=False)
+            if destinations is None:
+                self.model.load_state_dict(prepared_weights, strict=False)
+            else:
+                with torch.no_grad():
+                    for key, tensor in prepared_weights.items():
+                        destinations[key].copy_(tensor)
             self.active_version = version_tag
             self.swap_count += 1
         finally:

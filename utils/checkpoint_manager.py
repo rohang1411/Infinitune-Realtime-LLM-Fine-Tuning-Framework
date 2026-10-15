@@ -301,7 +301,7 @@ class CheckpointManager:
         if not force and os.path.isdir(save_path):
             _log(
                 f"Checkpoint '{dir_name}' already exists in run '{self._run_dir}' "
-                f"— skipping save (pass force=True to overwrite)."
+                f"- skipping save (pass force=True to overwrite)."
             )
             return None
 
@@ -347,7 +347,7 @@ class CheckpointManager:
                 _log(f"Warning: Could not write config_snapshot.yaml: {exc}")
 
         step_label = f"step {step}" if step != "final" else "final"
-        _log(f"Checkpoint saved [{step_label}] → {save_path} (run: {self._run_dir})")
+        _log(f"Checkpoint saved [{step_label}] -> {save_path} (run: {self._run_dir})")
         return save_path
 
     # -----------------------------------------------------------------------

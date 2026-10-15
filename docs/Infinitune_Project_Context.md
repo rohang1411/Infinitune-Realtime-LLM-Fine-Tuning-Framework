@@ -1,6 +1,6 @@
 # InfiniTune — Complete Project Context & Technical Reference
 
-> **Purpose of this document:** A single-source, end-to-end reference for any person or AI agent who needs to understand the full InfiniTune codebase — its motivation, architecture, design decisions, code internals, and operational details — without having to read any other file.
+> **Purpose of this document:** A single-source, end-to-end reference for any person or AI agent who needs to understand the full InfiniTune codebase, reproduce its evaluations, and distinguish measured results from historical or proposed claims. **Section 13 is the current evaluation authority.**
 
 ---
 
@@ -27,14 +27,14 @@
    - [utils/eval_qualitative.py — Qualitative Evaluator](#68-utilseval_qualitativepy--qualitative-evaluator)
    - [utils/evaluation_artifacts.py — Artifact Orchestrator](#69-utilsevaluation_artifactspy--artifact-orchestrator)
    - [utils/plot_metrics.py — Offline Plot & Report Utility](#610-utilsplot_metricspy--offline-plot--report-utility)
-   - [utils/adapter_manifest.py — Signed Adapter Manifest Protocol & Safetensors](#611-utilsadapter_manifestpy--signed-adapter-manifest-protocol--safetensors)
-   - [utils/serving_router.py — Atomic Double-Buffered Adapter Router & ReadWriteLock](#612-utilsserving_routerpy--atomic-double-buffered-adapter-router--readwritelock)
-   - [utils/precision_manager.py — Precision Engine & MFU Profiler](#613-utilsprecision_managerpy--precision-engine--mfu-profiler)
+   - [utils/adapter_manifest.py — Offline Signed Adapter Artifact Helper](#611-utilsadapter_manifestpy--offline-signed-adapter-artifact-helper)
+   - [utils/serving_router.py — Single-Model Read/Write Locked Adapter Router](#612-utilsserving_routerpy--single-model-readwrite-locked-adapter-router)
+   - [utils/precision_manager.py — Device-Aware Precision Helper](#613-utilsprecision_managerpy--device-aware-precision-helper)
    - [utils/replay_buffer.py — Reservoir Sampling Replay Buffer](#614-utilsreplay_bufferpy--reservoir-sampling-replay-buffer)
-   - [utils/continual_engine.py — Golden Canary Evaluator & ADWIN Drift Detector](#615-utilscontinual_enginepy--golden-canary-evaluator--adwin-drift-detector)
-   - [benchmarks/load_test_serving.py — Concurrent Serving Load Tester](#616-benchmarksload_test_servingpy--concurrent-serving-load-tester)
-   - [benchmarks/canary_freshness_probe.py — Canary Freshness Latency Probe](#617-benchmarkscanary_freshness_probepy--canary-freshness-latency-probe)
-   - [benchmarks/run_streaming_cl.py — Continual Learning 3-Phase Benchmark Runner](#618-benchmarksrun_streaming_clpy--continual-learning-3-phase-benchmark-runner)
+   - [utils/continual_engine.py — Canary and Drift Helpers](#615-utilscontinual_enginepy--canary-and-drift-helpers)
+   - [benchmarks/load_test_serving.py — Closed-Loop HTTP Load Client](#616-benchmarksload_test_servingpy--closed-loop-http-load-client)
+   - [benchmarks/canary_freshness_probe.py — Keyword Diagnostic](#617-benchmarkscanary_freshness_probepy--keyword-diagnostic)
+   - [benchmarks/run_streaming_cl.py — Continual Metric Helpers](#618-benchmarksrun_streaming_clpy--continual-metric-helpers)
 7. [Configuration System](#7-configuration-system)
    - [Config Naming Convention](#71-config-naming-convention)
    - [Schema Reference (all keys explained)](#72-schema-reference)
@@ -58,10 +58,10 @@
     - [Metrics Logging & Plots](#109-metrics-logging--plots)
     - [Evaluation Artifact Bundle](#1010-evaluation-artifact-bundle)
 11. [Inference Server Internals](#11-inference-server-internals)
-    - [Concurrent Atomic Hot-Swap via Double-Buffered Router](#111-concurrent-atomic-hot-swap-via-double-buffered-router)
-    - [Reader-Writer Synchronization & Concurrency](#112-reader-writer-synchronization--concurrency)
-    - [Torn Adapter Update Elimination](#113-torn-adapter-update-elimination)
-    - [Safe Deserialization via Safetensors](#114-safe-deserialization-via-safetensors)
+    - [Concurrent Inference and Adapter Swaps](#111-concurrent-inference-and-adapter-swaps)
+    - [Lock and Version Semantics](#112-lock-and-version-semantics)
+    - [Kafka Snapshot Completeness](#113-kafka-snapshot-completeness)
+    - [Broker Deserialization Boundary](#114-broker-deserialization-boundary)
     - [Cold-Start Staleness Elimination & Auto-Discovery](#115-cold-start-staleness-elimination--auto-discovery)
     - [Serving SLAs & REST API Reference](#116-serving-slas--rest-api-reference)
 12. [Optimizations & Engineering Hardening](#12-optimizations--engineering-hardening)
@@ -77,12 +77,12 @@
     - [Full-Pool and Structured Evaluation Windows](#1210-full-pool-and-structured-evaluation-windows)
     - [Left-Padding for Batched Generation](#1211-left-padding-for-batched-generation)
     - [Lazy-Loaded Heavy Models](#1212-lazy-loaded-heavy-models)
-13. [Production Forensic Audit, Metrics Deep Dive & External Audit Reference](#13-production-forensic-audit-metrics-deep-dive--external-audit-reference)
-    - [Root-Cause Analysis: Audit Findings & Systemic Hardening](#131-root-cause-analysis-audit-findings--systemic-hardening)
-    - [Production Serving Architecture & Low-Latency SLA Benchmark](#132-production-serving-architecture--low-latency-sla-benchmark)
-    - [Streaming Model Evaluation & Classification Dynamics](#133-streaming-model-evaluation--classification-dynamics)
-    - [Hardware Requirements & Production Execution Matrix](#134-hardware-requirements--production-execution-matrix)
-    - [External Audit & Verification Runbook](#135-external-audit--verification-runbook)
+13. [Reproducible Evaluation, Evidence Ledger, and External Audit](#13-reproducible-evaluation-evidence-ledger-and-external-audit)
+    - [What the existing numbers actually establish](#131-what-the-existing-numbers-actually-establish)
+    - [Evaluation dashboard and command-line runner](#132-evaluation-dashboard-and-command-line-runner)
+    - [What each suite measures](#133-what-each-suite-measures)
+    - [Engineering issue ledger and why each fix was chosen](#134-engineering-issue-ledger-and-why-each-fix-was-chosen)
+    - [Measured runtimes and unmeasured hardware](#135-measured-runtimes-and-unmeasured-hardware)
 14. [Dependencies & Tech Stack](#14-dependencies--tech-stack)
 15. [Setup & Running the System](#15-setup--running-the-system)
 16. [Extending InfiniTune to a New Task](#16-extending-infinitune-to-a-new-task)
@@ -115,9 +115,9 @@ InfiniTune eliminates all three bottlenecks:
 
 1. **Static data → Streaming data**: Training samples are published to Apache Kafka in real time as they are generated or collected. The trainer consumes them on-the-fly.
 2. **Offline training → Background training**: The trainer runs as an independent background process, never blocking the inference server.
-3. **Manual deployment → Automatic weight hot-swap**: After every `weight_push_interval` seconds, the trainer serializes the learned LoRA adapter weights and publishes them back to Kafka. The inference server picks them up and applies them to the live model — **no restart, no downtime**.
+3. **Manual deployment → adapter publication**: When streaming is enabled, the trainer publishes complete LoRA snapshots after the configured interval and at completion. The inference server applies them under a write lock without restarting; requests can wait during the swap.
 
-The key insight is that **LoRA adapters are small** (often < 1% of the total model parameters), so serializing and transferring them over Kafka is fast and cheap — even for large base models.
+LoRA updates transfer the adapter rather than the base model. Transfer size and time depend on the rank, target modules, broker, and device; record these before making a scale claim.
 
 ---
 
@@ -273,27 +273,34 @@ Infinitune-Realtime-LLM-Fine-Tuning-Framework/
 |   |-- report_html.py            # Generates offline self-contained Plotly HTML report
 |   |-- report_utils.py           # Shared presentation-spec layer and chart utilities
 |   |-- adapter_manifest.py       # Cryptographic adapter snapshots (HMAC-SHA256 & SHA-256 manifests)
-|   |-- serving_router.py         # DoubleBufferedAdapterRouter with writer-priority ReadWriteLock
+|   |-- stream_protocol.py        # Complete Kafka snapshot validation before model updates
+|   |-- serving_router.py         # Single-model PEFT router with writer-priority ReadWriteLock
 |   |-- precision_manager.py      # PrecisionManager: CUDA BF16 AMP, FP16 GradScaler, torch.compile
 |   |-- replay_buffer.py          # ReservoirReplayBuffer (Algorithm R) with domain tracking
-|   `-- continual_engine.py       # ContinualLearningEngine: forward/backward transfer, ADWIN drift
+|   `-- continual_engine.py       # Canary/ADWIN helpers (not wired into live promotion)
 |
 |-- benchmarks/
-|   |-- load_test_serving.py      # SLA load tester & run manifest generator (p50/p95/p99 latency)
-|   |-- canary_freshness_probe.py # End-to-end freshness probe measuring data-to-serving adaptation
-|   `-- run_streaming_cl.py       # 3-phase domain shift continual learning benchmark harness
+|   |-- run.py                     # Selectable, resumable benchmark suite and failure manifest
+|   |-- repro_eval.py              # Dataset cache, LoRA baselines, per-example classification
+|   |-- e2e_eval.py                # Pinned E2E validation + BLEU/ROUGE/slot proxy
+|   |-- precision_probe.py         # Measured optimizer-step timing and memory
+|   |-- load_test_serving.py       # Closed-loop HTTP latency and raw request records
+|   |-- canary_freshness_probe.py  # Legacy keyword diagnostic only
+|   `-- run_streaming_cl.py        # Pure CL metric helpers; no sample-result CLI
 |
-|-- reports/                      # Verifiable benchmark artifacts & manifests (git-tracked)
-|   `-- serving_ab/               # Serving SLA A/B test results and run_manifest.json
+|-- reports/
+|   |-- serving_ab/               # Historical unequal-load A/B artifacts (not a causal speedup)
+|   `-- benchmark_runs/           # New raw runs and tracebacks (Git-ignored)
 |
-|-- tests/                       # 29 automated pytest unit & regression tests
+|-- tests/                       # 42 automated pytest unit & regression tests at this audit
 |   |-- test_adapter_manifest.py  # HMAC-SHA256 signing, SHA-256 integrity, safe loading
 |   |-- test_benchmarks.py        # Benchmark harness & continual learning metric calculation
 |   |-- test_continual_learning.py# Reservoir replay buffer sampling & ADWIN drift detector
 |   |-- test_eval_metrics.py      # Target-class Macro F1 vs phantom class isolation
 |   |-- test_precision_manager.py # Autocast precision management & torch.compile device fallback
 |   |-- test_serving_router.py    # ReadWriteLock reader parallelism & atomic weight swaps
-|   `-- test_stream_integrity.py  # Atomic Kafka framing preventing torn updates
+|   |-- test_stream_integrity.py  # Tensor/metadata serialization checks
+|   `-- test_repro_evaluation.py  # Real PEFT validation, failure/resume, metrics
 |
 |-- docs/
 |   |-- Infinitune_Project_Context.md   # This file - full architecture reference
@@ -365,12 +372,12 @@ Where:
 **Why this matters for InfiniTune:**
 - The adapter tensors are tiny (e.g., 5–20 MB for a GPT-2 class model vs. hundreds of MB for the full model)
 - Only adapters are serialized and sent over Kafka — this is fast
-- The base model stays frozen and is shared between training and inference
-- Memory footprint is dramatically smaller than full fine-tuning
+- The same base-model architecture is loaded separately by trainer and inference; only the adapter is updated and transferred
+- Trainable optimizer state is smaller than full fine-tuning; the base model still occupies memory
 
 In InfiniTune, LoRA is applied via the `peft` library using `get_peft_model()`. The target modules (attention layers) are configured per-task in the YAML config.
 
-**LoRA vs QLoRA:** InfiniTune uses **LoRA** (Low-Rank Adaptation) on full-precision (`fp32`) or half-precision (`bf16`/`fp16`) base model weights. Base model weights remain frozen, and rank $r=16, lpha=32$ adapter matrices are trained. True QLoRA (4-bit NF4 quantization) is deliberately not employed during streaming training to ensure numerical stability and avoid dequantization latency spikes during high-frequency live adapter swaps.
+**LoRA vs QLoRA:** InfiniTune uses **LoRA** (Low-Rank Adaptation) with frozen base-model weights. The IMDb configuration trains rank `r=16`, `lora_alpha=32` adapters. FP32 is the tested local CPU path; BF16/FP16 are conditional on accelerator support, as recorded by the `precision` suite. QLoRA (4-bit NF4) is not implemented in this training path; no QLoRA comparison was run.
 
 #### LoRA Target Modules — Evolution
 
@@ -397,20 +404,20 @@ Key Kafka concepts used:
 - **Offset**: Position within a topic. On startup, the trainer uses `auto_offset_reset="earliest"` (replay all data) or seeks to the end in `test_mode`.
 
 **Why Kafka instead of a simple queue?**
-- Records are persistent — the trainer can be restarted and replay data from the beginning
-- Kafka handles backpressure naturally — the producer can be faster or slower than the trainer
-- Kafka's durable log is perfect for weight updates — the inference server can catch up if it was briefly unavailable
-- Topic-level separation makes it trivial to add new consumers (e.g., a second inference server)
+- Records remain available subject to topic retention; replay requires an appropriate consumer group and offset policy
+- Kafka buffers records when the producer is faster than the trainer. Measure broker lag, retention limits, and disk use before claiming controlled backpressure.
+- Kafka decouples adapter publication from inference. The current listener uses `latest`; a restarted listener needs a saved checkpoint or another snapshot publication to catch up.
+- Additional inference replicas need distinct consumer groups and a version-consistency test; they are not provided by this single-server benchmark
 
 #### Kafka API Version — Critical Note
 
 > **Previously:** Some early versions pinned `api_version=(0, 10)` explicitly in the `KafkaProducer` constructor.
 >
-> **Now:** This is explicitly forbidden. Pinning `api_version=(0, 10)` causes **silent delivery failures on modern Kafka 3.x+ brokers** — messages appear to send but are never received. The producer always uses auto-negotiation. This is enforced via a code comment directly above the `KafkaProducer` instantiation.
+> **Now:** The producer uses API auto-negotiation instead of forcing a very old broker version. This reduces compatibility risk; the isolated `pipeline` probe checks actual delivery on the selected broker.
 
 #### Kafka Consumer Long-Eval Reliability
 
-For qualitative evaluation tasks (especially `structured_slot_coverage` with many consistency runs), a single eval call can take 15–25 minutes. Kafka's default consumer session timeout is far shorter, causing the broker to evict the consumer as "dead" and trigger a rebalance that breaks training.
+Qualitative evaluation can block calls to `poll()` for a long time. The relevant group-liveness bound is `max_poll_interval_ms`; heartbeats and `session_timeout_ms` are separate. Earlier project notes reported multi-minute inline evaluations, but this audit did not retain a matched per-call timing trace. Measure the evaluator and consumer behavior together before assigning a failure rate or duration.
 
 The following settings are applied to `KafkaConsumer` in `trainer.py`:
 
@@ -426,20 +433,20 @@ All three can be overridden in `kafka:` config block.
 
 Traditional training processes a fixed dataset in multiple epochs. InfiniTune uses **online learning**: the model is updated on each mini-batch as it arrives from the stream, without storing the full dataset.
 
-In `test_mode: true` (used by all current configs), the trainer processes the full streaming dataset **exactly once** — a single pass through the Kafka topic — stopping when it receives the `_eof` sentinel. This is equivalent to a single epoch of streaming training, not multi-epoch replay.
+In `test_mode: true`, the trainer uses a unique group from the earliest offset and runs until the `_eof` sentinel plus a drained-offset check. An uninterrupted isolated-topic run aims for one pass. This is **not** an exactly-once guarantee across crashes or retries; those need transactional offset and optimizer-state recovery.
 
 Benefits:
 - The model continuously adapts to new data without waiting for a full dataset to accumulate
 - Memory is proportional to a single mini-batch + the model, not the entire dataset
-- The model improves immediately as data flows in, making it suitable for live or rapidly evolving data sources
+- Quality can be checked on fixed held-out data as updates arrive; an update is not assumed to improve the model
 
 ### 5.4 Decoupled Evaluation Architecture
 
-**The Problem:** In-process quantitative and qualitative evaluation was originally always inline — it ran inside `trainer.py` at every `eval_interval` optimizer steps. For qualitative tasks (e.g., `structured_slot_coverage` with `consistency_runs: 10`), a single eval pass over 334 samples took **40+ minutes**, freezing the Kafka consumer and blocking training ingestion.
+**The Problem:** Inline generation evaluation blocks training and can delay Kafka polling. Earlier project notes reported a 40-minute pass over 334 samples with ten consistency runs, but the raw timing trace is not retained here. Treat that duration as an unverified historical report.
 
-> **Previously (inline-only):** All evaluation ran synchronously inside `trainer.py`. Setting `eval_interval: 200` meant every 200 optimizer steps, training would pause for 15–40 minutes while qualitative metrics were computed. This made real-time training impractical for complex eval configurations.
+> **Previously (inline-only):** Evaluation ran synchronously in `trainer.py`; pause time depends on model, sample count, decoding, and device. The quoted 15–40-minute range is not independently verified in this audit.
 >
-> **Now (decoupled flag):** A `evaluation.decoupled: true` config flag completely bypasses inline evaluation. The trainer focuses on streaming training and checkpoint saving at `save_every_steps`. After training (or even during it), `evaluate.py` can be run independently at any time against any saved checkpoint, producing the full evaluation suite without affecting training throughput.
+> **Now (decoupled flag):** `evaluation.decoupled: true` bypasses inline evaluation. `evaluate.py` can score a saved checkpoint in a separate process. Running it concurrently on the same laptop can still compete for CPU, GPU, RAM, or disk and slow training.
 
 The `evaluate.py` script is the dedicated offline evaluator:
 - No Kafka connection required
@@ -616,52 +623,54 @@ Builds a `torch.optim.lr_scheduler.LambdaLR` with one of three schedules:
 4.  Optionally enable gradient_checkpointing (use_reentrant=False).
 5.  Detect device (CUDA > MPS > CPU) and move model to device.
 6.  Create KafkaConsumer for training-data topic with long-eval timeout settings.
-    - In test_mode: seek to END of topic (consume only new data from this run).
-    - UUID-suffixed consumer group in test_mode to avoid stale committed offsets.
+    - In test_mode: use a UUID-suffixed consumer group and start at the earliest offset.
+    - Publish to an isolated topic for each test run to avoid replaying unrelated data.
 7.  Set up optimizer (AdamW) and LR scheduler.
 8.  Instantiate LoRAProducer (if enable_lora_streaming) and Evaluator.
 9.  Instantiate CheckpointManager for periodic checkpoint saving.
 10. Enter the streaming training loop:
 
-    WHILE optimization_step < max_steps AND not stop_requested:
+    WHILE optimization_step < effective_max_steps AND not stop_requested:
       a. Poll Kafka for messages, assemble a mini-batch.
+         - Bound each poll with max_records=remaining batch capacity to avoid dropping fetched records.
          - Skip _verify and _eof control messages.
          - On _eof: set eof_received = True.
-         - After EOF + 2s idle: set stop_requested = True.
+         - After EOF, verify assigned offsets reached broker end offsets, then wait
+           training.eof_empty_polls consecutive empty polls (default 100; pipeline probe 3).
       b. Tokenize each sample with label masking.
       c. Pad the batch and move to device.
       d. Forward pass → compute loss.
       e. Scale loss by 1/grad_accum_steps, backward pass.
       f. Every grad_accum_steps micro-batches:
-           i.  clip_grad_norm_(max_norm=1.0) — before optimizer.step()
-           ii. optimizer.step(), scheduler.step()
+           i.  Unscale FP16 gradients, then clip_grad_norm_(max_norm=1.0).
+           ii. Step via GradScaler when active; advance scheduler only for applied updates.
            iii.optimizer.zero_grad(set_to_none=True) — aggressive memory release
            iv. del outputs, loss, scaled_loss, batch → gc.collect() → empty_cache()
            v.  Log step metrics (loss, LR, grad_norm, tok/s, step time).
-           vi. Every eval_interval steps AND NOT decoupled:
-               run Evaluator.evaluate() + QualitativeEvaluator.run()
+           vi. Run quantitative and qualitative evaluators on their independent
+               cadences when enabled and not decoupled.
            vii.Every save_every_steps steps:
                CheckpointManager.save(model, tokenizer, step, loss)
       g. Every weight_push_interval seconds AND enable_lora_streaming:
          - Send LoRA adapter state dict to Kafka via LoRAProducer.
 
-11. On training complete (or Ctrl-C / error):
-    a. Send final LoRA weights (if streaming enabled).
-    b. Send __done__ sentinel (if streaming enabled).
-    c. Save final checkpoint via CheckpointManager.save(model, tokenizer, "final")
+11. On training completion:
+    a. Flush a partial gradient accumulation if needed.
+    b. Save final checkpoint via CheckpointManager.save(model, tokenizer, "final").
+    c. Send final LoRA weights and __done__ (if streaming enabled and loop did not fail).
     d. Run final evaluation (unless interrupted or decoupled).
     e. Generate evaluation artifact bundle from metrics CSV.
     f. Log: "To run decoupled evaluation: python evaluate.py --config <config> [--step N | --all-checkpoints]"
 ```
 
 **`test_mode` behavior:**
-When `test_mode: true`, the trainer seeks to the **end** of the Kafka topic on startup so it only consumes records produced *after* the current run starts. It trains until the EOF marker arrives, rather than stopping at `max_steps`. `max_steps` serves as a safety cap only.
+When `test_mode: true`, the trainer uses a unique consumer group with the **earliest** offset. It trains until an EOF marker is consumed and the assigned partitions have caught up to the broker end offsets. `max_steps` is ignored in test mode; use a dedicated topic, a bounded producer, and the configured EOF idle-poll count. The benchmark runner does this automatically. In normal mode, `max_steps` remains the update limit.
 
 **Heartbeat logging:** While waiting for the producer to send data, the trainer logs every 5 seconds with idle time and batch progress, so it never looks "stuck".
 
 **Gradient norm tracking:** The raw (pre-clip) L2 norm of all gradients is accumulated across micro-batches and logged at each optimizer step as `grad_norm`. This is useful for diagnosing training instability.
 
-**Token throughput:** Tokens per second is computed as `response_tokens_in_batch / step_wall_time`, giving a hardware-specific throughput metric.
+**Token throughput:** Tokens per second is computed from response tokens accumulated across the optimizer step divided by step wall time. This is a local throughput diagnostic, not device MFU.
 
 ---
 
@@ -1015,8 +1024,8 @@ Computed via `_normalized_aauc_from_history()`. Uses trapezoidal integration ove
 **Forgetting-Max (`forgetting_max`):**
 Tracks the peak value of each `forgetting_track_metrics` scalar and reports the maximum drop from peak to current value. Meaningful when using a stable eval pool (sliding window can conflate distribution shift with genuine forgetting).
 
-**Backward Transfer (`backward_transfer`):**
-For each sample that the model *currently gets wrong*, checks if it was correct at a previous eval step. The BWT score is the mean "did we get this wrong after having been right" across all samples. A negative BWT signals catastrophic forgetting; zero means no regression.
+**Historical within-task `backward_transfer` field:**
+The inline evaluator tracks whether the same examples changed from correct to incorrect across checkpoints. That is a within-task regression diagnostic, **not formal cross-task BWT**. Formal BWT in Section 13 uses a separate task-by-training-phase matrix.
 
 **QAFactEval:**
 Factual consistency score between the source input and the generated response. Uses an extractive QA model (`deepset/minilm-uncased-squad2` by default, ~120 MB, **lazy-loaded on CPU**). For each sentence-span in the source, asks the QA model to find that span in the generated text. Scores are averaged across spans using token-level F1. Range: 0 (fully inconsistent) → 1 (fully consistent).
@@ -1256,149 +1265,38 @@ Useful after a crash (metrics CSV is written incrementally), after a Ctrl-C inte
 
 ---
 
-### 6.11 `utils/adapter_manifest.py` — Signed Adapter Manifest Protocol & Safetensors
+### 6.11 `utils/adapter_manifest.py` — Offline Signed Adapter Artifact Helper
 
-**Role:** Provides a cryptographically verified, safe serialization protocol for LoRA adapter weights, completely eliminating Python pickle vulnerabilities and detecting data tampering, signature mismatch, or torn updates.
+The module creates/verifies safetensors file bundles with SHA-256 and optional HMAC-SHA256. Its tests validate that **offline helper**. The Kafka producer/consumer use a different frame manifest (`utils/stream_protocol.py`) without HMAC authentication; do not claim that live Kafka updates are signed. Add a shared secret, signed canonical frame payload, and broker access controls before making that claim.
 
-#### Core Capabilities
-- **`AdapterManifest` Dataclass:** Encapsulates complete provenance metadata:
-  ```python
-  @dataclass
-  class AdapterManifest:
-      manifest_version: str      # e.g., "1.0.0"
-      model_name: str            # e.g., "distilgpt2", "Qwen/Qwen2.5-1.5B"
-      step_id: int               # Optimizer step number
-      created_at: float          # Unix timestamp
-      tensors: Dict[str, Dict]   # Tensor name -> {"shape": list, "dtype": str}
-      total_parameters: int      # Sum of trainable adapter parameters
-      sha256_checksum: str       # Cryptographic SHA-256 digest of safetensors payload
-      signature: Optional[str]   # HMAC-SHA256 digital signature
-  ```
-- **Safe Safetensors I/O:** Serializes state dictionaries via `safetensors.torch.save()` into raw byte buffers, eliminating arbitrary code execution vectors.
-- **Integrity & HMAC Authentication:** `load_adapter_weights()` verifies the HMAC-SHA256 signature against a pre-shared secret key and recomputes the SHA-256 checksum of received bytes before deserializing tensors. Raises `ValueError` upon tampering, truncation, or signature failure.
-- **Atomic File Artifact Bundling:** `create_adapter_artifact()` creates self-contained directories with `adapter_model.safetensors` and `manifest.json`.
+### 6.12 `utils/serving_router.py` — Single-Model Read/Write Locked Adapter Router
 
----
+`DoubleBufferedAdapterRouter` retains its historical class name for compatibility, but stores **one live PEFT model**, not two model buffers. Concurrent readers hold a shared read lock for generation; a writer waits for them, then copies a complete validated adapter snapshot under the exclusive lock. PEFT tensor names/shapes must match the live adapter exactly. The version is published only after all copies succeed. This prevents requests from observing a partial write, but it does not make swaps lock-free or guarantee a latency SLA. `swap_stress` measures actual pauses and failures. `/metrics` exposes rolling request latency and swap telemetry; its p99 on small samples is only descriptive.
 
-### 6.12 `utils/serving_router.py` — Atomic Double-Buffered Adapter Router & ReadWriteLock
+### 6.13 `utils/precision_manager.py` — Device-Aware Precision Helper
 
-**Role:** Replaces the legacy global `model_lock` with an atomic, double-buffered router and writer-priority reader-writer lock, enabling concurrent non-blocking inference during continuous live weight hot-swaps.
+CUDA supports BF16 autocast when available and FP16 with GradScaler. CPU and MPS currently resolve requested BF16/FP16 to FP32 in this helper; `torch.compile` is attempted only on CUDA. `trainer.finish_optimizer_step()` now unscales FP16 accumulated gradients before clipping and handles overflow without advancing the scheduler. The `precision` benchmark records actual step timing, RSS, CUDA peak allocation if available, and an explicit unsupported status. `calculate_mfu()` is a theoretical formula helper, not a measured profiler result. No MPS/CUDA speedup or MFU score has been established here.
 
-#### Key Mechanics
-- **`ReadWriteLock` with Writer Preference:**
-  - Multiple inference threads acquire shared read locks concurrently via `reader_acquire()` / `reader_release()`.
-  - When an adapter update arrives, `writer_acquire()` sets a `waiting_writers` flag, preventing new readers from entering. Once active readers drain, the writer executes exclusively.
-  - Prevents writer starvation under sustained high-throughput inference traffic.
-- **Double-Buffered State Architecture:**
-  - Holds model state and prepares incoming weight dictionaries on the execution device in background threads before acquiring synchronization locks.
-  - The hot-swap applies device-prepared tensors under an exclusive write lock:
-    ```python
-    prepared_weights = {k: v.to(self.device) for k, v in new_state_dict.items()}
-    self.rw_lock.acquire_write()
-    try:
-        self.model.load_state_dict(prepared_weights, strict=False)
-        self.active_version = version_tag
-        self.swap_count += 1
-    finally:
-        self.rw_lock.release_write()
-    ```
-  - **Zero Request Dropping:** Live generation requests run concurrently under shared read locks; incoming writer requests yield priority to drain active readers without dropping in-flight traffic.
-- **Real-Time Latency Telemetry:** Tracks rolling distributions of request latencies (p50, p95, p99) and swap durations, exposed directly via the `/metrics` endpoint (verified in `reports/serving_ab/run_manifest.json`).
+### 6.14 `utils/replay_buffer.py` — Reservoir Sampling
 
----
+`ReservoirReplayBuffer` implements bounded Algorithm-R sampling. The `continual` benchmark actually uses it at capacity 1,000, replacing 20% of current-domain examples with prior examples while keeping total example and optimizer-step budgets matched against a no-replay arm. The ordinary Kafka training loop does **not** use this buffer; the benchmark does not prove live replay is deployed.
 
-### 6.13 `utils/precision_manager.py` — Precision Engine & MFU Profiler
+### 6.15 `utils/continual_engine.py` — Canary and Drift Helpers
 
-**Role:** Orchestrates device-aware mixed precision execution (BF16 AMP, FP16 GradScaler), compiler graph optimization (`torch.compile`), and Model FLOPs Utilization (MFU) telemetry across CUDA, Apple Silicon MPS, and CPU.
+`GoldenCanaryEvaluator` and `ADWINDriftDetector` have unit tests, but neither is wired into the trainer-to-serving promotion path. There is no automatic live rollback or ADWIN-driven learning-rate change. A deployment claim requires integration tests with persisted canary data, promotion decisions, failure injection, and recovery traces.
 
-#### Architecture
-- **Precision Resolution:** Resolves user-configured precision mode (`fp32`, `fp16`, `bf16`) according to hardware capabilities:
-  - CUDA: Supports native BF16 AMP (`torch.bfloat16`) and FP16 with dynamic `GradScaler`.
-  - Apple Silicon MPS: Enforces FP32 default for numerical stability with small batches; allows FP16 for memory-constrained larger models.
-  - CPU: Defaults to FP32 or bfloat16 autocast.
-- **`autocast_context()`:** Provides context manager wrapping model forward passes in appropriate device autocast namespaces.
-- **`backward_and_step()`:** Scales loss, computes backward gradients, unscales gradients, executes gradient clipping (`max_norm=1.0`), and steps the optimizer safely.
-- **`compile_model()`:** Fuses attention and MLP projections using `torch.compile(model, mode="max-autotune")` with fallback to eager mode on unsupported configurations.
-- **Model FLOPs Utilization (MFU) Computation:**
-  Calculates floating-point hardware efficiency per optimizer step:
-  $$\text{MFU} = \frac{6 \times P \times \text{tokens\_per\_sec}}{\text{Peak Device FLOPs}}$$
-  where $P$ is total model parameter count. Provides continuous hardware efficiency tracking.
+### 6.16 `benchmarks/load_test_serving.py` — Closed-Loop HTTP Load Client
 
----
+This client reports per-request raw JSONL, HTTP status/errors, version, client end-to-end latency, server-reported latency, and achieved QPS at a chosen concurrency. `benchmarks.run` launches each mode on the same checkpoint, sends warmups, and alternates A/B order. The endpoint returns only a completed JSON response, so **TTFT is not measured**. No open-loop arrival schedule or saturation knee is measured. Use ≥1,000 successful calls per arm for a minimally useful p99 estimate and repeat across runs.
 
-### 6.14 `utils/replay_buffer.py` — Reservoir Sampling Replay Buffer
+### 6.17 `benchmarks/canary_freshness_probe.py` — Keyword Diagnostic
 
-**Role:** Mitigates catastrophic forgetting in streaming continuous fine-tuning without storing the entire training history, using bounded-memory reservoir sampling.
+The legacy script polls `/generate` for a keyword. It does not publish Kafka data or prove causal training adaptation. Its output is named `keyword_observation_latency_s`. Use the new `freshness` suite for adapter Kafka publication-to-visible-version timing, or `pipeline` for isolated eight-record publication through the real trainer to the step-2 serving version. Neither test calls a version change a behavior flip.
 
-#### Algorithmic Design
-- **Vitter's Algorithm R:**
-  - Fixed capacity $M$ (default $1,000$ samples).
-  - The first $M$ items from the stream populate the reservoir directly.
-  - For item $n > M$, it is selected with probability $\frac{M}{n}$. If selected, it replaces a randomly chosen item in the reservoir.
-  - **Theoretical Guarantee:** At any step $N$, every sample seen in the stream has an exact uniform probability $\frac{M}{N}$ of being retained in memory.
-- **Mini-Batch Rehearsal Collation (`collate_with_stream`):**
-  - Interleaves historical exemplars with fresh Kafka streaming records at a configurable `replay_ratio` (e.g., $0.25$ = 25% replay, 75% streaming).
-  - Provides stability against task-to-task distribution drift while maintaining forward plasticity.
+### 6.18 `benchmarks/run_streaming_cl.py` — Continual Metric Helpers
 
----
+The file retains BWT/forgetting calculation and Markdown formatting helpers for callers. Its former standalone command printed a hard-coded example matrix; that command now exits with guidance. Actual three-phase experiments are run by `python -m benchmarks.run run --suites continual`, which prepares pinned IMDb/Yelp/Amazon data, trains LoRA phases, evaluates each fixed held-out task after every phase, and writes raw predictions and matrices per seed. See Section 13 for experimental limits.
 
-### 6.15 `utils/continual_engine.py` — Golden Canary Evaluator & ADWIN Drift Detector
-
-**Role:** Enforces production safety invariants via automated regression gating and statistical concept drift detection.
-
-#### Modules
-- **`GoldenCanaryEvaluator`:**
-  - Evaluates candidate LoRA adapters against a fixed, stationary 200-sample **Golden Canary Benchmark** prior to serving promotion.
-  - **Safety Gate Invariant:**
-    $$\text{Loss}_{\text{canary}}(\theta_{\text{new}}) \le 1.10 \times \text{Loss}_{\text{canary}}(\theta_{\text{baseline}})$$
-  - If loss regresses by $> 10\%$, adapter promotion is aborted, an alert is logged, and the inference router executes an atomic rollback to the previous known-good adapter.
-- **`ADWINDriftDetector` (Adaptive Windowing):**
-  - Monitors the streaming prequential error / loss stream.
-  - Dynamically splits observation window $W$ into sub-windows $W_0, W_1$. When $|\mu_{W_0} - \mu_{W_1}| > \epsilon_{\text{cut}}$ according to the Hoeffding variance bound with confidence $1 - \delta$, a drift alert is triggered to adapt training hyper-parameters.
-
----
-
-### 6.16 `benchmarks/load_test_serving.py` — Concurrent Serving Load Tester
-
-**Role:** Asynchronous, multi-threaded stress-testing harness measuring serving latency SLAs, throughput ceilings, and hot-swap pause times under concurrent HTTP traffic.
-
-#### Operational Workflow
-- Spawns $N$ concurrent client worker threads issuing POST requests to `/generate`.
-- Records client-side end-to-end wall-clock latency, server-reported processing latency, adapter versions (`X-Adapter-Version` header), and HTTP response status codes.
-- Measures throughput under continuous load and during live adapter hot-swaps.
-- Outputs structured JSON report and run manifest containing:
-  - Total requests, successful requests, dropped requests (achieved 0.00% failure rate)
-  - Sustained throughput (Queries Per Second - QPS)
-  - Client and server latency percentiles: p50, p95, p99, and arithmetic mean.
-
----
-
-### 6.17 `benchmarks/canary_freshness_probe.py` — Canary Freshness Latency Probe
-
-**Role:** Measures end-to-end pipeline latency from Kafka data ingestion to observable behavioral adaptation at the inference endpoint.
-
-#### Methodology
-1. Connects to the Kafka training topic and publishes a canary training record containing a distinct factual assertion or trigger pattern.
-2. Immediately polls the `/generate` endpoint with a probe prompt every 500ms.
-3. Records the exact elapsed seconds until the generated response flips from the pre-trained default to the updated target behavior.
-4. Exposes headline real-time adaptation latency (typically 10-15s, bounded by `weight_push_interval`).
-
----
-
-### 6.18 `benchmarks/run_streaming_cl.py` — Continual Learning 3-Phase Benchmark Runner
-
-**Role:** Automated CLI benchmark runner executing 3-phase domain shift experiments across multiple random seeds, generating empirical Backward Transfer (BWT) and Forward Transfer (FWT) metrics.
-
-#### Protocol
-- Evaluates model performance across three sequential distributions (e.g., Domain A: IMDb Movie Reviews $\to$ Domain B: Yelp Business Reviews $\to$ Domain C: Amazon Product Reviews).
-- Tracks evaluation matrix $R_{i, j}$ (accuracy on domain $j$ after training on domain $i$).
-- Calculates formal continual learning metrics:
-  - **Backward Transfer (BWT):** $BWT = \frac{1}{T-1} \sum_{i=1}^{T-1} (R_{T, i} - R_{i, i})$
-  - **Forward Transfer (FWT):** $FWT = \frac{1}{T-1} \sum_{i=2}^{T} (R_{i-1, i} - \tilde{b}_i)$
-  - **Retained Accuracy & Forgetting Rate:** Quantifies retention percentage across all previously learned tasks.
-- Produces multi-seed statistical summaries with Wilson 95% confidence intervals and markdown reports.
-
----
 
 ## 7. Configuration System
 
@@ -1511,12 +1409,12 @@ kafka:
 
 # ── Training ─────────────────────────────────────────────
 training:
-  test_mode: true               # true = seek to end, train full dataset, stop on EOF
+  test_mode: true               # true = unique group from earliest; isolate topic and stop on EOF
   batch_size: 8
   gradient_accumulation_steps: 4  # Effective batch = batch_size × grad_accum
-  gradient_checkpointing: false  # true = save VRAM at cost of ~20% more compute
+  gradient_checkpointing: false  # recompute activations to reduce memory; measure time cost
   learning_rate: 1e-4
-  max_steps: 2000               # Safety cap (ignored in test_mode until EOF)
+  max_steps: 2000               # Normal-mode cap; ignored in test_mode
   logging_steps: 1
   weight_push_interval: 60      # Push LoRA weights to Kafka every N seconds
   lr_scheduler:
@@ -1647,7 +1545,7 @@ python trainer.py  --config configs/imdb_quantitative.yaml
 python evaluate.py --config configs/imdb_quantitative.yaml --all-checkpoints
 ```
 
-**Expected learning curve:** Accuracy climbs from ~50% (random) toward ~85–90% over 1,563 steps. MCC rises from ~0 toward ~0.70–0.80. Loss decays smoothly with cosine schedule.
+**Evaluation requirement:** Run the fixed-set `classification`, `calibration`, and multi-seed `baseline` suites before describing a learning curve or quoting an expected final score.
 
 ---
 
@@ -1679,7 +1577,7 @@ python trainer.py  --config configs/imdb_qualitative.yaml
 python evaluate.py --config configs/imdb_qualitative.yaml --all-checkpoints
 ```
 
-**Expected learning curve:** Perplexity decays steadily. `qual_keyword_density` rises over training steps as the model absorbs movie-review vocabulary. `qual_type_token_ratio` and `qual_hapax_ratio` also trend upward, indicating increasing lexical diversity.
+**Evaluation requirement:** These are proxy measurements; measure the fixed set at each checkpoint before describing a trend or interpreting vocabulary learning.
 
 ---
 
@@ -1713,7 +1611,7 @@ python trainer.py  --config configs/gsm8k_quantitative.yaml
 python evaluate.py --config configs/gsm8k_quantitative.yaml --all-checkpoints
 ```
 
-**Expected learning curve:** Accuracy (exact-match on extracted answer) climbs from near-0% at step 0 toward 20–40% by step 500 (~26% of dataset). Perplexity decays steadily. The model learns to produce `####` markers and correctly compute simple arithmetic.
+**Evaluation requirement:** No fixed-set GSM8K result is established by this config alone. Report exact-match, invalid-format rate, sample IDs, and raw generations from an actual run.
 
 ---
 
@@ -1742,7 +1640,7 @@ python producer.py --config configs/gsm8k_qualitative.yaml
 python trainer.py  --config configs/gsm8k_qualitative.yaml
 ```
 
-**Expected learning curve:** `qual_cot_anchor_count_mean` rises from ~1–2 per response to 4–8. `qual_cot_coverage_rate` rises toward 90%+. `qual_cot_step_length_mean` trends upward as reasoning steps grow longer with more content.
+**Evaluation requirement:** These are formatting proxies, not proof of reasoning. Do not quote a trend until measured on fixed prompts alongside answer correctness.
 
 ---
 
@@ -1756,7 +1654,7 @@ python trainer.py  --config configs/gsm8k_qualitative.yaml
 **Key config choices:**
 
 - **Why Alpaca instead of UltraChat or similar conversational datasets:** UltraChat's target column (`messages`) is a list of dicts. The producer would stringify it via `str()` into garbage like `"[{'role': 'user', 'content': '...'}]"`. Alpaca's columns (`instruction`, `output`) are clean strings that flow through the data-agnostic producer pipeline without transformation.
-- `dataset.column_mapping: {input_col: "instruction", target_col: "output"}` — ~40% of examples have a non-empty `input` field providing additional context; the prompt template handles this gracefully.
+- `dataset.column_mapping: {input_col: "instruction", target_col: "output"}` — the prompt template can include a non-empty `input` field. The older ~40% prevalence claim was not counted in this audit.
 - `dataset.eval_split: "train"` — Alpaca has no test split; eval uses a shuffled subset of the train split.
 - `preprocessing.prompt_template: "### Instruction:\n{{ input }}\n\n### Response:"` — standard Alpaca instruction format.
 - `testing_strategy.method: "semantic_similarity"` — uses cosine similarity between generated and golden responses via `sentence-transformers/all-MiniLM-L6-v2` on CPU.
@@ -1772,7 +1670,7 @@ python trainer.py  --config configs/alpaca_qualitative.yaml
 python evaluate.py --config configs/alpaca_qualitative.yaml --all-checkpoints
 ```
 
-**Expected learning curve:** `qual_semantic_similarity` rises from ~0.3–0.4 (baseline MiniLM similarity on random outputs) toward ~0.55–0.70. Perplexity decays from ~300+ toward ~150–200. `qual_mean_response_length` stabilizes as the model learns response length norms.
+**Evaluation requirement:** No semantic-similarity or perplexity target range is established by the configuration. Run and retain raw examples before drawing a quality conclusion.
 
 ---
 
@@ -1797,7 +1695,7 @@ python evaluate.py --config configs/alpaca_qualitative.yaml --all-checkpoints
 - `evaluation.decoupled: true` — qualitative eval with `consistency_runs: 3` would slow training.
 - `evaluation.eval_batch_size: 334` — `334 × 14 evals ≈ 4,676` ≥ 4,672 pool size, ensuring full coverage.
 - `testing_strategy.method: "structured_slot_coverage"`.
-- `testing_strategy.consistency_runs: 3` — reduced from the original 10 for faster inline iterations (3 is sufficient to detect instability).
+- `testing_strategy.consistency_runs: 3` — reduced from the original 10 to lower evaluation cost; three samples do not establish a reliable instability rate.
 - `testing_strategy.eval_batch_size: 32` — GPU batch size for generation.
 - `e2e_nlg_options.track_per_slot: [name, eatType, food, priceRange, customer rating, area, familyFriendly, near]` — produces 8 separate per-slot coverage metrics.
 - `e2e_nlg_options.slot_checkers.familyFriendly: "boolean_negation"` — the `familyFriendly` slot requires negation-aware checking: `yes` → model must say "child-friendly", `no` → model must say "not suitable for children" (not just "friendly").
@@ -1805,7 +1703,7 @@ python evaluate.py --config configs/alpaca_qualitative.yaml --all-checkpoints
 
 **Kafka Reliability (important for E2E):**
 
-`max_poll_interval_ms: 1,800,000` is essential. With `consistency_runs: 3` across 150 eval samples, a single qualitative eval pass takes 2–5 minutes. Without this setting, Kafka would evict the consumer during eval, terminating the training run.
+`max_poll_interval_ms: 1,800,000` gives the consumer up to 30 minutes between polls. The earlier 2–5-minute estimate for 150 samples and three consistency runs was not measured in this audit. Measure the actual eval interval and leave margin below the configured poll limit; exceeding it can trigger a rebalance.
 
 **Run recipe:**
 ```bash
@@ -1814,7 +1712,7 @@ python trainer.py  --config configs/e2e_qualitative.yaml
 python evaluate.py --config configs/e2e_qualitative.yaml --all-checkpoints
 ```
 
-**Expected learning curve:** `qual_slot_coverage_mean` rises from ~0.30 (base model zero-shot) toward ~0.75–0.85. `qual_perfect_coverage_rate` (all slots covered in one generation) rises toward 30–50%. `qual_consistency_score_mean` rises, indicating stable multi-run outputs. `qual_slot_familyFriendly_inversion_rate` falls toward 0 as the model learns negation-aware verbalization.
+**Evaluation requirement:** Slot coverage is heuristic. Run `e2e` on pinned unique MRs with raw generations, multi-reference BLEU/ROUGE-L, and separately labeled coverage proxies before asserting progress.
 
 > See `docs/e2e_qualitative_guide.md` for the full operational guide including startup instructions, expected metric ranges, and troubleshooting.
 
@@ -1962,18 +1860,18 @@ STEP 4 — Flask API starts at localhost:5000
 | Decision | Rationale |
 |---|---|
 | **Kafka as the transport layer** | Persistent, replayable, handles backpressure, supports multiple consumers, broker-mediated so services don't need to know each other's addresses. |
-| **LoRA-only weight transfer** | Full model weights would be GB-scale and impractically slow over Kafka. LoRA adapters are 5–20 MB and transfer in seconds. |
+| **LoRA-only weight transfer** | Publishes only trainable adapter tensors rather than the base model. Serialized size and delivery time depend on rank, target modules, broker, and device; measure them per run. |
 | **Prompt-only label masking** | Prevents the model from wasting capacity learning to predict the (known, templated) prompt. Loss is computed exclusively on response tokens. |
 | **Truncate prompt, not response** | The response (target) must always fit fully so the model sees the complete answer during training. The prompt can be truncated because the model still gets critical context. |
 | **EOS token appended to every response** | Teaches the model to stop generating after the answer, preventing infinite repetition at inference time. |
 | **CSV opened/closed per write** | Windows-specific: an open file handle blocks other processes from reading the file. Close after every write for Windows compatibility. |
-| **SHA-256 hash as Kafka message key** | Enables Kafka log compaction (keeps only the latest record per key). Also deduplicates re-sent data. 64-char deterministic key. |
+| **SHA-256 hash as Kafka message key** | Provides a deterministic record key. A key alone does not enable log compaction or consumer deduplication; those require topic policy and consumer logic. |
 | **Verification message on producer startup** | Detects broker connectivity issues immediately, rather than silently failing after streaming has begun. |
-| **`test_mode`: seek to end of topic** | Prevents re-processing data from a previous producer run when the topic already has messages. |
-| **Sliding window evaluation** | Evaluating the same fixed batch every time would be uninformative if it were all one class. The window ensures the full eval pool is covered over time. |
+| **`test_mode`: unique group from earliest offset** | Replays all records on its topic, so each benchmark uses a fresh isolated topic and a bounded producer. |
+| **Sliding window evaluation** | Useful as a training diagnostic, but window composition changes between steps. Resume or hiring claims should use the fixed, checksummed sets in Section 13. |
 | **`full_pool` eval_batch_size alias** | Enables evaluating the entire pool at once for classification tasks, eliminating window-composition noise from accuracy measurements. |
 | **`other_label` bucket** | Captures model generations that don't start with any known label (e.g., the model starts talking instead of classifying). Without it, off-label outputs would incorrectly inflate one class's miss count. |
-| **StreamFilter: short-circuit ordering** | O(1) checks first, O(N) scans second, O(N×R) regex last. Minimizes CPU time on the hot path (thousands of samples per minute). |
+| **StreamFilter: short-circuit ordering** | Runs inexpensive checks before more expensive scans and regexes. Throughput impact needs a separate benchmark. |
 | **Weight application thread batching** | Block-wait for first update, then drain queue non-blockingly before acquiring model lock. Minimizes lock contention and inference blocking duration. |
 | **Heartbeat logging in trainer** | Makes the trainer appear "alive" while waiting for producer data. Distinguishes "stuck" from "waiting". |
 | **Fail-open in StreamFilter** | If `validate()` crashes unexpectedly, returns `(True, None)`. Prevents one malformed record from permanently starving the trainer. |
@@ -2051,7 +1949,7 @@ model.gradient_checkpointing_enable(
 )
 ```
 
-**Trade-off:** Instead of storing all intermediate activations during the forward pass (which uses O(layers × batch × seq_len) VRAM), gradient checkpointing recomputes activations during the backward pass. This trades ~15–30% more compute for a significant reduction in VRAM usage.
+**Trade-off:** Gradient checkpointing recomputes selected activations during backward pass to reduce activation memory. The speed and memory change depend on architecture, batch, sequence length, and device; the older 15–30% time-cost range was not measured here.
 
 **When to enable:** Recommended for large sequence lengths (e.g., 512+ tokens with a 345M+ parameter model) or when VRAM pressure causes OOM errors. For small models like `distilgpt2`, it's disabled (`false`) to maximize throughput.
 
@@ -2202,61 +2100,22 @@ evaluation_artifacts/
 
 ## 11. Inference Server Internals
 
-### 11.1 Concurrent Atomic Hot-Swap via Double-Buffered Router
+### 11.1 Concurrent Inference and Adapter Swaps
 
-> **Previously:** A global `model_lock` (`threading.Lock`) was acquired across the entirety of `generate_text()`. This serialized all HTTP generation requests to concurrency = 1 and forced weight swaps to block until in-flight requests completed, yielding severe tail latency degradation.
->
-> **Now:** InfiniTune replaces the global mutex with `DoubleBufferedAdapterRouter` and an asynchronous reader-writer synchronization model (`ReadWriteLock`).
+`inference.py --serving-mode router` uses `DoubleBufferedAdapterRouter` (historical name) with **one** PEFT model and a writer-priority `ReadWriteLock`. Every generation holds a shared read lock. Adapter tensors are prepared before the writer takes an exclusive lock, then copied into that same model while readers wait. The writer publishes `active_version` only after the complete copy. This is concurrent read access with an exclusive mutation, not a lock-free pointer swap or a two-replica double buffer. `--serving-mode legacy_lock` serializes generation under one mutex for matched A/B measurement. The new `swap_stress` suite measures real lock-held pause time and errors.
 
-```
-       Concurrent Inference Requests (Thread 1..N)
-                       │   │   │
-        ┌──────────────┴───┴───┴──────────────┐
-        │        Shared Read Lock (R)         │
-        └──────────────────┬──────────────────┘
-                           ▼
-                  ┌─────────────────┐
-                  │ Active Adapter  │ ──► model.generate() [Parallel Read Execution]
-                  └─────────────────┘
-                           ▲
-          Atomic In-Memory Weight Application
-          [Exclusive Write Lock with Writer Priority]
-                           ▼
-                  ┌─────────────────┐
-                  │ Staged Updates  │ ◄── Background Pre-load from Kafka / safetensors
-                  └─────────────────┘
-```
+### 11.2 Lock and Version Semantics
 
-1. **Background Deserialization & Device Staging:** Incoming adapter tensors are deserialized and loaded to the target execution device in the background without acquiring locks or impacting active serving requests.
-2. **Exclusive Writer-Priority Application:** When the weight dictionary is fully staged on device, the router acquires `rw_lock.acquire_write()`. New incoming read requests wait briefly while in-flight readers drain, and weights are applied via `model.load_state_dict(prepared_weights, strict=False)`.
-3. **Zero Request Dropping:** Generates uninterrupted responses without connection resets or drops. Monotonic version tags are tracked and verified per request via the `X-Adapter-Version` HTTP response header.
+New readers wait while a writer is queued. Existing readers finish before a swap begins. The router validates the complete expected PEFT key set and shapes before taking the write lock. A response includes the version active during its generation in JSON and `X-Adapter-Version`. Writer priority limits starvation but can increase request latency; no fixed sub-second guarantee follows from the lock design.
 
-### 11.2 Reader-Writer Synchronization & Concurrency
+### 11.3 Kafka Snapshot Completeness
 
-The synchronization primitive is a custom **`ReadWriteLock` with Writer Priority**:
-- **Shared Read Access:** High-throughput concurrent inference requests acquire shared read locks simultaneously (`read_lock()`).
-- **Writer Preference:** When a weight hot-swap arrives, the writer registers interest. New incoming read requests yield, allowing existing readers to drain rapidly.
-- **Starvation Elimination:** Prevents writer starvation under continuous saturated HTTP traffic, guaranteeing predictable sub-second weight propagation.
+The producer sends a manifest, step-tagged safetensors tensors, and a commit marker **in partition 0** to preserve Kafka ordering. `SnapshotAssembler` stages the message set privately and emits only when the commit step/status and exact declared tensor names match. Missing, duplicate, undeclared, or wrong-type tensors are rejected and logged; incomplete updates never enter the model queue. The router again validates PEFT keys/shapes before copying. Unit tests exercise these failure paths. This protocol does not currently authenticate frames with HMAC.
 
-### 11.3 Torn Adapter Update Elimination
+### 11.4 Broker Deserialization Boundary
 
-> **Previously:** The trainer published weights layer-by-layer across independent Kafka messages without a commit boundary. The inference consumer drained arbitrary queue chunks, creating the risk of running "torn" models (half layers from step $N$, half from step $N-1$).
->
-> **Now:** An atomic commit marker protocol guarantees complete snapshot integrity:
+The inference consumer accepts safetensors tensor bytes and JSON metadata only. It rejects pickle/PyTorch serialized broker bytes; no `torch.load` fallback remains. The separate offline `AdapterManifest` helper supports HMAC, but live Kafka frames do not use it. Broker TLS/ACL and signed live frames are future hardening work.
 
-1. **Manifest Header:** Trainer sends `key="__manifest__:<step_id>"` with expected tensor names and metadata.
-2. **Step-Tagged Payloads:** Each tensor is published with key `<step_id>:<layer_name>`.
-3. **Commit Sentinel:** Trainer sends `key="__commit__:<step_id>"`.
-4. **Staging & Queueing:** The inference consumer buffers layers privately in memory by `step_id`. Only when the commit marker arrives and all expected tensors are verified does it push the entire snapshot dictionary to `update_queue`. Partial batches are never applied.
-
-### 11.4 Safe Deserialization via Safetensors
-
-> **Previously:** The inference server deserialized Kafka records via raw `torch.load(buffer, map_location='cpu')`, introducing critical Python pickle Remote Code Execution (RCE) vulnerabilities.
->
-> **Now:** Deserialization is hardened via safetensors and HMAC authentication:
-- Payload serialization defaults to `safetensors.torch.save()` with SHA-256 integrity verification and HMAC-SHA256 signature enforcement.
-- Deserializer parses safetensors byte buffers directly into PyTorch tensors without invoking Python pickle.
-- Legacy PyTorch fallback strictly enforces `weights_only=True` to reject arbitrary executable bytecodes.
 
 ### 11.5 Cold-Start Staleness Elimination & Auto-Discovery
 
@@ -2302,13 +2161,13 @@ Exposes real-time operational telemetry from `DoubleBufferedAdapterRouter.get_me
   "avg_latency_ms": 365.61
 }
 ```
-*(Values above reflect actual measured metrics from `reports/serving_ab/router_results.json` on distilgpt2).*
+*(Historical 20-request snapshot from `reports/serving_ab/router_results.json`; it is too small for a p99 or SLA claim and was not a matched A/B workload. See Section 13.)*
 
 ---
 
 ## 12. Optimizations & Engineering Hardening
 
-This chapter consolidates all optimizations implemented during the modernization sprint. Each subsection describes the problem, the implementation, and the measured impact.
+This chapter describes implemented changes and their evidence limits. A claimed speedup requires a matched measurement trace; the older examples in this chapter do not supply one.
 
 ### 12.1 Apple Silicon / Unified Memory Sweep
 
@@ -2334,7 +2193,7 @@ elif torch.cuda.is_available():
     torch.cuda.empty_cache()
 ```
 
-**Impact:** Unified memory usage stabilizes at **~10 GB** regardless of training duration or Kafka poll wait lengths. Multi-task workloads (training + evaluation + Kafka) become viable on 16 GB M-series machines.
+**Evidence status:** This code releases references and requests cache cleanup, but the historical “stable ~10 GB regardless of duration” claim has no retained memory trace. Run a long `soak` or training-memory trace on the target Mac before quoting a bound.
 
 ---
 
@@ -2344,9 +2203,9 @@ elif torch.cuda.is_available():
 
 > **Previously:** Hard-coded `precision: "fp16"` in all configs. NaN losses were a frequent failure mode on MPS, particularly early in training when gradients are largest.
 >
-> **Now:** `precision` is a per-config configurable field defaulting to `"fp32"`. All Qwen configs use `"fp32"`. The `imdb_qualitative.yaml` config uses `"fp16"` because Qwen2.5-1.5B is large enough that the memory savings are important and the model is more stable at that scale. `"bf16"` is available as an alternative — wider exponent range than fp16, narrower mantissa than fp32.
+> **Now:** `precision` is configured per model. `PrecisionManager` resolves CPU/MPS requested FP16/BF16 to FP32 and only enables mixed-precision autocast/scaling on supported CUDA devices. Inspect `active_precision` in a run rather than inferring it from the YAML request.
 
-**Impact:** Zero NaN-related training failures since the switch. No measurable quality difference between fp32 and fp16 for LoRA fine-tuning at these scales.
+**Evidence status:** No cross-precision quality or NaN failure-rate experiment has been retained. The selectable `precision` suite measures step time and numerical finiteness on available modes.
 
 ---
 
@@ -2360,9 +2219,9 @@ elif torch.cuda.is_available():
 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 ```
 
-The raw gradient norm (before clipping) is still logged as `grad_norm`. Persistent high `grad_norm` values in the training log indicate instability even with clipping and may warrant reducing `learning_rate` or increasing `gradient_accumulation_steps`.
+The pre-clip **unscaled accumulated** gradient norm is logged as `grad_norm`. Persistent high norms may warrant reviewing the learning rate and batch size; the threshold is not a quality guarantee.
 
-**Impact:** Eliminates parameter corruption from gradient explosions. Training is stable even at `batch_size: 2` on GSM8K math sequences.
+**Evidence status:** Clipping bounds the applied gradient norm, but it does not prove an absence of optimizer instability for every task or batch size.
 
 ---
 
@@ -2375,13 +2234,13 @@ for i, sample in enumerate(window):
     output_ids = model.generate(**inputs, ...)   # batch_size=1
 ```
 
-With `eval_samples: 334` and `consistency_runs: 10`, this was **3,340 individual GPU calls**. On a Colab T4, this took **40 minutes** per eval interval — freezing training ingestion for the entire duration.
+With `eval_samples: 334` and `consistency_runs: 10`, the old one-at-a-time loop implies 3,340 generation calls. An earlier note reported a 40-minute Colab T4 eval interval, but this audit found no raw timing trace; it is not a verified benchmark result.
 
-> **Previously:** Unbatched generation. 40 minutes for 3,340 calls at step 200.
+> **Previously:** Unbatched generation with 3,340 implied calls for that configuration; the 40-minute duration is unverified.
 >
 > **Now:** `_generate_batch_records()` groups samples into chunks of `eval_batch_size` (e.g., 32). Chunks are tokenized together, left-padded (see §12.11), and sent to the GPU as a single `model.generate()` call.
 
-**Impact:** ~10–15× speedup. The same 3,340 calls complete in **3–4 minutes**.
+**Evidence status:** The batching code is present; a matched raw timing trace for the “10–15×” figure is not retained in this audit. Re-measure both implementations on identical hardware, prompts, output lengths, and consistency runs before quoting the speedup.
 
 ---
 
@@ -2396,17 +2255,17 @@ for run_idx in range(self._consistency_runs):
 
 This forced the GPU to re-tokenize the same prompts `consistency_runs` times, re-transfer tensors, and recompute KV-cache from scratch on each pass.
 
-> **Previously:** Python-level loop. Generating 3 consistency runs ≈ 3× the time of 1 run.
+> **Previously:** Python-level loop repeated tokenization and generation for each consistency run; the actual time ratio was not measured here.
 >
-> **Now:** `num_return_sequences=consistency_runs` is injected directly into `model.generate()`. All stochastic branches are generated in parallel as a single GPU matrix operation on `(batch_size × consistency_runs)` sequences.
+> **Now:** `num_return_sequences=consistency_runs` asks `model.generate()` to produce multiple stochastic outputs per prompt in a batch. Memory and runtime still scale with batch, sequence length, and model.
 
-**Impact:** 60–70% further reduction in generation time. Generating 3 or 10 consistency runs is nearly as fast as generating 1.
+**Evidence status:** The performance gain depends on model, batch size, device memory and decoding. No matched timing trace validates the “60–70%” claim here.
 
 ---
 
 ### 12.6 Kafka Consumer Long-Eval Reliability
 
-**Context:** Kafka's default consumer session timeout (`session_timeout_ms=10000`, 10 seconds) is far shorter than the time needed for a qualitative eval pass. When `trainer.py` was blocked inside `Evaluator.evaluate()` for 15–25 minutes, the Kafka broker marked the consumer as dead and triggered a group rebalance. On return from eval, the consumer had been removed from the group and had to rejoin — causing offset reset and data replay.
+**Context:** A long synchronous evaluation delays calls to `KafkaConsumer.poll()`. Exceeding `max_poll_interval_ms` can remove the consumer from its group even if a heartbeat thread remains active. The earlier 15–25-minute timing and a specific offset-replay incident are not independently verified by a retained trace; treat them as a failure hypothesis until an instrumented run reproduces them.
 
 **Implementation:** Three custom timeout settings now applied to `KafkaConsumer`:
 ```python
@@ -2419,7 +2278,7 @@ KafkaConsumer(
 
 All three are configurable in the `kafka:` YAML block and default to the above values.
 
-**Impact:** No consumer evictions or rebalances during eval, regardless of eval duration.
+**Evidence status:** The longer poll interval reduces one known eviction cause. No broker trace proves zero rebalances under all evaluation durations.
 
 ---
 
@@ -2456,14 +2315,14 @@ All three are configurable in the `kafka:` YAML block and default to the above v
 
 ### 12.9 Decoupled Flag — Removing Eval from the Hot Path
 
-**Context:** (See §5.4 for full context.) Inline qualitative eval blocked Kafka ingestion for 40+ minutes per eval interval. Setting `eval_interval: 200` with `consistency_runs: 10` would only allow training to process ~200 batches between 40-minute pauses — completely defeating the "real-time" premise.
+**Context:** (See §5.4 for full context.) Inline generation evaluation pauses the trainer's polling and optimizer loop. An earlier note reported 40-minute evals with ten consistency runs, but no matched trace remains, so the duration should not be used as a measured claim.
 
 **Implementation:** `evaluation.decoupled: true` in config causes `trainer.py` to:
-1. Skip instantiation of `Evaluator` and `QualitativeEvaluator`.
+1. Skip inline evaluator calls during the training loop.
 2. Focus entirely on training forward/backward passes and checkpoint saving.
 3. Log at training end: `"To run decoupled evaluation: python evaluate.py --config <config>"`
 
-**Impact:** Training throughput is maximized. Evaluation can be run asynchronously at any time, against any checkpoint, without affecting training.
+**Impact:** Separating evaluation removes its synchronous pause from training. Concurrent evaluation on the same laptop can still compete for compute and memory; compare step times to quantify any impact.
 
 ---
 
@@ -2518,176 +2377,193 @@ finally:
 
 ---
 
-## 13. Production Forensic Audit, Metrics Deep Dive & External Audit Reference
+## 13. Reproducible Evaluation, Evidence Ledger, and External Audit
 
-This chapter documents the forensic technical audit of the InfiniTune streaming architecture, the root causes of legacy discrepancies, the production hardening fixes implemented, the complete dual-perspective metrics catalog grounded in verified disk artifacts, and the exact testing methodologies required for rigorous external technical audits.
+**Status on 2026-10-05:** This section is the current measurement contract. Earlier architecture descriptions and values in historical reports describe past runs and must be checked against raw artifacts before reuse. A smoke run proves that a test executes; it does not establish a resume-worthy model score or an SLA. `output/`, the benchmark dataset cache, and new benchmark runs are local and Git-ignored.
 
----
+### 13.1 What the existing numbers actually establish
 
-### 13.1 Root-Cause Analysis: Audit Findings & Systemic Hardening
+| Claim | Evidence and defensible interpretation |
+|---|---|
+| IMDb accuracy **0.8265** at the historical final row | Present in `output/imdb/outputs/run10/metrics_clean.csv` (SHA-256 `2337ba552288fc611dd0cbf95ef2832ef031e7fd6f563b3c4e6fb00262c427f7`). The CSV is an aggregate, not 4,000 predictions. The 3,306/4,000 interpretation follows from multiplying the stored accuracy by the configured pool size; it cannot be independently re-counted without raw predictions. The local artifact is ignored by Git and will not exist in a clean clone. |
+| IMDb legacy F1 **0.575832** | Stored in the same CSV. The claim **0.8638 “validated binary F1” is withdrawn**. Multiplying by 1.5 assumes the legacy three-class denominator and does not reconstruct the confusion matrix. With accuracy 0.8265 on an approximately balanced binary holdout, a target-class macro F1 of 0.8638 is incompatible with zero `other` predictions. Re-run `classification` and use its per-example file. |
+| IMDb `other_rate = 0` at the historical final step | **Unknown.** The historical run did not retain per-example generations. The new runner records `other` for every unmapped output. |
+| IMDb loss **0.117765** and perplexity **1.12498** | Stored aggregates from the historical label-masked evaluator. These are label-token language-model values. `calibration` computes a different, restricted two-label NLL/perplexity; do not compare the two as the same metric. |
+| Wilson interval around 82.65% | A mathematical interval conditional on the aggregate accuracy and assumed (n=4000), not a confidence interval for training-seed variation. It does not compare models. The new runner records Wilson intervals from actual per-example outcomes and paired bootstrap differences on identical IDs. |
+| Serving router **+74.4% QPS** | **Invalid as an A/B effect.** The historical artifacts used 10 requests at concurrency 2 for legacy and 20 at concurrency 4 for router; there were no active swaps. The new `serving` suite uses equal workloads, warmup, alternating order, raw requests, and repeated pairs. |
+| Historical p99 and “zero drops” | With 10/20 requests, p99 is effectively the maximum and cannot support a tail SLA. Zero failures in such a small run is only an observation for that run. `full` uses 1,000 requests per arm per repeat; still report the environment and uncertainty. |
+| IMDb BWT/forgetting | A within-task score on one IMDb stream is **not** cross-task backward transfer or catastrophic-forgetting evidence. Use the fixed IMDb/Yelp/Amazon matrix from `continual`. |
+| E2E 0.8988 slot coverage / 0.1733 perfect coverage | Historical heuristic proxy scores from changing evaluation windows; actual per-checkpoint IDs and denominators are not retained. These are not official generation scores or a matched fixed-set trend. New `e2e` groups all references per unique meaning representation and retains generations, BLEU, ROUGE-L, and separately labeled slot-coverage proxies. |
 
-| # | Flaw Identified | Why It Was a Critical Flaw | Root Cause in Legacy Code | Architectural Fix Implemented |
-|---|---|---|---|---|
-| **1** | **Phantom Class F1 Dilution** (*Macro F1 0.5758 next to 82.65% Acc*) | A balanced binary classification task cannot mathematically yield 0.5758 Macro F1 alongside 82.65% Accuracy without an evaluation anomaly. Any senior data scientist or frontier AI reviewer immediately flags this. | The base model's un-tuned outputs did not start with "positive" or "negative", landing in the `other` fallback class. `eval_metrics_train.py` appended `'other'` to `all_labels`, constructing a $3 \times 3$ confusion matrix with zero true positives for `other` ($F1_{\text{other}} = 0$). Averaging across 3 classes multiplied binary Macro F1 by $\frac{2}{3}$ ($0.8638 \times \frac{2}{3} \approx 0.5758$). | Decoupled task classification from format compliance. Macro F1 is computed strictly over configured target classes (`f1_macro`), while unmapped format non-compliance is isolated into `other_rate`. Validated true binary Macro F1 at **0.8638** ($\approx 0.5758 \times 1.5$)! |
-| **2** | **Torn Adapter Updates** (*Step N and N-1 Layer Mixing*) | Serving a model composed of mismatched layer weights causes unpredictable loss spikes, degraded perplexity, and erratic token generation. In production, this violates transactional consistency. | Weights were published one layer per Kafka message without step IDs or transaction boundaries. The inference weight apply thread drained whatever happened to be queued at that microsecond, mixing layers between steps. | In `LoRAProducer` and `inference.py`, implemented atomic snapshot framing: producer sends `__manifest__:<step>`, step-tagged layers `<step>:<name>`, and `__commit__:<step>`. Consumer thread buffers incoming layers by step ID and only stages complete dictionaries to the router. |
-| **3** | **Unsafe Pickle Deserialization Risk** (`torch.load` RCE) & Manifest Spoofing | Passing untrusted network byte streams directly into Python's `torch.load` creates a critical Arbitrary Code Execution (RCE) vulnerability. Simple SHA-256 in untrusted payloads prevents accidental corruption, not tampering. | Legacy `deserialize_tensor()` invoked `torch.load(io.BytesIO(bytes))` directly on Kafka messages without restriction, and manifests had no digital authentication. | Replaced pickle serialization with `safetensors.torch.save` and `safetensors.torch.load` with mandatory `weights_only=True` fallback. Hardened `utils/adapter_manifest.py` with HMAC-SHA256 signature verification using a shared secret. |
-| **4** | **Inference Concurrency Bottleneck** (`model_lock` Serializing Serving) | Acquiring a global mutex across generation serialized HTTP requests to concurrency = 1. Concurrent requests queued linearly, degrading tail latency and blocking background weight updates. | `generate_text()` held `model_lock` for tokenization and forward autoregressive generation, while `weight_application_thread` held it during weight application. | Engineered `DoubleBufferedAdapterRouter` with a writer-priority `ReadWriteLock`. Concurrent readers execute generation in parallel; hot-swaps apply prepared weights cleanly with zero dropped requests. |
-| **5** | **Cold-Start Staleness** (`auto_offset_reset="latest"`) | Restarted or autoscaled inference servers served empty base weights until the trainer's next push, degrading live production traffic. | Consumer subscribed with `auto_offset_reset="latest"` and had no local state recovery logic. | Added automatic cold-start discovery: on startup, `inference.py` queries `CheckpointManager.list_checkpoints()` and pre-loads the latest saved adapter from disk into the serving router before opening HTTP traffic. |
-| **6** | **Within-Task Variance Mislabelled as Catastrophic Forgetting** | Reporting "Forgetting-max 0.002, BWT -0.072" within a single dataset measures within-task variance, not catastrophic forgetting across domain shift. | Evaluator tracked sliding-window variance on stationary data from the same task rather than distinct domain shifts. | Built formal Continual Learning benchmark (`benchmarks/run_streaming_cl.py`) across a 3-phase domain shift stream (IMDb $\to$ Yelp $\to$ Amazon), added bounded reservoir replay buffer ($N=1,000$, Algorithm R), and integrated ADWIN drift detection. Renamed within-task metric to `instance_forgetting_rate`. |
-| **7** | **Unaccelerated FP32 Execution on Capable Accelerators** | Naive FP32 execution saturated memory bandwidth and capped throughput on modern hardware. | Lack of automatic mixed precision (AMP) and graph compilation support in earlier iterations. | Built `PrecisionManager` integrating CUDA BF16 AMP, FP16 GradScaler, and graceful fallback on non-CUDA / non-Triton systems. |
+#### E2E resume metric audit (2026-10-13)
 
----
+The proposed resume claim “raising attribute slot coverage from 20% to 90% while reducing factual contradiction errors from 15.8% to 1.2%” overstates the available evidence. The historical CSV has 19.5817% mean heuristic coverage at step 0 and 89.8786% at final, but changing evaluation windows prevent a paired before/after claim. The final complete-coverage proxy is only 17.3333%. The supposed contradiction metric is specifically `qual_slot_familyFriendly_inversion_rate`: initial 0%, peak 15.7303% at step 400, and final 1.2048%. It is a majority-vote family-friendliness inversion heuristic, not an all-facts error rate. The peak rounds to 15.7%, and it is not the initial baseline. The current negative-value checker also counts omission as covered, so these aggregates should not be renamed factual recall/precision/F1. No automated alert-delivery path was found in the surveyed runtime code; chart thresholds alone do not establish alerting. Telemetry did not establish the cause of model-quality changes.
 
-### 13.2 Production Serving Architecture & Low-Latency SLA Benchmark
+The four retained smoke generations were re-scored without running the model. ROUGE-L precision **67.83%**, recall **65.75%**, and F1 **66.64%** use the reference with highest F1 per example, then average per-example scores; the F1 exactly reproduces the original manifest and the input checksum matches. ROUGE-1 precision/recall/F1 are **88.72% / 83.93% / 85.90%**; ROUGE-2 values are **57.96% / 54.50% / 56.12%**. These are word-overlap diagnostics on **four MRs**, not factual accuracy or resume-ready general quality. Aggregate BLEU/coverage alone cannot recover precision, recall, or F1. The calculation script, input provenance, per-example values, claim audit, and resume wording are in `reports/e2e_resume_audit_2026-10-13/`.
 
-To measure the impact of concurrency optimization and atomic hot-swapping under identical conditions, InfiniTune includes an A/B benchmark harness (`benchmarks/load_test_serving.py`).
+The recommended understandable quality metric is **required-detail recall** (“percentage of requested restaurant details correctly included”), paired with factual precision/F1 or **fully correct description rate** (all supplied facts correctly expressed, with no unsupported additions). Establish it on the same fixed held-out MRs before/after training, preserve fact labels and text, validate semantic/negation handling with human-reviewed examples, and report sample size and uncertainty. The full runner covers 1,484 unique validation MRs; it still needs a validated fact scorer before it can claim factual precision/recall/F1. Until then, use an implementation-focused resume bullet without the unsupported improvement/alerting claim.
 
-The benchmark was executed locally on the host CPU testbed using `distilgpt2` (82M parameters) with the saved LoRA checkpoint `output/imdb/checkpoints/distilgpt2__imdb/final`. Both serving modes were tested against the identical prompt and configuration.
+**Local verification (Intel Core Ultra 5 125H / 16 GB Windows, PyTorch CPU):** The initial pinned private environment passed **42 automated tests**. The final `smoke` run completed **66/66 stages** with no stage errors, and re-running the same command reused all completed stages. Its manifest, package inventory, checksums, raw predictions, and server/trainer logs are under `reports/benchmark_runs/verified_smoke_20261006/` (ignored by Git). Earlier failed-attempt archives remain under `reports/benchmark_runs/pipeline_live_20261006/`. The earlier CLI run did **not** preserve a unified terminal transcript; `events.jsonl`, stage-specific logs, raw files, and the manifest are its evidence. Dashboard runs now also save `console.log`, `dashboard_settings.json`, and `dashboard_state.json` in the same run directory.
 
-#### Verifiable A/B Load Test Results (Artifact: `reports/serving_ab/run_manifest.json`)
+**Dashboard verification:** Two subsequent dashboard integrity-only smoke jobs completed with recorded exit code 0: `reports/benchmark_runs/20261006-071908_7051cf/` and `reports/benchmark_runs/20261006-072331_ae8b14/`. Each has two complete integrity stages, the full `console.log`, a manifest, an event log, and a `pytest.log` reporting **46 passed** at the time of those runs. The second job was started from the rendered web page; its separate Windows log-watcher terminal process was observed while it was running. One further resume-route regression test was added afterward; the final direct suite execution passed **47 tests**. These integrity jobs do **not** add new model-quality results. The data science numbers in the table below come only from the earlier 66-stage smoke run.
 
-| Metric | Legacy Baseline (`legacy_lock`) | InfiniTune Optimized (`router`) | Relative Delta / Engineering Analysis |
-|---|---|---|---|
-| **Serving Synchronization** | Global Mutex (`threading.Lock`) | `DoubleBufferedAdapterRouter` (`ReadWriteLock`) | Readers parallelized; writer-priority swap |
-| **Test Concurrency** | 2 concurrent workers | 4 concurrent workers | Router sustains higher concurrent client load |
-| **Total Requests Evaluated** | 10 requests | 20 requests | Controlled load burst |
-| **Successful Requests / Drops** | 10 succeeded / 0 dropped (100.0%) | 20 succeeded / 0 dropped (100.0%) | **0.00% request loss** achieved across both modes |
-| **Total Test Duration** | 11.15 seconds | 12.74 seconds | 2x requests processed in +14% time |
-| **Achieved Throughput (QPS)** | **0.90 req/s** | **1.57 req/s** | **+74.4% throughput capacity** on multi-core CPU |
-| **Client Latency p50** | 2,166.77 ms | 2,391.22 ms | Stable median latency under 2x worker concurrency |
-| **Client Latency p95** | 2,475.44 ms | 2,930.81 ms | Queueing delay under concurrent CPU execution |
-| **Client Latency p99** | 2,475.44 ms | 2,930.81 ms | Tail latency bound |
-| **Server Processing Latency p50** | 109.95 ms | 332.54 ms | Internal forward pass execution time |
-| **Adapter Version Verification** | `v0_base` | `final` (verified via `X-Adapter-Version`) | Guaranteed adapter version tracking |
+The current benchmark source has changed since the 66-stage smoke run, so its manifest fingerprint does **not** match today's checkout. This does not erase the run's historical raw evidence, but it means its scores must not be described as a fresh result from the current source. The dashboard now marks that mismatch; resuming the old run with the current source archives the previous attempt and recomputes affected stages. Preserve the old run folder before doing that if you need its original evidence intact.
 
-> [!NOTE]
-> **Provenance & Telemetry:**
-> - **Raw Artifacts:** [`legacy_lock_results.json`](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/reports/serving_ab/legacy_lock_results.json), [`router_results.json`](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/reports/serving_ab/router_results.json), [`run_manifest.json`](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/reports/serving_ab/run_manifest.json).
-> - **Host Hardware:** Windows 11 Enterprise (10.0.26300), 18 logical CPU cores, Host CPU execution.
-> - **Software Runtime:** Python 3.10.16 (`py3.10env`), PyTorch 2.10.0, Transformers 5.5.3, PEFT 0.18.1.
-> - **Git Commit:** `c6cb2365c15de6f2460e70ab2662ebc0b90f2d74` on branch `evaluation-changes-rs`.
+| Final smoke observation | Measured result | Interpretation |
+|---|---:|---|
+| IMDb fixed classification | Saved adapter 12/16 correct, 75% accuracy, target-class macro F1 0.7333; base 0/16 and `other_rate=1.0` | Real per-example outputs, but the 16-example sample is too small for a resume claim. |
+| IMDb forced-choice calibration | Base accuracy 62.5%, ECE 0.1609; adapter accuracy 75%, ECE 0.2309 | Adapter accuracy rose, but ECE worsened on this tiny set; the probabilities are restricted two-label scores. |
+| Ordered vs offline shuffled and sequential continual learning | Both baseline arms and both continual arms had 0% generated-label accuracy after two steps per phase | No acquired skill was measurable; zero backward transfer here is not retention. |
+| E2E NLG | Four unique MRs: corpus BLEU 51.44, max-reference ROUGE-L F1 0.6664 | Tiny diagnostic, with a different protocol from leaderboard runs. |
+| Equal-load serving | 20 requests per arm, router 7.09 QPS, legacy lock 8.95 QPS | One closed-loop pair; earlier smoke pairs had the opposite ordering. No speedup is established. |
+| Kafka adapter freshness | One isolated snapshot became visible in 0.844 s | Publication-to-version visibility only, not a behavioral improvement. |
+| Kafka record-to-version pipeline | Eight acknowledged records, two optimizer steps, `step_2` visible in 7.593 s from last-send initiation | Real trainer and inference processes on isolated topics; no learned-behavior flip asserted. |
+| Precision | FP32 steady step 0.772 s in a two-step synthetic probe; BF16/FP16 unsupported on this CPU path | Diagnostic timing, not a production throughput or MFU result. |
+| Memory soak | 11 successful requests over ten seconds; loaded inference process RSS 705.7 to 706.7 MB | Too short to infer a leak. The earlier roughly 5 MB launcher-process trace is invalid. |
+| Swap stress | 20 requests, five swaps, zero failures; median 140 ms, maximum 307 ms lock-held swap | Observed in one small run; the historical sub-millisecond claim is false on this CPU. |
 
----
+The temporary Kafka 3.9 KRaft broker ran on port 19092. A separate first live freshness smoke took 1.58 s, and an earlier pipeline run took 7.78 s; these differences show why one measurement is not a latency distribution. Another matched serving smoke measured router 4.41 QPS versus legacy 3.86 QPS, reversing the final pair's ordering. None of these smoke results is a resume-ready scale or quality claim.
+### 13.2 Evaluation dashboard and command-line runner
 
-### 13.3 Streaming Model Evaluation & Classification Dynamics
+#### Local web dashboard
 
-All reported classification and streaming fine-tuning numbers below are grounded in the verified raw training run artifact at [`output/imdb/outputs/run10/metrics_clean.csv`](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/output/imdb/outputs/run10/metrics_clean.csv).
+On Windows, open PowerShell in the repository root and run:
 
-#### Model & Training Setup
-- **Model:** `distilgpt2` (82M parameters), Causal LM head.
-- **LoRA Configuration:** $r=16, \alpha=32$, target modules `["c_attn", "c_proj"]`, dropout 0.05.
-- **Optimizer & Schedule:** AdamW, learning rate $1\text{e-}4$, batch size 4, gradient accumulation steps 4 (effective batch size 16).
-- **Dataset:** IMDb Sentiment Analysis (binary classification: 0=negative, 1=positive), prompt template `"Review: {{ input }}\nSentiment:"`, response `" {{ target }}"`.
-- **Evaluation Set:** 4,000 test samples held-out from training.
-
-#### Measured Metrics at Final Step (Step 1563)
-
-| Metric | Legacy Evaluator (Run 10) | Reconciled / Hardened Metric | Derivation & Statistical Rigor |
-|---|---|---|---|
-| **Accuracy** | **82.65%** | **82.65%** | Measured over 4,000 test samples (3,306 correct, 694 incorrect). |
-| **Binomial 95% Wald CI** | — | **$82.65\% \pm 1.17\%$** | Formula: $\hat{p} \pm 1.96 \sqrt{\frac{\hat{p}(1-\hat{p})}{n}} = [81.48\%, 83.82\%]$. |
-| **Binomial 95% Wilson Score CI** | — | **$[81.45\%, 83.79\%]$** | Asymmetric binomial interval accounting for finite sample size $n=4,000$. |
-| **Macro F1 Score** | **0.5758** (diluted) | **0.8638** (true binary F1) | Legacy evaluator averaged across 3 classes (`negative`, `positive`, and empty `other`): $\text{Macro F1}_{\text{3-class}} = \frac{2}{3} \times \text{Macro F1}_{\text{binary}} \implies 0.57583 \times 1.5 = 0.86375$. |
-| **Format Non-Compliance (`other_rate`)** | Not tracked separately | **0.00%** at Step 1563 | Zero samples produced off-label text at final step (down from 100% off-label at un-tuned step 0). |
-| **Evaluation Perplexity** | **1.125** | **1.125** | Exponentiated cross-entropy loss ($\exp(0.118) \approx 1.125$) on target label tokens. |
-| **Evaluation Loss** | **0.118** | **0.118** | Cross-entropy loss on masked target label sequence. |
-
-#### Mathematical Proof of the 0.5758 F1 Disparity
-
-In the legacy implementation (`output/imdb/utils/eval_metrics_train.py`), the classification label mapping was:
-```python
-label_map = {0: "negative", 1: "positive"}
-all_labels = ["negative", "positive", "other"]
+```powershell
+.\run_evaluation.ps1 dashboard
 ```
-When evaluating predictions:
-1. Ground truth $y_{\text{true}} \in \{\text{"negative"}, \text{"positive"}\}$. The class `"other"` was never present in ground truth ($N_{\text{true, other}} = 0$).
-2. For any sample where the model output did not match `"negative"` or `"positive"`, it was assigned $\hat{y} = \text{"other"}$.
-3. The resulting $3 \times 3$ confusion matrix computed precision and recall for all three classes. For `"other"`:
-   $$\text{Precision}_{\text{other}} = \frac{\text{TP}_{\text{other}}}{\text{TP}_{\text{other}} + \text{FP}_{\text{other}}} = 0$$
-   $$\text{Recall}_{\text{other}} = 0 \implies F1_{\text{other}} = 0.0$$
-4. The legacy unweighted Macro F1 was computed as:
-   $$\text{Macro F1}_{\text{legacy}} = \frac{F1_{\text{negative}} + F1_{\text{positive}} + F1_{\text{other}}}{3} = \frac{F1_{\text{negative}} + F1_{\text{positive}} + 0}{3} = \frac{2}{3} \times \text{Macro F1}_{\text{binary}}$$
-5. Reconstructing the true binary Macro F1:
-   $$\text{Macro F1}_{\text{binary}} = \frac{3}{2} \times \text{Macro F1}_{\text{legacy}} = 1.5 \times 0.57583 = 0.86375 \approx 0.8638$$
-6. Checking against accuracy: $\frac{0.57583}{0.8265} = 0.6967 \approx \frac{2}{3} = 0.6667$. The ratio precisely confirms the $\frac{2}{3}$ dilution factor.
 
-> [!IMPORTANT]
-> **Statistical Significance Note:**
-> The Wilson 95% CI $[81.45\%, 83.79\%]$ quantifies the binomial test-set sampling error for a single training run. To prove statistical significance against an offline fine-tuning baseline, multiple seeds (e.g., 5 seeds) must be trained, reporting mean $\pm$ standard deviation and a paired McNemar test on the identical 4,000 test samples.
+On macOS or Linux run `bash run_evaluation.sh dashboard`. The launcher creates `.venv-eval` and installs pinned packages on first use, then the browser opens at `http://127.0.0.1:7860/`. Keep the launching terminal open: it is the dashboard server. The page works only on the local machine; it does not bind to a public interface.
 
----
+Select any combination of the twelve suites. The form provides `smoke`, `standard`, and `full` profiles and adjustable sampling/training seeds, maximum sequence length, serving concurrency/port, Kafka address, pipeline timeout, saved adapter directories, soak duration/rate, offline cache mode, and optional precision compilation. The base model stays pinned to DistilGPT-2 in this interface; the CLI supports other models only with an immutable revision and only for compatible suites. Controls that do not apply to selected suites are disabled. The server independently validates types, ranges, distinct seeds, checkpoint files, broker reachability when Kafka is selected, and inference port availability before it launches a run. Validation errors appear in the page and no benchmark starts. A custom setting is exploratory; the result is comparable to another run only when the full manifest specifications and inputs match.
 
-### 13.4 Hardware Requirements & Production Execution Matrix
+Press **Start evaluation**. Each click creates a unique folder under `reports/benchmark_runs/<run-id>/`, starts the runner automatically, and opens a separate visible terminal that tails the same saved `console.log` on Windows. The terminal remains open after completion until you press Enter, so the final status is visible. On macOS, the dashboard requests a Terminal window using a generated `watch.command`; that path is implemented but has **not been tested on a Mac**. The browser always shows the live log, current-stage progress bar, and the runner's *current-stage* ETA from observed processing rate. There is no extrapolated overall ETA. Keep the dashboard open to watch; the evaluation job and its log continue independently of a browser tab. The run page separates actual data science stage results from engineering results, offers the complete stage JSON and file downloads, and warns when a saved run's benchmark code fingerprint differs from the current checkout. The **Saved runs** list also reads older CLI folders; for an older CLI run, use its manifest and stage logs because no combined `console.log` was captured. The page shows the run profile and whether its exit code was recorded. It does not promote a smoke result to a resume-ready claim.
 
-To avoid confusion between local development capabilities and cloud/accelerator infrastructure, InfiniTune workloads are categorized into two tiers:
+**Reading past runs in the UI:** The page opens the saved run with the most completed data science stages, when one exists. Choose any other folder in **Saved runs** to see its short measured headlines, plain-language takeaways, and charts. The charts show IMDb base/adapter accuracy, forced-choice calibration, ordered/offline baseline scores, continual-learning phase matrices, and E2E generation scores when those suites were actually run; engineering cards show serving QPS, Kafka visibility times, precision timing, soak memory samples, and swap times. An integrity-only run explicitly says it has no model-quality results. **Configure a new evaluation** is collapsed so saved evidence is visible first. Expand **All stage details and exact values** for the underlying manifest JSON, and **Raw evidence and failure traces** for downloadable files. A brief “Reading saved manifest” message means the browser is loading existing files; it does **not** launch or rerun tests. Completed runs are fetched once when selected; automatic two-second updates occur only while a run is active. Click **Refresh** to reread a completed run. The dashboard never computes a new score from the browser chart; it displays completed stage results from `run_manifest.json`.
 
-#### Tier 1: Local Laptop (Host CPU / Integrated GPU)
-- **Supported Workloads:**
-  - Automated unit and regression test suite (`python -m pytest tests/` — 29 tests, ~25 seconds).
-  - Serving concurrency and SLA load tester (`benchmarks/load_test_serving.py` on `distilgpt2`).
-  - Cryptographic adapter manifest creation, SHA-256 verification, and HMAC-SHA256 signing.
-  - Streaming data filter and quality checks (`utils/stream_filter.py`).
-  - Static checkpoint inference and offline evaluation report generation (`utils/plot_metrics.py`).
-- **Hardware Profile:** Multi-core host CPU (4+ cores), 8GB+ RAM, Windows/macOS/Linux.
+On failure, open the failed stage, `console.log`, `events.jsonl`, and `errors/<stage>.txt` from **Raw evidence and failure traces**. Fix the cause and click **Resume run** for a dashboard-created run. The command retains the same settings, reuses intact stages, and appends another attempt to `console.log`; changed benchmark code, installed packages, or external adapters cause the runner to archive the previous attempt and recompute stages. An older CLI run has no dashboard settings file, so resume it with the exact command and options used originally. Dashboard runs store the exact command, launcher PID, runner PID, start/end time, and process exit code in `dashboard_state.json`. If the launcher dies, the page labels the run interrupted rather than claiming success. A successful `exit_code=0` plus complete stages is stronger evidence than stage count alone.
 
-#### Tier 2: Dedicated Accelerator (Cloud GPU / Workstation)
-- **Required For:**
-  - High-throughput training with CUDA BF16 Automatic Mixed Precision (AMP) and `torch.compile(mode="max-autotune")`.
-  - Larger base model streaming fine-tuning (Qwen2.5-1.5B, Qwen2.5-3B, Llama-3-8B).
-  - Multi-seed Continual Learning 3-phase domain shift sweeps (`benchmarks/run_streaming_cl.py` across IMDb $\to$ Yelp $\to$ Amazon).
-  - Multi-hour Kafka streaming soak testing under continuous 50+ QPS load.
-- **Hardware Profile:** NVIDIA A100 (40GB/80GB), H100, or RTX 4090 (24GB VRAM), Linux (Ubuntu 22.04 LTS), CUDA 12.1+, Triton compiler.
+**Where the files are:** `benchmarks/` holds benchmark source code; `reports/benchmark_runs/` holds actual run outputs. This output directory and the cached datasets under `data/benchmark_cache/` are Git ignored, so a Git clone will not contain this laptop's raw evidence. The existing 66-stage smoke run is at `reports/benchmark_runs/verified_smoke_20261006/run_manifest.json`; data science outputs include `classification/*`, `calibration/*`, `baseline/*`, `continual/*`, and `e2e/*` stage results plus `predictions/` and `probabilities/`. Run folders from earlier failed attempts remain available locally. To share a claim, archive its full run directory and the referenced cached dataset manifests, not just a screenshot or a copied score. **No standard/full profile or Mac run is present in this audit.**
 
-#### Cloud Reproduction Runbook (Google Colab / RunPod / AWS)
+#### Command-line runner
+
+The entry point is `python -m benchmarks.run`. `run_evaluation.ps1` (Windows) and `run_evaluation.sh` (macOS/Linux) create a private `.venv-eval` and install `requirements-eval.txt` on first use. The first setup downloads packages and Hugging Face model weights; allow free disk space and network access. The runner downloads and pins each dataset to a Hub commit, makes a deterministic balanced sample, stores JSONL plus a SHA-256 manifest under `data/benchmark_cache/`, and verifies the hash on reuse. `--offline` fails explicitly when a requested cached sample is absent. IMDb, Yelp Polarity, and Amazon Polarity use upstream train/test splits; E2E uses the pinned GEM validation parquet and groups references by unique MR. A full E2E request covers the available **1,484 unique MRs**, not 4,672 independent examples.
+
+```powershell
+# From the repository root in PowerShell:
+.\run_evaluation.ps1 list
+.\run_evaluation.ps1 run --suites integrity classification calibration serving --profile smoke
+.\run_evaluation.ps1 run --suites baseline continual e2e precision swap_stress --profile standard
+.\run_evaluation.ps1 run --suites classification calibration baseline continual e2e serving precision swap_stress --profile full
+```
 
 ```bash
-# -------------------------------------------------------------
-# 1. Setup Environment on Cloud Instance (Ubuntu 22.04 + CUDA)
-# -------------------------------------------------------------
-git clone https://github.com/rohang1411/Infinitune-Realtime-LLM-Fine-Tuning-Framework.git
-cd Infinitune-Realtime-LLM-Fine-Tuning-Framework
-git checkout evaluation-changes-rs
-pip install -r requirements.txt
-pip install pytest safetensors scikit-learn
-
-# -------------------------------------------------------------
-# 2. Run Complete Automated Unit & Regression Test Suite (29 tests)
-# -------------------------------------------------------------
-python -m pytest tests/ -v
-
-# -------------------------------------------------------------
-# 3. Serving SLA A/B Load Test (distilgpt2, port 8000)
-# -------------------------------------------------------------
-# Terminal 1: Launch router inference server
-python inference.py --config output/imdb/config.yaml --checkpoint final --serving-mode router --port 8000
-
-# Terminal 2: Execute load test
-python benchmarks/load_test_serving.py \
-  --url http://localhost:8000/generate \
-  --requests 50 \
-  --concurrency 10 \
-  --output_json reports/serving_ab/router_results.json
-
-# -------------------------------------------------------------
-# 4. Multi-Seed Continual Learning Benchmark (GPU required)
-# -------------------------------------------------------------
-python benchmarks/run_streaming_cl.py \
-  --seeds 42 1337 2026 \
-  --buffer-size 1000 \
-  --replay-ratio 0.25 \
-  --output-dir reports/continual_learning_benchmark/
+# macOS/Linux, from the repository root:
+bash run_evaluation.sh list
+bash run_evaluation.sh run --suites integrity classification --profile smoke
 ```
 
----
+By default only `integrity` runs. `--suites` selects any names shown by `list`, or `all`; `--profile` selects `smoke`, `standard`, or `full`. Profiles set sample sizes, training steps, repeated seeds, and serving loads. The default sequence limit is 128/256/512 respectively; `--max-seq-length` overrides it. `smoke` uses 32 training rows, 16 test rows, one seed and two optimizer steps. `standard` uses 1,000/200 rows, three seeds and 63 steps. `full` uses 25,000/4,000 rows, five seeds and 1,563 steps for each IMDb training arm. E2E uses 4/100/all available unique MRs. Serving uses 20/200/1,000 requests per arm and 1/3/5 alternating pairs.
 
-### 13.5 External Audit & Verification Runbook
+For a reproducible resume, set an explicit run directory and reuse the **same options**:
 
-For third-party technical auditors verifying the system:
-1. **Cryptographic Integrity & HMAC Authentication:** Run `pytest tests/test_adapter_manifest.py` — verifies that SHA-256 detects tampering, HMAC-SHA256 validates secret keys, and mismatched signatures raise authentication exceptions.
-2. **Serving Concurrency & Atomic Hot-Swap:** Run `pytest tests/test_serving_router.py` — verifies that concurrent readers execute without deadlocks during active swaps.
-3. **Stream Atomicity:** Run `tests/test_stream_integrity.py` — proves that partial batches are never staged without the commit marker.
-4. **Metric Integrity & Phantom Class Elimination:** Run `pytest tests/test_eval_metrics.py` — proves that the phantom class artifact is eliminated and true binary F1 is preserved.
-5. **Raw Artifact Grounding:** Inspect `reports/serving_ab/run_manifest.json` and `output/imdb/outputs/run10/metrics_clean.csv` to verify all reported numbers against disk artifacts.
+```powershell
+.\run_evaluation.ps1 run --suites baseline continual --profile standard --run-dir reports/benchmark_runs/my_eval
+.\run_evaluation.ps1 status reports/benchmark_runs/my_eval
+# Fix the cause shown in errors/<stage>.txt, then run the first command again.
+```
+
+The runner writes `run_manifest.json` (code revision/content hash, dirty files, options, environment, installed package versions, external adapter hashes, stage results and suite failures), `events.jsonl`, per-stage and per-suite `errors/*.txt` tracebacks, raw predictions/probabilities/HTTP requests, trainer and server logs, and source dataset manifests. A suite setup failure exits nonzero even before its first stage. Completed stages are reused when code/config content, installed package versions, and external adapter hashes are unchanged; interrupted prediction files and checkpoint staging folders are preserved with an `.interrupted_*` suffix before deterministic stage restart. If benchmark code/config, the installed package graph, or an external adapter changes between invocations, the runner archives the previous attempt under `attempt_archive/` and reruns stages so scores from different implementations are never combined. A stage never reports a fabricated score after an exception. Training resumes **between completed phases**, not mid-optimizer-step. For exact mid-step recovery, optimizer, scheduler, scaler, RNG, and Kafka offsets would all need a transactional checkpoint.
+
+Local saved adapters are **not in Git**. `classification`, `calibration`, `serving`, `swap_stress`, and `soak` default to `output/imdb/checkpoints/distilgpt2__imdb/final`; pass `--checkpoint <adapter-directory>` if yours is elsewhere. `e2e` discovers the newest local final E2E adapter or accepts `--e2e-checkpoint`. If a checkpoint is missing, the stage fails and names the missing path. The `baseline` and `continual` suites train fresh adapters into their run directory. No script downloads or invents a historical trained adapter.
+
+The benchmark pins the base DistilGPT-2 model to Hub commit `2290a62682d06624634c1f46a6ad5be0f47f38aa` and GPT-2 Medium to `6dcaa7a952f72f9298047fd5137cd6e4f05f41da`. `--model <other-model>` requires an explicit immutable `--model-revision <commit>` and applies to offline suites; the live serving suites use the project's DistilGPT-2 config. `run_manifest.json` stores the model revision, installed package versions, and SHA-256 hashes for the external adapter weights and config. If those files change before resume, prior stage artifacts are archived and the run restarts; if they change during a run, it exits nonzero. These checks prevent an older score from being attached to different model weights.
+
+### 13.3 What each suite measures
+
+| Suite | Measurement and required interpretation |
+|---|---|
+| `integrity` | Regression tests and SHA-256 audit of the historical IMDb CSV. Historical CSV absence is a failure, not a zero score. |
+| `classification` | Greedy six-token generation on identical fixed IMDb IDs for base and saved adapter; per-example raw text, confusion matrix including `other`, accuracy, target-class macro F1, MCC, kappa, Wilson 95%, and paired bootstrap difference. `other` remains a wrong prediction, not a third gold class. |
+| `calibration` | Separate restricted two-label softmax (verified one-token labels), forced-choice accuracy, 10-bin ECE, Brier score, AUROC, and conditional-label NLL/perplexity. It is not free-generation confidence or historical LM perplexity. ECE needs a substantial fixed holdout. |
+| `baseline` | Same fixed train/test IDs, LoRA architecture, optimizer steps, scheduler and seed for an ordered pass versus an additional offline shuffle. Reports per-seed paired differences and cross-seed mean/SD. Both arms run offline inside one process; this isolates order, **not Kafka overhead**. |
+| `continual` | Sequential IMDb → Yelp → Amazon LoRA phases, fixed task-specific held-outs after every phase, matched no-replay and 20% replacement from a 1,000-example Algorithm-R reservoir. Reports full matrix, final average accuracy, BWT, FWT relative to zero-shot base, and per-task forgetting. Short runs with all-zero accuracy cannot establish retention. |
+| `e2e` | Pinned validation MRs, all references per unique MR, greedy 60-token generations, SacreBLEU corpus BLEU signature, max-reference ROUGE-L F1, and explicitly heuristic slot coverage. The decoding/protocol differs from published E2E papers; do not claim a direct leaderboard comparison. |
+| `serving` | Identical endpoint, prompt, checkpoint, concurrency, warmup and request counts per mode; order alternates by repeat. Raw client end-to-end latency, errors, versions, and achieved closed-loop QPS. It does **not** measure TTFT or an open-loop saturation knee. |
+| `swap_stress` | Actual PEFT model under concurrent direct generation and complete adapter swaps: request errors, version observations, and measured lock-held swap times. A passed small run does not prove a universal zero-drop guarantee. |
+| `freshness` | Requires Kafka. Publishes a complete adapter snapshot to an isolated topic and waits for `/metrics.active_version`; measures adapter-publication-to-version visibility. It does not publish a training example. |
+| `pipeline` | Requires Kafka. Creates isolated training/update topics, launches actual trainer and inference processes, publishes eight labeled records plus EOF, and waits for the step-2 adapter version. Measures last-record-publication-to-version visibility. It does **not** assert a behavioral response flip from only two updates. |
+| `precision` | Fixed synthetic-token LoRA optimizer steps, measured step time and memory. Unsupported BF16/FP16 modes are reported as unsupported rather than pretending an FP32 fallback measured them. No MFU claim is made without device-specific FLOP profiling. |
+| `soak` | Paced requests plus process RSS samples and a linear RSS slope. `full` defaults to 24 hours; `smoke`/`standard` default to 30 seconds/10 minutes. Short slopes are diagnostics, not memory-leak findings. Set `--soak-seconds` and `--soak-rate` explicitly for other conditions. |
+
+Kafka suites need a reachable broker (`--kafka-bootstrap`, default `localhost:9092`). Start the broker using Section 15.2 first; the runner checks broker availability and records `NoBrokersAvailable` with a traceback when it is absent. `--port` changes the isolated inference server port. Avoid running two suites against the same port concurrently. These suites use a single broker and process per service; they do not establish multi-broker fault tolerance or distributed training. `run_streaming_cl.py` no longer prints a sample result matrix; use `benchmarks.run`. The old `canary_freshness_probe.py` is only a keyword-observation diagnostic.
+
+### 13.4 Engineering issue ledger and why each fix was chosen
+
+| Issue / failure reason | Why it matters | Fix and rationale | Status |
+|---|---|---|---|
+| Historical aggregate lacks raw IDs/predictions | F1, `other_rate`, paired tests and exact sample selection cannot be audited | Persist each prediction, source ID and hash before computing scores; this makes every derived metric recomputable | New runner fixed; historical gap permanent unless rerun |
+| Three-class F1 was multiplied by 1.5 and called observed | Can create a contradictory headline metric | Compute target-class F1 from actual gold/predicted labels; keep off-format outputs as errors and report `other_rate` separately | Fixed in new runner; old 0.8638 withdrawn |
+| Old serving A/B changed workload and omitted raw requests | Throughput difference could be caused by concurrency and cache order | Equal-load alternating pairs, warmup, raw JSONL, same checkpoint and prompt | Fixed methodology; no proven speedup yet |
+| p99 was reported from 10–20 calls; TTFT named for a non-streaming endpoint | Tail estimates and first-token claims are statistically/technically invalid | Explicit client end-to-end latency definition and `p99_reliable` threshold; TTFT remains unavailable until streaming response instrumentation | Partly fixed; TTFT/open-loop saturation still unmeasured |
+| Router name and docs claimed a two-model double buffer | Actual code mutates one model under a write lock; swap can block readers | Validate entire PEFT key/shape set before write lock, then copy under the lock; describe it as single-model read/write locking | Fixed semantics; real two-replica design remains future work |
+| Commit accepted partial tensors; Kafka keys could use different partitions | Torn versions or out-of-order manifest/tensor/commit delivery | `SnapshotAssembler` requires exact manifest tensor set and valid commit; producer pins all frames to partition 0 | Fixed; targeted tests added |
+| Broker bytes could reach an unsafe `torch.load` fallback | Version-dependent pickle execution risk | Safetensors tensors and JSON control records only; reject all other bytes | Fixed |
+| Standalone HMAC manifest helper was described as active Kafka authentication | Tests of a helper do not authenticate live broker frames | Do not claim authenticated updates; integrate signed frame manifest and secret distribution or enforce broker ACL/TLS before a security claim | **Open** |
+| FP16 training scaled gradients were clipped and stepped without unscaling; partial flush ignored scaler | Incorrect updates, misleading gradient norms, possible overflow corruption | Centralized unscale → rescale partial accumulation → clip → scaler step/update; scheduler advances only when update applies | Fixed; CPU test covers unscaled branch, CUDA overflow path needs accelerator validation |
+| Trainer swallowed loop errors then wrote final artifacts | Automation could mistake a failed training run for success | Preserve traceback and exit nonzero after cleanup | Fixed |
+| A suite could fail before it created a stage and the command could exit 0 | A setup or import failure could be silently misclassified as a successful evaluation | Persist a suite-level traceback and error in the manifest, show it in `status`, and return nonzero | Fixed; regression test added |
+| A Kafka listener or adapter applier could die while HTTP health still said OK | External automation might trust a stale adapter | Save worker error state, print a full traceback in the server log, and make `/health` return 503 after worker failure | Fixed; regression test added; live broker failure injection pending |
+| A completed stage could be reused after its prediction or request artifact was deleted or changed | A manifest score could lose its underlying evidence | Verify saved output paths and SHA-256 before reuse; archive changed in-run files and rerun their stage | Fixed; regression test added |
+| Reusing a run after a transitive dependency changed could mix metrics from different runtimes | A fixed source commit and top-level requirements file do not capture the installed package graph | Pin direct benchmark packages and record every installed distribution/version in the manifest; archive and restart stages when that graph changes | Fixed; regression test added |
+| Base model revision and local adapter file were not part of run identity | A moving Hub reference or overwritten local checkpoint could give an old score to new weights | Pin DistilGPT-2 and GPT-2 Medium by immutable Hub commits; record SHA-256 of external adapter weights/config and invalidate a run if either changes | Fixed; regression test added; full-scale rerun still needed |
+| Windows launcher assumed the `py` command could find Python 3.10 | This laptop has Python 3.10 in Conda but its `py` launcher only lists 3.13 | Search compatible `py`, Conda and system Python executables before creating the private evaluation environment | Fixed; private environment installed and `list`/`integrity` passed |
+| First E2E smoke attempt failed with Windows `c10.dll` / WinError 1114 when ROUGE loaded before PyTorch | A library import-order failure prevented the actual generation metric from running | Import PyTorch before `rouge_score` in the E2E worker, then resume the failed stage; the rerun generated real outputs and metrics | Fixed on this Windows host |
+| Kafka freshness and record-to-version probes initially could not start locally | No broker was reachable at `localhost:9092`; `NoBrokersAvailable` is infrastructure absence, not a measured zero latency or correctness result | Start a local broker or pass a reachable `--kafka-bootstrap`, rerun those suites, and inspect their isolated topic/process logs | Resolved locally with a temporary KRaft broker on port 19092; both smoke probes passed |
+| Live eight-record pipeline initially trained on only four records | An unrestricted `KafkaConsumer.poll` could return more than one micro-batch; the trainer broke after four records while the consumer offset advanced past the rest | Bound each poll to the remaining batch capacity with Kafka's `max_records`, preserving every published record; verify in the live pipeline trace | Fixed; final live trace shows eight records and two optimizer steps |
+| Next live pipeline attempt crashed while logging a saved checkpoint on Windows | Redirected child stdout used cp1252; the Unicode arrow in a checkpoint log raised `UnicodeEncodeError` after training step 2 | Launch benchmark child processes with UTF-8 stdio and use ASCII in critical checkpoint logs; logging must never invalidate a successful model update | Fixed; final live pipeline passed |
+| EOF test mode waited approximately 100 seconds after consuming the marker | It made an eight-record smoke probe unnecessarily slow even after the single partition offset was caught up | Keep the conservative default, but set `training.eof_empty_polls=3` only for the closed benchmark topic | Fixed; final live pipeline completed promptly |
+| Project text said SHA-256 Kafka keys automatically deduplicate or compact records | Keys alone do neither; those behaviors require topic configuration and explicit consumer state | Describe the key as deterministic identity only, and add a separate duplicate-delivery/replay test before claiming exactly-once processing | Documentation fixed; exactly-once claim remains open |
+| Earlier text called test mode an exactly-once pass and implied a second inference replica would automatically receive every update | A consumer restart can replay records, and replicas in one Kafka group share partitions rather than each receiving every snapshot | Use isolated topics for one-pass probes; for replicas, assign independent groups and verify version skew and restart recovery; transactional optimizer/offset checkpointing is required for exactly-once training | Documentation fixed; distributed/transactional behavior open |
+| `StreamFilter` returns accepted on unexpected validation exceptions | A malformed record or filter bug can pass into training without a rejection trace | Route unexpected failures to a counted reject/quarantine path with raw record ID and exception details; verify the intended producer behavior before changing this policy | Open; avoid claiming robust data-quality gating |
+| Cross-domain text overlap and the historical adapters' training provenance are not independently reconstructed | Within-task train/test SHA-256 disjointness does not prove no IMDb/Yelp/Amazon cross-domain duplicate or that an ignored historical adapter never saw a held-out item | Add a global train-vs-all-test hash intersection gate and retain each trained adapter's source split IDs, code commit, and training manifest; do not label the historical adapter leak-free until that evidence exists | Open for historical adapters; new runner records its own sampled IDs |
+| First memory-soak trace sampled the Windows virtual-environment launcher process | A roughly 5 MB stub RSS and zero slope do not represent the loaded inference model | Find the `inference.py` interpreter in the launched process tree, record its PID, and sample that process | Fixed; 10-second rerun measured roughly 709 MB RSS, but the short slope is not a leak estimate |
+| Continual-learning CLI printed a hard-coded sample matrix | Fabricated-looking results could be copied to a resume | Require actual training/evaluation through the new runner; old CLI exits with instructions | Fixed |
+| Fixed E2E validation and standard generation metrics were absent | Sliding-window proxy cannot establish fixed-set NLG quality | Pin parquet commit, group references by MR, save generations, report BLEU/ROUGE and separately named proxy | Fixed; full run needed |
+| Calibration helper existed but was not in the evaluator path | No confidence evidence for predictions | Separate forced-choice calibration suite with raw probabilities and correct method label | Fixed; full run needed |
+| Reservoir, drift detector and golden-canary helper were presented as live production gates | Unit-tested helpers do not imply deployed rollback or online adaptation | Continual benchmark now exercises reservoir; require explicit trainer/serving integration and recovery tests before claiming ADWIN/canary promotion | Reservoir benchmark fixed; live gates **open** |
+| MFU and compiler benefits had no measured trace; CPU/MPS precision capability was overstated | Formula and configuration do not prove achieved hardware efficiency | Measure actual optimizer timing/memory, report unsupported modes; measure MFU only after profiler validation on a named CUDA GPU | Timing fixed; MFU claim **open** |
+| No multi-broker failover, replica-skew, or true distributed training test | A single Kafka broker with one trainer is not a distributed cluster | Keep wording “decoupled streaming architecture”; add replicated cluster and failover protocol before changing this claim | **Open** |
+| Raw evaluation outputs were hard to find because `benchmarks/` contains code while `reports/benchmark_runs/` is Git ignored | A user could mistake source scripts for executed evidence or miss failed runs | Add a local run browser that lists existing folders, manifest stage results, raw artifacts, and explicit process exit status; document the exact output path and Git boundary | Fixed for local visibility; ignored evidence must be archived separately to share |
+| Earlier CLI runs did not preserve one combined terminal transcript | A stage traceback existed, but the complete sequence of console warnings/progress was unavailable after the terminal closed | Launch dashboard jobs through a durable wrapper that appends `console.log`, records command/PIDs/exit code, and opens a visible log terminal | Fixed for new dashboard runs; historical terminal output cannot be reconstructed |
+| Runtime tables contained extrapolated standard/full and Mac durations | The numbers looked like measured results despite no corresponding runs | Remove all forecasts; publish only measured smoke-stage `duration_s` values and mark every untested profile/device unmeasured | Fixed in §13.5; actual larger runs still needed |
+| Live run history was rebuilt every two seconds | Replacing buttons repeatedly disturbed browser interaction and scroll state, making an older run harder to open | Rebuild only when the run list or selection changes; this preserves stable controls while status still updates | Fixed; browser interaction checked |
+| A missing combined log message was appended during startup polling | When `console.log` appeared later, the page displayed stale placeholder text before real output | Return an explicit `available` flag, show the placeholder once, then replace it when the file exists; the file remains the source of truth | Fixed; API test and live browser check |
+| Historical 66-stage scores remain visible after benchmark source edits | The outputs are real for their original code but could be misattributed to the current checkout | Compare each manifest's code fingerprint with today's metric code and warn on mismatch; keep old evidence read-only and rerun to establish current-code scores | Fixed in dashboard; current-code full suite remains unmeasured |
+| Selecting an older run displayed dozens of long JSON blocks before showing understandable results | The browser had to build 66 large stage cards and fetch the file list; repeated polling made completed runs appear continually busy | Render short measured charts first, auto-open the past run with the most DS evidence, load JSON/files only when expanded, and poll only active jobs | Fixed; existing smoke and integrity-only runs checked in browser |
+
+### 13.5 Measured runtimes and unmeasured hardware
+
+The table below contains **only measured stage durations** from `reports/benchmark_runs/verified_smoke_20261006/run_manifest.json` on the Intel Core Ultra 5 125H Windows laptop, using PyTorch CPU, a warm local cache, the `smoke` profile, and `--max-seq-length 64`. These are sums of the manifest's `duration_s` fields for each suite's completed stages; they exclude environment setup and model/dataset downloads. They are observations from one small diagnostic run, not a forecast for a future run.
+
+| Suite | Measured local smoke stage time |
+|---|---:|
+| Integrity | 12.21 s |
+| Classification | 11.53 s |
+| Calibration | 5.12 s |
+| E2E | 17.23 s |
+| Baseline | 27.62 s |
+| Continual | 184.23 s |
+| Serving | 26.07 s |
+| Freshness | 13.60 s |
+| Pipeline | 36.40 s |
+| Precision | 2.41 s |
+| Soak | 19.30 s, including the programmed 10-second sampling window |
+| Swap stress | 4.37 s |
+
+No `standard` or `full` profile has been completed in this audit. No InfiniTune evaluation has been run here on a MacBook Air M4 or MacBook Pro M4 Pro. **Their measured runtimes are unavailable.** The Windows laptop's installed GPU identifies as Intel Arc Graphics, and this run used CPU, so it does not establish an Iris Xe GPU runtime either. The dashboard displays the runner's live *current-stage* ETA after a stage has processed examples; it does not extrapolate an overall completion time.
+
+For resume use, review full-profile fixed-set classification and calibration, matched baseline/continual comparisons across seeds, complete E2E generations, and enough serving calls for meaningful tail estimates. Hardware-specific schedules should be based on actual completed runs and their saved `duration_s` values. No single metric or repository guarantees interview shortlisting.
 
 ---
 
@@ -2710,7 +2586,7 @@ For third-party technical auditors verifying the system:
 | `hashlib` | (stdlib) | SHA-256 hashing for Kafka message keys |
 | `scipy` | (transitive) | Statistics utilities (transitive via transformers/datasets) |
 | `numpy` | (transitive) | Array operations for confusion matrix metrics |
-| `safetensors` | >= 0.4.0 | Safe tensor serialization protocol with SHA-256 / HMAC support |
+| `safetensors` | See `requirements-eval.txt` | Safe tensor serialization; the live Kafka frame protocol does not currently authenticate messages |
 | `scikit-learn` | >= 1.3.0 | Confusion matrix, Macro F1, and classification metrics |
 | `trl` | Any | In `requirements.txt`; not directly used in current code (available for future SFT trainers) |
 | `wandb` | Any | In `requirements.txt`; not integrated in current codebase (available for future experiment tracking) |
@@ -2722,12 +2598,17 @@ For third-party technical auditors verifying the system:
 | Platform | Status | Notes |
 |---|---|---|
 | **CUDA GPU (Linux/Windows)** | Fully supported | Primary target. `fp16`/`bf16` training and `torch.compile` available. |
-| **Apple Silicon MPS (macOS)** | Fully supported | Tested with memory sweep (§12.1). Stable at ~10 GB unified memory for 1.5B models (fp16/fp32) and ~6-8 GB for distilgpt2 (fp32). 3B models in fp32 require 16GB+ RAM. |
+| **Apple Silicon MPS (macOS)** | Supported code path; not measured in this audit | `PrecisionManager` currently resolves FP16/BF16 requests to FP32. No Mac speed or memory result is available. |
 | **CPU** | Supported | Functional benchmark and inference platform. Used for local serving SLA verification. |
 
 ---
 
 ## 15. Setup & Running the System
+
+For the **automated, selectable, resumable evaluation** command, data-cache rules,
+failure logs, and evidence requirements, use [Section 13](#13-reproducible-evaluation-evidence-ledger-and-external-audit).
+The commands below describe ordinary service operation; they do not create a
+controlled benchmark by themselves.
 
 ### 15.1 Prerequisites
 
@@ -2768,15 +2649,19 @@ kafka-topics --bootstrap-server localhost:9092 --list
 #### Windows (KRaft mode — No Zookeeper)
 
 ```bat
-cd C:\kafka
+cd C:\Apps\Kafka
+
+:: Kafka 3.9 on this Windows host; set this before startup because the
+:: default script's WMIC-based heap detection fails on newer Windows.
+set KAFKA_HEAP_OPTS=-Xmx1G -Xms1G
 
 :: One-time storage format:
 .\bin\windows\kafka-storage.bat random-uuid
 :: Copy the printed UUID, then:
-.\bin\windows\kafka-storage.bat format -t <YOUR_UUID> -c .\config\server.properties
+.\bin\windows\kafka-storage.bat format -t <YOUR_UUID> -c .\config\kraft\server.properties
 
 :: Start the broker:
-.\bin\windows\kafka-server-start.bat .\config\server.properties
+.\bin\windows\kafka-server-start.bat .\config\kraft\server.properties
 
 :: Verify:
 .\bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
@@ -2952,11 +2837,11 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | 6 | Inference launch | Required running Kafka broker for any inference | `kafka.enable_lora_streaming: false` + `--checkpoint` arg; `PeftModel.from_pretrained` from disk |
 | 7 | Checkpoint layout | Flat `step_*/final/` under `<model>__<dataset>/` — runs could collide | Hierarchical `run_<ts>_<uid>/step_*/final/` with `checkpoint_meta.json` + `config_snapshot.yaml` |
 | 8 | Precision | Hard-coded `fp16` — NaN losses on MPS under small-batch variance | Configurable `model.precision`; `fp32` as stable default; `fp16`/`bf16` opt-in |
-| 9 | MPS memory | 25+ GB unified RAM blowup during `poll()` waits | Explicit `del` + `set_to_none=True` + `gc.collect()` + `torch.mps.empty_cache()` → steady ~10 GB |
+| 9 | MPS memory | Historical memory-growth report during `poll()` waits | Explicit `del` + `set_to_none=True` + `gc.collect()` + `torch.mps.empty_cache()`; no retained long-run trace proves a steady 10 GB bound |
 | 10 | Gradient stability | Raw gradients; small batches → exploding norms | `torch.nn.utils.clip_grad_norm_(max_norm=1.0)` pre-`optimizer.step()` |
 | 11 | VRAM on large seq | Always stored full activations | Optional `training.gradient_checkpointing` (`use_reentrant=False`) — VRAM vs compute trade-off |
-| 12 | Qualitative generation | Unbatched (one sample at a time) — 40 min for 3,340 calls | Batched generation with left-padding, chunk size 32 — 10-15× speedup (~3–4 min) |
-| 13 | Consistency runs | Python `for run in range(N)` — N sequential forward passes | `num_return_sequences=N` in `model.generate()` — parallel on GPU, 60-70% further reduction |
+| 12 | Qualitative generation | Unbatched one-sample generation | Batched generation with left-padding; the historical 10–15× timing claim lacks a matched retained trace |
+| 13 | Consistency runs | Python loop over repeated generations | `num_return_sequences=N` in `model.generate()`; the historical 60–70% speedup is unverified here |
 | 14 | Kafka long-eval | Default timeouts → consumer evicted during 15–25 min eval | `max_poll_interval_ms=1,800,000`, `session_timeout_ms=30,000`, `heartbeat_interval_ms=10,000` |
 | 15 | Run isolation | Shared consumer group; fixed timestamp dir → collisions on rapid restart | UUID-suffixed consumer group in `test_mode`; `<ts>_<uuid>` output dirs |
 | 16 | Kafka topic hygiene | Stale records from previous runs replayed on restart | `clear_kafka_topic()` removes stale records before streaming |
@@ -2964,13 +2849,13 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | 18 | Eval sample balance | Sliding window could be class-imbalanced | `full_pool` alias, `other_label` bucket, `_normalize_class_match_labels()` |
 | 19 | Heavy eval models | Eager loading at evaluator init | Lazy-load on first `score()`/`compute()` call, CPU-only, ~120 MB / ~90 MB |
 | 20 | Report surface | PNG dashboard embedded in `report.html`; KPI text overlapped | Independent Plotly HTML + reconstructed card-based PNG dashboard; usecase-aware KPIs |
-| 21 | F1 metric dilution | Unmapped outputs added as 3rd class `other`, diluting binary Macro F1 to 0.5758 | Evaluated target classes strictly (`f1_macro`), reconciling true 0.8638 binary F1; isolated format errors into `other_rate` |
-| 22 | Model weight serialization | Insecure Python `torch.load` pickle deserialization over network Kafka streams | `safetensors.torch.save` / `load` with HMAC-SHA256 signatures, SHA-256 checksums, and `weights_only=True` fallback |
-| 23 | Stream update atomicity | Layers pushed independently without commit markers, risking torn model states | Manifest header + step-tagged layer keys + `__commit__` sentinel protocol buffering full atomic snapshots |
-| 24 | Serving concurrency | Global `model_lock` serializing all requests to concurrency=1 | `DoubleBufferedAdapterRouter` + `ReadWriteLock`; concurrent parallel reads; non-blocking live adapter swaps |
+| 21 | F1 metric dilution | Unmapped outputs included as 3rd class in legacy F1 | Target-class F1 and `other_rate` from raw predictions in the new runner; old 0.8638 derivation withdrawn |
+| 22 | Model weight serialization | Network bytes could reach a `torch.load` fallback | Live Kafka accepts safetensors and JSON only; offline HMAC helper is not wired into Kafka |
+| 23 | Stream update atomicity | Partial batches could pass commit and message keys could reorder across partitions | All frames use partition 0; `SnapshotAssembler` verifies exact tensor set before queuing |
+| 24 | Serving concurrency | Global `model_lock` serialized legacy requests | Single-model read/write router allows concurrent readers but blocks them during an actual weight copy; measure via `swap_stress` |
 | 25 | Cold-start staleness | `auto_offset_reset="latest"` caused restarted servers to serve base weights for up to 60s | Cold-start auto-discovery pre-loads latest disk checkpoint on boot before opening HTTP port |
-| 26 | Hardware acceleration & MFU | Naive FP32 execution capped throughput on capable hardware | `PrecisionManager` supporting CUDA BF16 AMP, FP16 GradScaler, `torch.compile`, and device MFU profiling |
-| 27 | Continual learning rigor | Within-task variance claimed as BWT without domain shift | Formal 3-phase domain shift benchmark (`run_streaming_cl.py`), reservoir replay buffer ($N=1,000$), ADWIN detector |
+| 26 | Hardware acceleration & MFU | Configuration and formula were mistaken for measured utilization | `precision` suite measures step timing/memory; no measured MFU or MPS mixed-precision result yet |
+| 27 | Continual learning rigor | Within-task variance claimed as BWT without domain shift | `benchmarks.run` trains/evaluates three domains and Algorithm-R replay; ADWIN remains a helper, not a live detector |
 | 28 | Observability & SLAs | Zero serving latency or swap telemetry | Added `/metrics` endpoint with p50/p95/p99 request latency percentiles and automated load tester (`load_test_serving.py`) |
 
 ---
@@ -3010,7 +2895,7 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | **Decoupled Eval** | Running `evaluate.py` independently from training; requires no Kafka connection; scores any saved checkpoint |
 | **Static Checkpoint Mode** | Launching `inference.py --checkpoint <path>` to load a LoRA adapter from disk without Kafka |
 | **AAUC** | Average Accuracy Under the Curve — normalized trapezoidal area under the accuracy-vs-step curve; reported as both `aauc` and `average_accuracy` |
-| **Backward Transfer (BWT)** | Fraction of eval samples that were correct at a previous checkpoint but are now wrong; negative BWT signals catastrophic forgetting |
+| **Historical inline `backward_transfer`** | Within-task example-level regression diagnostic; not the cross-task BWT reported by the continual benchmark |
 | **Forgetting-Max** | Maximum drop from peak value across any tracked `forgetting_track_metrics` scalar; zero means no regression |
 | **Update Latency** | `update_latency_s` — wall-clock seconds between consecutive optimizer steps; measures training throughput |
 | **Eval Cycle Time** | `eval_cycle_time_s` — wall-clock seconds from the previous eval's end to the current eval's start; includes training steps + I/O |
@@ -3042,7 +2927,7 @@ A chronological record of all major "old → new" transitions. Each entry corres
 | **Expected Calibration Error (ECE)** | Difference between model predicted confidence probabilities and actual empirical accuracy across confidence bins |
 | **Model FLOPs Utilization (MFU)** | Ratio of observed floating-point operations per second to the theoretical peak capability of the underlying accelerator |
 | **Reservoir Sampling (Algorithm R)** | Bounded-memory algorithm guaranteeing uniform probability of retention across an unbounded data stream |
-| **Golden Canary Benchmark** | Stationary held-out evaluation set used to automatically gate model promotion and trigger rollbacks upon regression |
+| **Golden Canary Benchmark** | Proposed held-out promotion gate; helper exists but automatic live promotion/rollback is not integrated |
 | **ADWIN (Adaptive Windowing)** | Statistical concept drift detection algorithm that dynamically splits observation windows using Hoeffding bounds |
 | **Backward Transfer (BWT)** | Continual learning metric quantifying performance changes on previously learned tasks after training on new tasks |
 | **Forward Transfer (FWT)** | Continual learning metric quantifying positive zero-shot transfer onto future tasks prior to explicit training |
