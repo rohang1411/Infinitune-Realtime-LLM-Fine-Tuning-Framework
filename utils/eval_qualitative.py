@@ -507,13 +507,19 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
             "adults only", "adult only",
             "no children", "not child-friendly",
         ]
-        has_positive = any(p in text for p in positive_phrases)
-        has_negative = any(n in text for n in negative_phrases)
+        has_negative = False
+        remaining_text = text
+        for n in sorted(negative_phrases, key=len, reverse=True):
+            if n in remaining_text:
+                has_negative = True
+                remaining_text = remaining_text.replace(n, " __NEG__ ")
+
+        has_positive = any(p in remaining_text for p in positive_phrases)
 
         if slot_value.lower() == "yes":
             return has_positive and not has_negative
         else:  # 'no'
-            return has_negative or not has_positive
+            return has_negative and not has_positive
 
     def _is_valid_restaurant_description(self, name_value: str, text: str) -> bool:
         """Fluency gate to combat false positives in early hallucinations."""

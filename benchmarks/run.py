@@ -1459,6 +1459,12 @@ def suite_ablation(run, args):
     run.stage("ablation/execute", lambda: run_ablation_suite(run, args))
 
 
+def suite_e2e_facts(run, args):
+    """Factual accuracy, slot coverage, and hallucination metrics on E2E NLG."""
+    from benchmarks.e2e_facts import run_e2e_facts_suite
+    run.stage("e2e_facts/execute", lambda: run_e2e_facts_suite(run, args))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1870,6 +1876,7 @@ def main():
         "filter_benchmark": lambda: suite_filter_benchmark(run, args),
         "rescore": lambda: suite_rescore(run, args),
         "ablation": lambda: suite_ablation(run, args),
+        "e2e_facts": lambda: suite_e2e_facts(run, args),
     }
     for suite in suites:
         try:
