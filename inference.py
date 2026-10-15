@@ -63,8 +63,37 @@ def deserialize_tensor(value_bytes):
 # Kafka Consumer Thread
 # --------------------------------------------------
 _DONE_SENTINEL = ("__done__", None)
-stream_state_global = {"enabled": False, "consumer_ready": False,
-                       "consumer_error": None, "applier_error": None}
+stream_state_global = {
+    "enabled": False,
+    "consumer_ready": False,
+    "consumer_error": None,
+    "applier_error": None,
+    "counters": {
+        "rejected_frames": 0,
+        "rejected_by_reason": {},
+    },
+}
+
+
+def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional[tuple]:
+    """Return (step, batch) on a validated commit, else None. Never raises."""
+    try:
+        if not key or raw_value is None:
+            raise ValueError(f"Missing key or raw_value (key={key!r}, value_is_none={raw_value is None})")
+        val = deserialize_tensor(raw_value)
+        return assembler.add(key, val)
+    except Exception as exc:
+        if counters is not None:
+            counters["rejected_frames"] = counters.get("rejected_frames", 0) + 1
+            by_reason = counters.setdefault("rejected_by_reason", {})
+            reason_name = type(exc).__name__
+            by_reason[reason_name] = by_reason.get(reason_name, 0) + 1
+        msg = f"REJECTED adapter frame key={key!r} reason={type(exc).__name__}: {exc}"
+        if len(msg) > 300:
+            msg = msg[:300]
+        _log(msg)
+        return None
+
 
 def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
@@ -83,7 +112,6 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
             topic,
             bootstrap_servers=kafka_cfg['bootstrap_servers'],
             key_deserializer=lambda k: k.decode("utf-8") if k else None,
-            value_deserializer=deserialize_tensor,
             group_id=kafka_cfg.get('consumer_group_inference', 'inference-api-group'),
             auto_offset_reset="latest",
             consumer_timeout_ms=consumer_timeout_ms
@@ -123,14 +151,12 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                         done = True
                         break
 
-                    if not key or val is None:
-                        continue
-
-                    try:
-                        complete = assembler.add(key, val)
-                    except (ValueError, TypeError) as exc:
-                        _log(f"REJECTED adapter message key={key!r}: {exc}")
-                        continue
+                    complete = process_adapter_record(
+                        assembler,
+                        key,
+                        val,
+                        counters=stream_state_global.get("counters"),
+                    )
                     if complete is not None:
                         step_id, batch = complete
                         received_count += 1
@@ -356,7 +382,7 @@ def get_metrics():
     """Returns real-time serving SLAs, latency percentiles, and hot-swap telemetry."""
     if router_global is not None:
         return jsonify({**router_global.get_metrics(), "stream": stream_state_global}), 200
-    return jsonify({"status": "router_not_initialized"}), 200
+    return jsonify({"status": "router_not_initialized", "stream": stream_state_global}), 200
 
 # --------------------------------------------------
 # Main Execution Block
