@@ -1,0 +1,13 @@
+# InfiniTune Managed Kafka Overlay (Mode B: Colab -> Laptop split streaming)
+# Connects to managed cloud Kafka (e.g. Confluent Cloud, Upstash, Redpanda, Aiven) over SASL_SSL.
+# Credentials must be provided via environment variables:
+#   INFINITUNE_KAFKA_BOOTSTRAP
+#   INFINITUNE_KAFKA_USERNAME
+#   INFINITUNE_KAFKA_PASSWORD
+#   INFINITUNE_ADAPTER_HMAC_KEY
+
+kafka:
+  client:
+    security_protocol: SASL_SSL
+    sasl_mechanism: PLAIN
+  integrity: hmac

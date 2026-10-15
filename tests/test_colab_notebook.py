@@ -58,6 +58,7 @@ def test_colab_v2_notebook_validity():
 
     # Cell 3: Git clone
     assert "git clone" in all_code
+    assert "rohang1411" in all_code
 
     # Cell 4: Requirements install & env check
     assert "requirements-colab.txt" in all_code
@@ -69,9 +70,11 @@ def test_colab_v2_notebook_validity():
     # Cell 6: HuggingFace home & token
     assert "HF_HOME" in all_code
 
-    # Cell 7 & 8: benchmarks.run and resume
+    # Benchmark runs & Split deployment cells
     assert "benchmarks.run" in all_code
     assert "--kafka-bootstrap" in all_code
+    assert "managed_kafka.yaml" in all_code
+    assert "drive_sync.yaml" in all_code
 
-    # Cell 9: Zip export
+    # Archive export
     assert "make_archive" in all_code

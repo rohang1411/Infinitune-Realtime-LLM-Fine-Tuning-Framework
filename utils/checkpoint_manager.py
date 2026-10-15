@@ -349,6 +349,28 @@ class CheckpointManager:
             except Exception as exc:
                 _log(f"Warning: Could not write config_snapshot.yaml: {exc}")
 
+        # --- Write manifest.json with SHA-256 checksum for cryptographic verification ---
+        checksum = None
+        weight_file = os.path.join(save_path, "adapter_model.safetensors")
+        if not os.path.exists(weight_file):
+            weight_file = os.path.join(save_path, "adapter_model.bin")
+        if os.path.exists(weight_file):
+            try:
+                from utils.adapter_manifest import AdapterManifest, compute_file_sha256
+                checksum = compute_file_sha256(weight_file)
+                base_name = self._config.get("model", {}).get("name", "base_model") if self._config else "base_model"
+                manifest = AdapterManifest(
+                    adapter_version=f"step_{step:06d}" if isinstance(step, int) else str(step),
+                    base_model=base_name,
+                    step=step if isinstance(step, int) else 0,
+                    artifact_path=weight_file,
+                    checksum_sha256=checksum,
+                    status="APPROVED",
+                )
+                manifest.save_json(os.path.join(save_path, "manifest.json"))
+            except Exception as m_exc:
+                _log(f"Warning: Could not write manifest.json: {m_exc}")
+
         # Write COMMITTED marker last to signal atomic completion to external watchers
         committed_marker_path = os.path.join(save_path, "COMMITTED")
         try:
@@ -357,6 +379,7 @@ class CheckpointManager:
                     "step": step,
                     "run_id": self._run_dir,
                     "committed_at": time.time(),
+                    "checksum": checksum,
                 }) + "\n")
         except Exception as exc:
             _log(f"Warning: Could not write COMMITTED marker: {exc}")

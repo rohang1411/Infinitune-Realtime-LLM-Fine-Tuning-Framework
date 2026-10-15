@@ -34,10 +34,10 @@ def _ts():
 def _log(msg):
     print(f"[{_ts()}][TRAINER] {msg}", flush=True)
 
-def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+def load_config(config_path, overlay_path=None):
+    """Load configuration from a YAML file, optionally applying a deep-merged overlay."""
+    from utils.config_overlay import load_config_with_overlay
+    return load_config_with_overlay(config_path, overlay_path)
 
 
 def _apply_label_map_if_configured(target_value, label_map):
@@ -1362,10 +1362,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Trainer")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--config-overlay", type=str, default=None,
+                        help="Path to YAML configuration overlay to deep-merge on top of base config")
     parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
                         help="Compute device (auto/cpu/cuda/mps/xpu)")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    _log(f"Loaded config: {args.config}")
+    config = load_config(args.config, args.config_overlay)
+    _log(f"Loaded config: {args.config}" + (f" with overlay: {args.config_overlay}" if args.config_overlay else ""))
     train_model(config, config_path=args.config, cli_device=args.device)

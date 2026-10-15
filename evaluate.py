@@ -68,9 +68,9 @@ def _log(msg: str) -> None:
 # Config helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def load_config(path: str, overlay_path: Optional[str] = None) -> dict:
+    from utils.config_overlay import load_config_with_overlay
+    return load_config_with_overlay(path, overlay_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +574,10 @@ def main():
         "--config", required=True,
         help="Path to the YAML config file used during training.",
     )
+    parser.add_argument(
+        "--config-overlay", default=None,
+        help="Path to YAML configuration overlay to deep-merge on top of base config.",
+    )
 
     # Checkpoint selection (mutually exclusive)
     ckpt_group = parser.add_mutually_exclusive_group()
@@ -625,8 +629,8 @@ def main():
         _log(f"ERROR: Config file not found: {args.config}")
         sys.exit(1)
 
-    config = load_config(args.config)
-    _log(f"Loaded config: {args.config}")
+    config = load_config(args.config, args.config_overlay)
+    _log(f"Loaded config: {args.config}" + (f" with overlay: {args.config_overlay}" if args.config_overlay else ""))
 
     from utils.checkpoint_manager import (
         CheckpointManager,

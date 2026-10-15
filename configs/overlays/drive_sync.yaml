@@ -1,0 +1,5 @@
+# InfiniTune Split Deployment Mode C (Google Drive Checkpoint Sync)
+# Directs outputs and checkpoints to mounted Google Drive storage.
+project:
+  output_dir: "/content/drive/MyDrive/infinitune/output"
+  checkpoint_dir: "/content/drive/MyDrive/infinitune/checkpoints"

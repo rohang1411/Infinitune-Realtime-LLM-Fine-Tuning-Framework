@@ -29,10 +29,10 @@ def _ts():
 def _log(msg):
     print(f"[{_ts()}][INFERENCE] {msg}", flush=True)
 
-def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+def load_config(config_path, overlay_path=None):
+    """Load configuration from a YAML file, optionally applying a deep-merged overlay."""
+    from utils.config_overlay import load_config_with_overlay
+    return load_config_with_overlay(config_path, overlay_path)
 
 # --------------------------------------------------
 # Helper Functions
@@ -127,6 +127,7 @@ def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0
             pass
 
     _log(f"Checkpoint watcher started on directory: {watch_path}")
+    retry_counts = {}
     while True:
         try:
             if watch_path.is_dir():
@@ -145,10 +146,16 @@ def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0
 
                     # Verify manifest if present
                     if manifest_file.exists():
+                        is_one_shot = (stop_event is not None and stop_event.is_set())
                         try:
                             from utils.adapter_manifest import AdapterManifest
                             manifest = AdapterManifest.from_file(str(manifest_file))
                             if not manifest.verify_artifact():
+                                retries = retry_counts.get(sub.name, 0) + 1
+                                retry_counts[sub.name] = retries
+                                if retries < 5 and not is_one_shot:
+                                    _log(f"Transient checksum mismatch for '{sub.name}' (attempt {retries}/5); cloud sync may still be in progress. Will retry...")
+                                    continue
                                 _log(f"REJECTED committed checkpoint '{sub.name}': checksum mismatch")
                                 applied_dirs.add(sub.name)
                                 _persist_state()
@@ -156,9 +163,15 @@ def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0
                             swap_ms = router.swap_from_manifest(manifest)
                             _log(f"Applied committed checkpoint '{sub.name}' from manifest in {swap_ms:.2f} ms")
                             applied_dirs.add(sub.name)
+                            retry_counts.pop(sub.name, None)
                             _persist_state()
                             continue
                         except Exception as m_exc:
+                            retries = retry_counts.get(sub.name, 0) + 1
+                            retry_counts[sub.name] = retries
+                            if retries < 5 and not is_one_shot:
+                                _log(f"Transient error verifying '{sub.name}': {m_exc} (attempt {retries}/5). Will retry...")
+                                continue
                             _log(f"REJECTED committed checkpoint '{sub.name}': {m_exc}")
                             applied_dirs.add(sub.name)
                             _persist_state()
@@ -179,8 +192,14 @@ def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0
                         swap_ms = router.swap_weights(state_dict, version_tag=sub.name, run_id=c_run, seq=c_seq)
                         _log(f"Applied committed checkpoint '{sub.name}' in {swap_ms:.2f} ms")
                         applied_dirs.add(sub.name)
+                        retry_counts.pop(sub.name, None)
                         _persist_state()
                     except Exception as s_exc:
+                        retries = retry_counts.get(sub.name, 0) + 1
+                        retry_counts[sub.name] = retries
+                        if retries < 5 and stop_event is None:
+                            _log(f"Transient error loading '{sub.name}': {s_exc} (attempt {retries}/5). Will retry...")
+                            continue
                         _log(f"REJECTED committed checkpoint '{sub.name}': {s_exc}")
                         applied_dirs.add(sub.name)
                         _persist_state()
@@ -604,14 +623,16 @@ if __name__ == "__main__":
                         help="Directory to watch for committed adapter checkpoints (Mode C Drive sync)")
     parser.add_argument("--watch-poll-seconds", type=float, default=2.0,
                         help="Polling interval in seconds for --watch-checkpoints (default: 2.0)")
+    parser.add_argument("--config-overlay", type=str, default=None,
+                        help="Path to YAML configuration overlay to deep-merge on top of base config")
     args = parser.parse_args()
     if args.listen_updates and args.no_listen_updates:
         parser.error("Cannot specify both --listen-updates and --no-listen-updates.")
 
-    config = load_config(args.config)
+    config = load_config(args.config, args.config_overlay)
     config_global = config
     serving_mode_global = args.serving_mode
-    _log(f"Loaded config: {args.config}")
+    _log(f"Loaded config: {args.config}" + (f" with overlay: {args.config_overlay}" if args.config_overlay else ""))
     _log(f"Serving mode configured: '{serving_mode_global}'")
 
     # Resolve checkpoint path if provided
@@ -679,7 +700,13 @@ if __name__ == "__main__":
     BASE_MODEL_NAME = model_cfg['name']
     prec = model_cfg.get('precision', 'fp32')
     allow_half_on_mps = model_cfg.get('allow_half_on_mps', False)
-    precision_mgr = PrecisionManager(precision=prec, device=device_global, allow_half_on_mps=allow_half_on_mps)
+    allow_half_on_cpu = model_cfg.get('allow_half_on_cpu', False)
+    precision_mgr = PrecisionManager(
+        precision=prec,
+        device=device_global,
+        allow_half_on_mps=allow_half_on_mps,
+        allow_half_on_cpu=allow_half_on_cpu,
+    )
     dtype = precision_mgr.torch_dtype
     
     model_revision = model_cfg.get('revision') or (

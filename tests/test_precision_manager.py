@@ -13,13 +13,18 @@ from utils.precision_manager import PrecisionManager
 
 
 def test_precision_resolution_cpu():
-    # On CPU, all precision modes must resolve to fp32 for stability
+    # On CPU, all precision modes must resolve to fp32 by default
     mgr_bf16 = PrecisionManager(precision="bf16", device="cpu")
     assert mgr_bf16.active_precision == "fp32"
     assert mgr_bf16.torch_dtype == torch.float32
 
     mgr_fp16 = PrecisionManager(precision="fp16", device="cpu")
     assert mgr_fp16.active_precision == "fp32"
+
+    # With opt-in allow_half_on_cpu=True, bf16/fp16 resolve on CPU
+    mgr_opt_bf16 = PrecisionManager(precision="bf16", device="cpu", allow_half_on_cpu=True)
+    assert mgr_opt_bf16.active_precision in ("bf16", "fp16")
+    assert mgr_opt_bf16.torch_dtype in (torch.bfloat16, torch.float16)
 
 
 def test_autocast_context_cpu():

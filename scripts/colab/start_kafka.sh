@@ -9,6 +9,12 @@ KAFKA_DIR="/content/kafka_${SCALA_VERSION}-${KAFKA_VERSION}"
 KAFKA_DATA="/content/kafka-data"
 KAFKA_LOG="/content/kafka.log"
 
+# Check if Kafka broker is already online
+if [ -d "${KAFKA_DIR}" ] && "${KAFKA_DIR}/bin/kafka-topics.sh" --bootstrap-server localhost:9092 --list > /dev/null 2>&1; then
+    echo "Apache Kafka broker is already ONLINE and responding on localhost:9092."
+    exit 0
+fi
+
 echo "=== [1/5] Installing OpenJDK 17 JRE Headless ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

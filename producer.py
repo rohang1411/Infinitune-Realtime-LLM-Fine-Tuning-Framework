@@ -18,10 +18,10 @@ def _ts():
 def _log(msg):
     print(f"[{_ts()}][PRODUCER] {msg}", flush=True)
 
-def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+def load_config(config_path, overlay_path=None):
+    """Load configuration from a YAML file, optionally applying a deep-merged overlay."""
+    from utils.config_overlay import load_config_with_overlay
+    return load_config_with_overlay(config_path, overlay_path)
 
 # Track delivery failures globally so the main loop can detect them
 _delivery_errors = []
@@ -146,10 +146,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Data Producer")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--config-overlay", type=str, default=None,
+                        help="Path to YAML configuration overlay to deep-merge on top of base config")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    _log(f"Loaded config: {args.config}")
+    config = load_config(args.config, args.config_overlay)
+    _log(f"Loaded config: {args.config}" + (f" with overlay: {args.config_overlay}" if args.config_overlay else ""))
     stream_filter = StreamFilter(config, log_fn=_log)
     
     topic_name = config['kafka']['training_topic']

@@ -1786,6 +1786,8 @@ def main():
                             help="Concurrency level sweep for serving benchmark suites")
     run_parser.add_argument("--split-mode", default=None, choices=[None, "colab_split", "none"],
                             help="Cross-host clock sync mode for distributed benchmarking")
+    run_parser.add_argument("--config-overlay", type=Path, default=None,
+                            help="Optional YAML configuration overlay to deep-merge on top of live-config")
     status_parser = sub.add_parser("status", help="Show results and failures for a run")
     status_parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
@@ -1820,13 +1822,14 @@ def main():
     args.model_revision = args.model_revision or MODEL_REVISIONS.get(args.model)
     if not args.model_revision:
         parser.error("Custom --model requires --model-revision with an immutable Hub commit")
-    import yaml
+    from utils.config_overlay import load_config_with_overlay
     live_cfg_path = Path(args.live_config)
     if not live_cfg_path.is_absolute():
         live_cfg_path = ROOT / live_cfg_path
     if not live_cfg_path.exists():
         parser.error(f"--live-config not found: {args.live_config}")
-    live_cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+    overlay_str = str(args.config_overlay) if args.config_overlay else None
+    live_cfg = load_config_with_overlay(str(live_cfg_path), overlay_str)
     live_model_name = live_cfg.get("model", {}).get("name")
     live_suites = (
         "serving", "freshness", "pipeline", "soak", "swap_stress",
