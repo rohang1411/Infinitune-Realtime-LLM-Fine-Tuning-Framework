@@ -106,6 +106,7 @@ class MetricsLogger:
         "kappa",
         "exact_match",
         "qafacteval",
+        "qual_qafacteval_style",
         "answer_overlap_f1",
         "forgetting_max",
         "update_latency_s",

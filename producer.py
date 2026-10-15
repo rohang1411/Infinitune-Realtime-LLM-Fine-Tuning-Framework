@@ -9,6 +9,7 @@ import yaml
 
 from utils.stream_filter import StreamFilter
 from utils.kafka_config import build_client_kwargs
+from utils.holdout import is_holdout_example
 from collections import deque
 
 def _ts():
@@ -76,7 +77,13 @@ def generate_training_examples(config):
     _log(f"Loaded dataset: {dataset_cfg['name']} split={dataset_cfg['split']} ({len(dataset)} examples)")
     _log(f"Column mapping: input_col='{input_col}', target_col='{target_col}', label_map={'enabled' if label_map is not None else 'disabled'}")
 
+    holdout_cfg = dataset_cfg.get('holdout')
+    if holdout_cfg:
+        _log(f"Holdout filter enabled: skipping holdout rows for training (method={holdout_cfg.get('method')}, fraction={holdout_cfg.get('fraction')}).")
+
     for example in dataset:
+        if holdout_cfg and is_holdout_example(example, holdout_cfg, input_col=input_col):
+            continue
         input_val = str(example[input_col])
         target_val = example[target_col]
 

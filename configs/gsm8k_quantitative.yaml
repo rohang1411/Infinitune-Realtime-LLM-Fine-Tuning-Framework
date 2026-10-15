@@ -113,6 +113,7 @@ evaluation:
   eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)
   eval_batch_size: 20          # samples evaluated per sliding window
   answer_regex: "#### (\\d+)" # extracts final numeric answer from GSM8K format
+  answer_normalizer: "numeric" # canonicalizes numbers (commas, decimals, negatives) via Decimal.normalize()
   # Generative / extractive: keep string metrics; disable structure metrics by default
   # (many distinct numeric answers would make F1/MCC/kappa meaningless).
   metrics:

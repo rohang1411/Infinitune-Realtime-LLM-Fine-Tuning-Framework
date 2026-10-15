@@ -60,6 +60,10 @@ dataset:
     input_col: "instruction"   # The instruction to follow
     target_col: "output"       # The golden response (clean string)
   label_map: null              # No label remapping (generative task)
+  holdout:
+    method: "hash"
+    fraction: 0.02
+    seed: 42
   shuffle: true
   shuffle_seed: 42
 

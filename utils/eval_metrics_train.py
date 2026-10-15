@@ -3,10 +3,14 @@ import math
 import re
 import string
 import collections
+from decimal import Decimal, InvalidOperation
+from typing import Optional
 import torch
 from jinja2 import Template
 from datasets import load_dataset
 from transformers import GenerationConfig
+
+from utils.holdout import is_holdout_example
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -15,19 +19,42 @@ def _log(msg):
     print(f"[{_ts()}][EVAL] {msg}", flush=True)
 
 
-class _QAFactEvalScorer:
-    """Factual consistency scorer via extractive QA.
+def extract_final_number(text: str) -> Optional[str]:
+    """Extract and normalize the final number from a model prediction or gold target.
 
-    For each key span in the *source* text, a QA model is asked to find that
-    span inside the *generated* text.  Token-level F1 between the source span
-    and the model's extracted answer gives a per-span score; the final score
-    is the mean over all spans.
-
-    Score range: 0 (completely inconsistent) → 1 (fully consistent).
-
-    The QA pipeline is loaded lazily on the first call to score() so that
-    importing this module never triggers a model download.
+    Checks for `#### <num>` first (GSM8K canonical convention), falling back to
+    the last number in the text. Normalizes commas and decimal representations
+    (e.g., '1,200' -> '1200', '2.50' -> '2.5', '3.0' -> '3', '-3' -> '-3').
     """
+    if not text:
+        return None
+    # 1. Try #### pattern first
+    m = re.search(r"####\s*(-?[\d,]*\.?\d+)", text)
+    if m:
+        raw = m.group(1)
+    else:
+        # 2. Otherwise take the last number match in the text
+        matches = [tok for tok in re.findall(r"-?[\d,]*\.?\d+", text) if any(c.isdigit() for c in tok)]
+        if not matches:
+            return None
+        raw = matches[-1]
+
+    clean = raw.replace(",", "").strip()
+    try:
+        d = Decimal(clean)
+        d_norm = d.normalize()
+        sign, digits, exponent = d_norm.as_tuple()
+        if exponent >= 0:
+            val_str = str(int(d))
+        else:
+            val_str = f"{d_norm:f}"
+        return val_str
+    except (InvalidOperation, ValueError):
+        return None
+
+
+class _QAFactEvalScorer:
+    """QA-overlap proxy inspired by QAFactEval; answer selection and question generation differ from the published pipeline."""
 
     DEFAULT_MODEL = "deepset/minilm-uncased-squad2"
 
@@ -341,6 +368,7 @@ class Evaluator:
         self.strategy = self.eval_cfg.get('strategy', 'perplexity')
         self.eval_interval = self.eval_cfg.get('eval_interval', 100)
         self.answer_regex = self.eval_cfg.get('answer_regex')
+        self.answer_normalizer = self.eval_cfg.get('answer_normalizer')
         self.tokenizer = tokenizer
         self.device = device
 
@@ -500,8 +528,14 @@ class Evaluator:
             # first N would give all-same-class samples and fake 100% accuracy).
             dataset = dataset.shuffle(seed=42)
 
+            holdout_cfg = dataset_cfg.get('holdout')
+            if holdout_cfg:
+                _log(f"Holdout evaluation enabled: retaining only holdout partition (fraction={holdout_cfg.get('fraction')}).")
+
             for i, example in enumerate(dataset):
-                if i >= self.eval_pool_size:
+                if holdout_cfg and not is_holdout_example(example, holdout_cfg, input_col=col_map['input_col']):
+                    continue
+                if len(self.eval_data) >= self.eval_pool_size:
                     break
                 input_val = str(example[col_map['input_col']])
                 target_val = example[col_map['target_col']]
@@ -765,19 +799,25 @@ class Evaluator:
                         pred = self._normalize_class_match_prediction(response)
                         if pred == self.class_match_other_label:
                             other_predictions += 1
-                    elif self.strategy == "regex_extract" and self.answer_regex:
-                        try:
-                            pred_match = re.search(self.answer_regex, response)
-                            gold_match = re.search(self.answer_regex, sample["target"])
-                            if pred_match:
-                                pred = pred_match.group(1).strip().lower()
-                            if gold_match:
-                                gold = gold_match.group(1).strip().lower()
-                        except re.error as re_err:
-                            _log(f"  Warning: invalid answer_regex: {re_err}")
+                    elif self.strategy == "regex_extract":
+                        if self.answer_normalizer == "numeric":
+                            pred_num = extract_final_number(response)
+                            gold_num = extract_final_number(str(sample.get("target", "")))
+                            pred = pred_num if pred_num is not None else "__NO_NUM__"
+                            gold = gold_num if gold_num is not None else "__NO_NUM__"
+                        elif self.answer_regex:
+                            try:
+                                pred_match = re.search(self.answer_regex, response)
+                                gold_match = re.search(self.answer_regex, sample["target"])
+                                if pred_match:
+                                    pred = pred_match.group(1).strip().lower()
+                                if gold_match:
+                                    gold = gold_match.group(1).strip().lower()
+                            except re.error as re_err:
+                                _log(f"  Warning: invalid answer_regex: {re_err}")
+                                pred = response.lower().strip()
+                        else:
                             pred = response.lower().strip()
-                    else:
-                        pred = response.lower().strip()
 
                     if pred is None:
                         pred = response.lower().strip()
@@ -966,7 +1006,10 @@ class Evaluator:
                             if src and gen:
                                 qaf_scores.append(self._qafacteval_scorer.score(src, gen))
                         if qaf_scores:
-                            metrics["qafacteval"] = sum(qaf_scores) / len(qaf_scores)
+                            qaf_val = sum(qaf_scores) / len(qaf_scores)
+                            metrics["qual_qafacteval_style"] = qaf_val
+                            metrics["qafacteval"] = qaf_val
+                            _log("  Reporting metric as qual_qafacteval_style (qafacteval retained as alias)")
                     except Exception as e:
                         _log(f"  Warning: QAFactEval scoring failed (skipped): {e}")
 
