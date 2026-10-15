@@ -24,8 +24,8 @@ from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
 from utils.checkpoint_manager import CheckpointManager
 from utils.precision_manager import PrecisionManager
-import hashlib
 from utils.stream_protocol import canonical_json, manifest_digest, compute_manifest_hmac
+from utils.kafka_config import build_client_kwargs, redact_client_kwargs
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -298,16 +298,16 @@ class LoRAProducer:
         kafka_cfg = config['kafka']
         self.topic = kafka_cfg['lora_updates_topic']
         self.integrity = kafka_cfg.get('integrity', 'sha256')
-        self.max_request_size = int(kafka_cfg.get('max_request_size', 1048576))
+        producer_kwargs = build_client_kwargs(kafka_cfg, "producer")
+        self.max_request_size = int(producer_kwargs.get("max_request_size", 1048576))
         self.run_id = run_id or "run_" + time.strftime("%Y%m%d-%H%M%S")
         self.hmac_key = os.environ.get("INFINITUNE_ADAPTER_HMAC_KEY")
         if self.integrity == "hmac" and not self.hmac_key:
             raise ValueError("HMAC integrity mode requested but INFINITUNE_ADAPTER_HMAC_KEY is missing")
         self.producer = KafkaProducer(
-            bootstrap_servers=kafka_cfg['bootstrap_servers'],
             value_serializer=lambda v: self.serialize_payload(v),
             key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None),
-            max_request_size=self.max_request_size
+            **producer_kwargs,
         )
 
     def serialize_payload(self, value):
@@ -729,9 +729,9 @@ def train_model(config, config_path: str = "(unknown)"):
         consumer_group = f"{consumer_group}-{unique_suffix}"
         _log(f"Test mode: unique consumer group '{consumer_group}' (no stale offset risk)")
     _log(f"Connecting Kafka consumer: topic='{kafka_cfg['training_topic']}', consumer_group='{consumer_group}', poll_timeout_ms={poll_timeout_ms}")
+    consumer_kwargs = build_client_kwargs(kafka_cfg, "consumer")
     consumer = KafkaConsumer(
         kafka_cfg['training_topic'],
-        bootstrap_servers=kafka_cfg['bootstrap_servers'],
         group_id=consumer_group,
         auto_offset_reset="earliest",
         # max_poll_interval_ms: how long poll() can be absent before the broker
@@ -741,6 +741,7 @@ def train_model(config, config_path: str = "(unknown)"):
         max_poll_interval_ms=int(kafka_cfg.get('max_poll_interval_ms', 1800000)),   # 30 min
         session_timeout_ms=int(kafka_cfg.get('session_timeout_ms', 30000)),          # 30 sec
         heartbeat_interval_ms=int(kafka_cfg.get('heartbeat_interval_ms', 10000)),    # 10 sec
+        **consumer_kwargs,
     )
 
     # Force partition assignment and log it (otherwise first poll() does it silently)
@@ -792,7 +793,7 @@ def train_model(config, config_path: str = "(unknown)"):
     dead_letter_producer = None
     if dead_letter_topic:
         dead_letter_producer = KafkaProducer(
-            bootstrap_servers=kafka_cfg['bootstrap_servers'],
+            **build_client_kwargs(kafka_cfg, "producer"),
         )
         _log(f"Dead-letter queue enabled: forwarding malformed records to '{dead_letter_topic}'")
 

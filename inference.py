@@ -13,6 +13,7 @@ from utils.checkpoint_manager import CheckpointManager
 from utils.serving_router import DoubleBufferedAdapterRouter
 from utils.stream_protocol import SnapshotAssembler, deserialize_tensor
 from utils.serving_policy import should_listen_for_updates
+from utils.kafka_config import build_client_kwargs, redact_client_kwargs
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -107,14 +108,15 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     try:
         consumer_timeout_ms = int(kafka_cfg.get('consumer_timeout_ms', 1000))
         poll_timeout_ms = int(kafka_cfg.get('poll_timeout_ms', 1000))
-        _log(f"Connecting KafkaConsumer: bootstrap_servers={kafka_cfg['bootstrap_servers']}, group_id='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}', consumer_timeout_ms={consumer_timeout_ms}, poll_timeout_ms={poll_timeout_ms}")
+        consumer_kwargs = build_client_kwargs(kafka_cfg, "consumer")
+        _log(f"Connecting KafkaConsumer: kwargs={redact_client_kwargs(consumer_kwargs)}, group_id='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}', consumer_timeout_ms={consumer_timeout_ms}, poll_timeout_ms={poll_timeout_ms}")
         consumer = KafkaConsumer(
             topic,
-            bootstrap_servers=kafka_cfg['bootstrap_servers'],
             key_deserializer=lambda k: k.decode("utf-8") if k else None,
             group_id=kafka_cfg.get('consumer_group_inference', 'inference-api-group'),
             auto_offset_reset="latest",
-            consumer_timeout_ms=consumer_timeout_ms
+            consumer_timeout_ms=consumer_timeout_ms,
+            **consumer_kwargs,
         )
         # A producer can publish only after this marker: `latest` offset is
         # established once the consumer has joined and received assignment.

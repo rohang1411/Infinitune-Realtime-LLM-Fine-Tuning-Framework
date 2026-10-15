@@ -24,6 +24,7 @@ from benchmarks.repro_eval import (
     prepare_dataset, read_rows, train_phase, evaluate_rows,
     paired_bootstrap, file_sha256, evaluate_calibration, MODEL_REVISIONS,
 )
+from utils.kafka_config import build_client_kwargs
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
@@ -642,8 +643,10 @@ def suite_serving(run, args):
 def suite_freshness(run, args):
     def preflight():
         from kafka import KafkaAdminClient
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap,
-                                request_timeout_ms=5000)
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
         try:
             topics = admin.list_topics()
         finally:
@@ -666,7 +669,7 @@ def suite_freshness(run, args):
         from benchmarks.repro_eval import load_model
 
         topic = "infinitune-benchmark-" + uuid.uuid4().hex[:12]
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap)
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
         try:
             admin.create_topics([NewTopic(name=topic, num_partitions=1,
                                           replication_factor=1)])
@@ -745,8 +748,10 @@ def suite_pipeline(run, args, data_dir):
     import yaml
 
     def broker_ready():
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap,
-                                request_timeout_ms=5000)
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
         admin.close()
         return {"broker": args.kafka_bootstrap}
     if not run.stage("pipeline/preflight", broker_ready):
@@ -763,7 +768,7 @@ def suite_pipeline(run, args, data_dir):
         topic_suffix = uuid.uuid4().hex[:12]
         train_topic = "infinitune-train-bench-" + topic_suffix
         update_topic = "infinitune-update-bench-" + topic_suffix
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap)
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
         try:
             admin.create_topics([NewTopic(name=t, num_partitions=1, replication_factor=1)
                                  for t in (train_topic, update_topic)])
@@ -815,9 +820,11 @@ def suite_pipeline(run, args, data_dir):
                     if trainer.poll() is not None or time.monotonic() > deadline:
                         raise RuntimeError(f"Trainer not ready; see {trainer_log}")
                     time.sleep(.5)
-                producer = KafkaProducer(bootstrap_servers=[args.kafka_bootstrap],
+                producer = KafkaProducer(
                     value_serializer=lambda x: json.dumps(x).encode("utf-8"),
-                    key_serializer=lambda x: x.encode("utf-8"))
+                    key_serializer=lambda x: x.encode("utf-8"),
+                    **build_client_kwargs({"bootstrap_servers": [args.kafka_bootstrap]}, "producer"),
+                )
                 acknowledgements = []
                 began = None
                 for index, row in enumerate(rows):

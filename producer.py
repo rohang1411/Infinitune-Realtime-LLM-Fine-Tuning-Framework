@@ -8,6 +8,7 @@ import time
 import yaml
 
 from utils.stream_filter import StreamFilter
+from utils.kafka_config import build_client_kwargs
 from collections import deque
 
 def _ts():
@@ -36,9 +37,9 @@ def create_producer(config):
     # failures on modern Kafka 3.x+ brokers.
     _log("Creating KafkaProducer (api_version=auto-detect)...")
     return KafkaProducer(
-        bootstrap_servers=kafka_cfg['bootstrap_servers'],
         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        key_serializer=lambda k: k.encode('utf-8')  # expects key as a string
+        key_serializer=lambda k: k.encode('utf-8'),  # expects key as a string
+        **build_client_kwargs(kafka_cfg, "producer"),
     )
 
 def compute_hash(text):
@@ -109,7 +110,7 @@ def clear_kafka_topic(kafka_cfg, topic):
 
     try:
         _log(f"Checking for stale messages in topic '{topic}' to clear...")
-        consumer = KafkaConsumer(bootstrap_servers=kafka_cfg['bootstrap_servers'])
+        consumer = KafkaConsumer(**build_client_kwargs(kafka_cfg, "consumer"))
         partitions = consumer.partitions_for_topic(topic)
         if not partitions:
             _log("Topic does not exist yet; nothing to clear.")
@@ -126,7 +127,7 @@ def clear_kafka_topic(kafka_cfg, topic):
                 total_cleared += offset
 
         if records_to_delete:
-            admin = KafkaAdminClient(bootstrap_servers=kafka_cfg['bootstrap_servers'])
+            admin = KafkaAdminClient(**build_client_kwargs(kafka_cfg, "admin"))
             admin.delete_records(records_to_delete)
             _log(f"Successfully truncated topic. Cleared {total_cleared} stale messages.")
         else:
