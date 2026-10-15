@@ -352,7 +352,7 @@ class CheckpointManager:
 
     # -----------------------------------------------------------------------
 
-    def list_checkpoints(self) -> list:
+    def list_checkpoints(self, run_name: Optional[str] = None) -> list:
         """
         Return a sorted list of available checkpoints across ALL runs.
 
@@ -437,6 +437,8 @@ class CheckpointManager:
             return (run, 1, 0) if s == "final" else (run, 0, s)
 
         checkpoints.sort(key=sort_key)
+        if run_name is not None:
+            checkpoints = [c for c in checkpoints if c.get("run_name") == run_name or c.get("run") == run_name]
         return checkpoints
 
     def list_runs(self) -> list[str]:
@@ -473,7 +475,7 @@ class CheckpointManager:
         """
         return os.path.join(self._run_path, _step_dir_name(step))
 
-    def resolve_checkpoint_path(self, step) -> Optional[str]:
+    def resolve_checkpoint_path(self, step, run_name: Optional[str] = None) -> Optional[str]:
         """Resolve a checkpoint path by scanning all runs for a given step.
 
         Returns the path from the most-recent run that contains the step,
@@ -486,7 +488,7 @@ class CheckpointManager:
         # we want the latest run, so collect all matches and return the last.
         matches = [
             c["path"]
-            for c in self.list_checkpoints()
+            for c in self.list_checkpoints(run_name=run_name)
             if c["step"] == normalized_step
         ]
         return matches[-1] if matches else None

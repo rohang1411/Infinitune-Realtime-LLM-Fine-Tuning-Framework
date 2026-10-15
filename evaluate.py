@@ -73,7 +73,9 @@ def load_config(path: str) -> dict:
 # Device detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_device() -> torch.device:
+def _get_device(device_str: str = "auto") -> torch.device:
+    if device_str and device_str != "auto":
+        return torch.device(device_str)
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -197,6 +199,7 @@ def run_evaluation(
     evaluator_bundle: dict | None = None,
     run_quantitative: bool = True,
     run_qualitative: bool = True,
+    step: int = 0,
 ) -> dict:
     """
     Run the enabled evaluation suite for one checkpoint and return a flat dict
@@ -229,7 +232,7 @@ def run_evaluation(
             if evaluator.enabled and evaluator.eval_data:
                 pool_size = len(evaluator.eval_data)
                 evaluator.eval_batch_size = pool_size
-                quant_metrics = evaluator.evaluate(model, step=0) or {}
+                quant_metrics = evaluator.evaluate(model, step=step) or {}
                 combined_metrics.update(quant_metrics)
                 _log(f"Quantitative metrics: {list(quant_metrics.keys())}")
             else:
@@ -256,7 +259,7 @@ def run_evaluation(
                 qual_eval.device = device
             if qual_eval.enabled and qual_eval.eval_data:
                 qual_eval._eval_samples = len(qual_eval.eval_data)
-                qual_metrics = qual_eval.run(model, step=0) or {}
+                qual_metrics = qual_eval.run(model, step=step) or {}
                 combined_metrics.update(qual_metrics)
                 _log(f"Qualitative metrics: {list(qual_metrics.keys())}")
             else:
@@ -283,11 +286,14 @@ def evaluate_checkpoint(
     evaluator_bundle: dict | None = None,
     run_quantitative: bool = True,
     run_qualitative: bool = True,
+    step: int = 0,
+    device: torch.device | None = None,
 ) -> dict:
     """Load a checkpoint and run evaluation. Returns the combined metrics dict."""
     from utils.checkpoint_manager import CheckpointManager
 
-    device = _get_device()
+    if device is None:
+        device = _get_device()
     _log(f"Device: {device}")
 
     ckpt_manager = CheckpointManager(config, config_path=config_file)
@@ -303,6 +309,8 @@ def evaluate_checkpoint(
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
         model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     else:
         _log(f"Loading checkpoint: {ckpt_path}")
         model, tokenizer = ckpt_manager.load(ckpt_path, device=str(device))
@@ -315,6 +323,7 @@ def evaluate_checkpoint(
         evaluator_bundle=evaluator_bundle,
         run_quantitative=run_quantitative,
         run_qualitative=run_qualitative,
+        step=step,
     )
 
     # Free GPU/MPS memory
@@ -343,7 +352,7 @@ def main():
     # Checkpoint selection (mutually exclusive)
     ckpt_group = parser.add_mutually_exclusive_group()
     ckpt_group.add_argument(
-        "--step", type=int, default=None,
+        "--step", default=None,
         help="Evaluate the checkpoint saved at this optimizer step.",
     )
     ckpt_group.add_argument(
@@ -357,6 +366,18 @@ def main():
     ckpt_group.add_argument(
         "--list", action="store_true",
         help="List available checkpoints and exit without evaluating.",
+    )
+    parser.add_argument(
+        "--run", default=None,
+        help="Run directory name to evaluate (default: newest run from list_runs()).",
+    )
+    parser.add_argument(
+        "--all-runs", action="store_true",
+        help="When used with --all-checkpoints, evaluate checkpoints across ALL runs rather than just the selected run.",
+    )
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda", "mps", "xpu"], default="auto",
+        help="Device to use for evaluation (default: auto).",
     )
 
     args = parser.parse_args()
@@ -375,10 +396,14 @@ def main():
         select_evaluation_checkpoints,
     )
     ckpt_manager = CheckpointManager(config, config_path=args.config)
+    runs = ckpt_manager.list_runs()
+    selected_run = args.run if args.run else (runs[0] if runs else None)
+    device = _get_device(args.device)
 
     # ── --list ───────────────────────────────────────────────────────────────
     if args.list:
-        checkpoints = ckpt_manager.list_checkpoints()
+        run_filter = None if args.all_runs else (args.run if args.run else selected_run)
+        checkpoints = ckpt_manager.list_checkpoints(run_name=run_filter)
         if not checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(0)
@@ -394,7 +419,8 @@ def main():
 
     # ── Resolve which checkpoints to evaluate ────────────────────────────────
     if args.all_checkpoints:
-        available_checkpoints = ckpt_manager.list_checkpoints()
+        run_filter = None if args.all_runs else selected_run
+        available_checkpoints = ckpt_manager.list_checkpoints(run_name=run_filter)
         if not available_checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(1)
@@ -441,8 +467,11 @@ def main():
             "timestamp": None,
         }]
     elif args.step is not None:
-        ckpt_path = ckpt_manager.get_checkpoint_path(args.step)
-        if not os.path.isdir(ckpt_path):
+        target_step = int(args.step) if str(args.step).isdigit() else args.step
+        ckpt_path = ckpt_manager.resolve_checkpoint_path(target_step, run_name=selected_run)
+        if not ckpt_path and not args.run:
+            ckpt_path = ckpt_manager.resolve_checkpoint_path(target_step, run_name=None)
+        if not ckpt_path or not os.path.isdir(ckpt_path):
             _log(f"ERROR: No checkpoint found for step {args.step} at: {ckpt_path}")
             _log("Run with --list to see available checkpoints.")
             sys.exit(1)
@@ -454,8 +483,10 @@ def main():
         }]
     else:
         # Default: evaluate "final"
-        ckpt_path = ckpt_manager.get_checkpoint_path("final")
-        if not os.path.isdir(ckpt_path):
+        ckpt_path = ckpt_manager.resolve_checkpoint_path("final", run_name=selected_run)
+        if not ckpt_path and not args.run:
+            ckpt_path = ckpt_manager.resolve_checkpoint_path("final", run_name=None)
+        if not ckpt_path or not os.path.isdir(ckpt_path):
             _log(
                 f"No 'final' checkpoint found at: {ckpt_path}\n"
                 "Train with save_checkpoints.save_final: true (the default) or "
@@ -472,10 +503,27 @@ def main():
     # ── Run evaluation for each checkpoint ───────────────────────────────────
     all_results = []  # list of {step, checkpoint, **metrics} for multi-ckpt plots
     evaluator_bundle: dict = {}
+    failed = []
+    evaluated_count = 0
+    max_steps = int(config.get("training", {}).get("max_steps", 1000))
 
     for ckpt in checkpoints:
         ckpt_path = ckpt["path"]
         ckpt_name = ckpt["name"]
+        raw_step = ckpt.get("step")
+        if raw_step == "final" or str(raw_step).lower() == "final":
+            eval_step = max_steps
+        elif isinstance(raw_step, int):
+            eval_step = raw_step
+        elif isinstance(raw_step, str) and raw_step.isdigit():
+            eval_step = int(raw_step)
+        elif isinstance(raw_step, str) and raw_step.startswith("step_") and raw_step[5:].isdigit():
+            eval_step = int(raw_step[5:])
+        else:
+            try:
+                eval_step = int(raw_step)
+            except (ValueError, TypeError):
+                eval_step = 0
         run_quantitative = ckpt.get("run_quantitative", config.get("evaluation", {}).get("enabled", False))
         run_qualitative = ckpt.get("run_qualitative", config.get("testing_strategy", {}).get("enabled", False))
         targets = ckpt.get("evaluation_targets") or ((["quantitative"] if run_quantitative else []) + (["qualitative"] if run_qualitative else []))
@@ -493,10 +541,14 @@ def main():
                 evaluator_bundle=evaluator_bundle,
                 run_quantitative=run_quantitative,
                 run_qualitative=run_qualitative,
+                step=eval_step,
+                device=device,
             )
+            evaluated_count += 1
         except Exception as exc:
             _log(f"ERROR: Evaluation failed for '{ckpt_name}': {exc}")
             import traceback; traceback.print_exc()
+            failed.append(ckpt_name)
             continue
 
         if not metrics:
@@ -506,7 +558,7 @@ def main():
         # ── Save results for this checkpoint ─────────────────────────────────
         out_dir = _make_eval_output_dir(config, ckpt_name)
         _save_results(out_dir, metrics, config, ckpt_path)
-        _generate_plots([{"step": ckpt["step"], **metrics}], out_dir, config=config)
+        _generate_plots([{"step": eval_step, **metrics}], out_dir, config=config)
 
         # Print summary
         _log("── Metrics summary ──")
@@ -516,7 +568,7 @@ def main():
             else:
                 _log(f"  {k}: {v}")
 
-        all_results.append({"step": ckpt["step"], "checkpoint": ckpt_name, **metrics})
+        all_results.append({"step": eval_step, "checkpoint": ckpt_name, **metrics})
 
     # ── If multiple checkpoints, also produce combined plots ─────────────────
     if len(all_results) > 1:
@@ -536,7 +588,10 @@ def main():
         _log(f"Combined results CSV: {csv_path}")
         _log(f"Combined plots: {os.path.join(combined_out, 'plots')}")
 
-    _log("\nDecoupled evaluation complete.")
+    _log(f"\nEvaluated {evaluated_count} checkpoints, {len(failed)} failed: {failed}")
+    if failed:
+        sys.exit(2)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
