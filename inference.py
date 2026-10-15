@@ -6,6 +6,7 @@ import torch
 import threading
 import queue
 import os
+from collections import deque
 import traceback
 import yaml
 from kafka import KafkaConsumer
@@ -75,6 +76,7 @@ stream_state_global = {
     },
 }
 initial_active_global = None
+adapter_history_global = deque(maxlen=200)
 
 
 def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional[tuple]:
@@ -163,9 +165,10 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                         counters=stream_state_global.get("counters"),
                     )
                     if complete is not None:
+                        t_assembled = time.time()
                         step_id, batch = complete
                         received_count += 1
-                        update_queue.put((step_id, batch, getattr(assembler, "active", None)))
+                        update_queue.put((step_id, batch, getattr(assembler, "active", None), t_assembled))
                         _log(f"Committed complete adapter step {step_id}: tensors={len(batch)}")
                 if done:
                     break
@@ -207,10 +210,20 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
 
             active_run_id = None
             active_seq = None
-            if len(item) == 3:
+            t_publish_start = None
+            t_assembled = None
+            if len(item) == 4:
+                step_or_layer, tensor_or_dict, active_meta, t_assembled = item
+                if active_meta:
+                    active_run_id, active_seq = active_meta[0], active_meta[1]
+                    if len(active_meta) >= 3:
+                        t_publish_start = float(active_meta[2])
+            elif len(item) == 3:
                 step_or_layer, tensor_or_dict, active_meta = item
                 if active_meta:
                     active_run_id, active_seq = active_meta[0], active_meta[1]
+                    if len(active_meta) >= 3:
+                        t_publish_start = float(active_meta[2])
             else:
                 step_or_layer, tensor_or_dict = item
 
@@ -224,16 +237,24 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        if len(next_item) == 3:
+                        if len(next_item) == 4:
+                            n_step, n_val, n_meta, n_tassembled = next_item
+                        elif len(next_item) == 3:
                             n_step, n_val, n_meta = next_item
+                            n_tassembled = None
                         else:
                             n_step, n_val = next_item
                             n_meta = None
+                            n_tassembled = None
                         if isinstance(n_val, dict):
                             updates_to_apply = n_val
                             version_tag = f"step_{n_step}"
                             if n_meta:
                                 active_run_id, active_seq = n_meta[0], n_meta[1]
+                                if len(n_meta) >= 3:
+                                    t_publish_start = float(n_meta[2])
+                            if n_tassembled:
+                                t_assembled = n_tassembled
                         else:
                             updates_to_apply[n_step] = n_val
                     except queue.Empty:
@@ -248,7 +269,9 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        if len(next_item) == 3:
+                        if len(next_item) == 4:
+                            name, t, _, _ = next_item
+                        elif len(next_item) == 3:
                             name, t, _ = next_item
                         else:
                             name, t = next_item
@@ -284,6 +307,16 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                     swap_ms = (time.perf_counter() - swap_start) * 1000.0
                     applied_batches += 1
                     _log(f"Weight updates applied via legacy model_lock in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
+
+                t_applied = time.time()
+                adapter_history_global.append({
+                    "version": version_tag,
+                    "run_id": active_run_id,
+                    "seq": active_seq,
+                    "t_publish_start": t_publish_start,
+                    "t_assembled": t_assembled,
+                    "t_applied": t_applied,
+                })
 
             # If we hit the sentinel inside the drain loop, stop after this apply
             if item == _DONE_SENTINEL:
@@ -436,6 +469,17 @@ def get_adapter():
         "adapter_state_sha256": None,
         "expected_state_sha256": None,
         "match": False,
+    }), 200
+
+@app.route('/adapter/history', methods=['GET'])
+def get_adapter_history():
+    """Returns bounded dictionary/list of applied adapter versions and latency timestamps."""
+    hist_list = list(adapter_history_global)
+    hist_dict = {entry["version"]: entry for entry in hist_list}
+    return jsonify({
+        "history": hist_list,
+        "versions": hist_dict,
+        **hist_dict,
     }), 200
 
 

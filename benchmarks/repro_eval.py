@@ -26,6 +26,10 @@ LABELS = ("negative", "positive")
 MODEL_REVISIONS = {
     "distilgpt2": "2290a62682d06624634c1f46a6ad5be0f47f38aa",
     "gpt2-medium": "6dcaa7a952f72f9298047fd5137cd6e4f05f41da",
+    "Qwen/Qwen2.5-1.5B": "8faed761d45a263340a0528343f099c05c9a4323",
+    "Qwen2.5-1.5B": "8faed761d45a263340a0528343f099c05c9a4323",
+    "Qwen/Qwen2.5-3B": "3aab1f1954e9cc14eb9509a215f9e5ca08227a9b",
+    "Qwen2.5-3B": "3aab1f1954e9cc14eb9509a215f9e5ca08227a9b",
 }
 
 

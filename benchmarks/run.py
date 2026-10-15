@@ -25,6 +25,7 @@ from benchmarks.repro_eval import (
     paired_bootstrap, file_sha256, evaluate_calibration, MODEL_REVISIONS,
 )
 from utils.kafka_config import build_client_kwargs
+from utils.serving_router import nearest_rank_percentile
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
@@ -40,6 +41,15 @@ SUITES = {
     "precision": "measured fp32/bf16/fp16 LoRA step timing and memory",
     "soak": "long-running inference RSS slope, request latency and failures",
     "swap_stress": "real-model concurrent requests during validated adapter swaps",
+    "propagation": "weight-update propagation distribution (publish to apply)",
+    "cold_start": "checkpoint recovery vs waiting for first Kafka push",
+    "fault_injection": "truncated and corrupted Kafka frames recovery",
+    "eval_speed": "evaluation throughput and latency comparison",
+    "filter_benchmark": "five-stage stream filter throughput and latency",
+    "streaming_quality": "streaming continual learning quality and convergence",
+    "ablation": "ablation of streaming integrity and architectural components",
+    "e2e_facts": "factual accuracy and hallucination metrics on generated outputs",
+    "rescore": "offline metric re-scoring of benchmark outputs",
 }
 PROFILES = {
     "smoke": {"train": 32, "eval": 16, "e2e_mrs": 4, "steps": 2, "requests": 20, "repeats": 1, "seeds": 1},
@@ -878,6 +888,277 @@ def suite_pipeline(run, args, data_dir):
     run.stage("pipeline/record_to_version", execute)
 
 
+def parse_trainer_publish_log(trainer_log_path: Path):
+    """
+    Parse (run_id, seq) -> (t_publish_start, t_flushed) from trainer log lines like:
+    Published adapter step=step_1 seq=1 run_id=run_20261015 t_publish_start=123.456 t_flushed=123.789 publish_s=0.333
+    """
+    import re
+    records = {}
+    if not trainer_log_path.exists():
+        return records
+    pattern = re.compile(
+        r"Published adapter step=(\S+) seq=(\d+) run_id=(\S+) t_publish_start=([\d\.]+) t_flushed=([\d\.]+)"
+    )
+    for line in trainer_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            step, seq, run_id, t_start, t_flush = match.groups()
+            records[(run_id, int(seq))] = {
+                "step": step,
+                "seq": int(seq),
+                "run_id": run_id,
+                "t_publish_start": float(t_start),
+                "t_flushed": float(t_flush),
+                "publish_s": float(t_flush) - float(t_start),
+            }
+    return records
+
+
+def join_propagation_timestamps(trainer_records: dict, inference_history: list) -> list:
+    """
+    Join trainer publish records and inference history entries by (run_id, seq).
+    Computes publish_s, transport_assemble_s, apply_s, and total propagation_s.
+    """
+    joined = []
+    for entry in inference_history:
+        run_id = entry.get("run_id")
+        seq = entry.get("seq")
+        if seq is None:
+            continue
+        key = (run_id, int(seq))
+        if key in trainer_records:
+            t_rec = trainer_records[key]
+            t_publish_start = t_rec["t_publish_start"]
+            t_flushed = t_rec["t_flushed"]
+            t_assembled = entry.get("t_assembled")
+            t_applied = entry.get("t_applied")
+            if t_assembled and t_applied:
+                publish_s = t_flushed - t_publish_start
+                transport_assemble_s = t_assembled - t_flushed
+                apply_s = t_applied - t_assembled
+                propagation_s = t_applied - t_publish_start
+                joined.append({
+                    "version": entry.get("version"),
+                    "run_id": run_id,
+                    "seq": int(seq),
+                    "t_publish_start": t_publish_start,
+                    "t_flushed": t_flushed,
+                    "t_assembled": t_assembled,
+                    "t_applied": t_applied,
+                    "publish_s": round(publish_s, 6),
+                    "transport_assemble_s": round(transport_assemble_s, 6),
+                    "apply_s": round(apply_s, 6),
+                    "propagation_s": round(propagation_s, 6),
+                })
+    return joined
+
+
+def suite_propagation(run, args):
+    """
+    Measures weight-update propagation distribution across the streaming pipeline.
+
+    Definition:
+      For each weight push k:
+      - t_publish_start: the trainer calls send_weights (wall clock, time.time()).
+      - t_flushed: producer.flush() returned.
+      - t_assembled: the inference consumer validated the commit.
+      - t_applied: swap_weights released the write lock.
+      - propagation_s = t_applied - t_publish_start. (Resume claim number).
+      Reports publish_s, transport_assemble_s, apply_s, summing to propagation_s.
+    """
+    def preflight():
+        from kafka import KafkaAdminClient
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
+        try:
+            topics = admin.list_topics()
+        finally:
+            admin.close()
+        return {"broker": args.kafka_bootstrap, "topics": sorted(topics)}
+
+    if not run.stage("propagation/preflight", preflight):
+        return
+
+    def measure():
+        import urllib.request
+        import yaml
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+        target_trials = args.trials or {"smoke": 3, "standard": 20, "full": 100}[args.profile]
+        topic_suffix = uuid.uuid4().hex[:12]
+        train_topic = f"infinitune-train-prop-{topic_suffix}"
+        update_topic = f"infinitune-update-prop-{topic_suffix}"
+
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
+        try:
+            admin.create_topics([
+                NewTopic(name=t, num_partitions=1, replication_factor=1)
+                for t in (train_topic, update_topic)
+            ])
+        finally:
+            admin.close()
+
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        config = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+
+        config["project"]["output_dir"] = str(run.directory / "propagation_output")
+        config["model"]["max_seq_length"] = args.max_seq_length
+        config["kafka"].update(
+            bootstrap_servers=[args.kafka_bootstrap],
+            training_topic=train_topic,
+            lora_updates_topic=update_topic,
+            enable_lora_streaming=True,
+            consumer_group_inference=f"prop-inference-{topic_suffix}",
+            consumer_group_trainer=f"prop-trainer-{topic_suffix}",
+        )
+        config["training"].update(
+            weight_push_interval=args.push_interval,
+            max_steps=max(target_trials * 3, 20),
+            logging_steps=1,
+            gradient_checkpointing=False,
+            eof_empty_polls=10,
+        )
+        config["inference"]["auto_load_latest_checkpoint"] = False
+
+        config_path = run.directory / "propagation_config.yaml"
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+        server_log = run.directory / "server_logs" / "propagation_inference.log"
+        trainer_log = run.directory / "server_logs" / "propagation_trainer.log"
+        producer_log = run.directory / "server_logs" / "propagation_producer.log"
+        server_log.parent.mkdir(exist_ok=True)
+
+        url = f"http://127.0.0.1:{args.port}"
+
+        with server_log.open("w", encoding="utf-8") as server_out, \
+             trainer_log.open("w", encoding="utf-8") as trainer_out, \
+             producer_log.open("w", encoding="utf-8") as producer_out:
+
+            server = subprocess.Popen([
+                sys.executable, "-u", "inference.py",
+                "--config", str(config_path),
+                "--port", str(args.port),
+                "--serving-mode", "router",
+                "--listen-updates",
+            ], cwd=ROOT, stdout=server_out, stderr=subprocess.STDOUT, env=child_env())
+
+            trainer = None
+            producer_proc = None
+            joined_trials = []
+            try:
+                _wait_server(url, server)
+                deadline = time.monotonic() + 45
+                while "Kafka listener ready:" not in server_log.read_text(encoding="utf-8"):
+                    if server.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError(f"Inference listener not ready; see {server_log}")
+                    time.sleep(0.25)
+
+                trainer = subprocess.Popen([
+                    sys.executable, "-u", "trainer.py",
+                    "--config", str(config_path),
+                ], cwd=ROOT, stdout=trainer_out, stderr=subprocess.STDOUT, env=child_env())
+
+                deadline = time.monotonic() + 180
+                while ">>> Start the producer now" not in trainer_log.read_text(encoding="utf-8"):
+                    if trainer.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError(f"Trainer not ready; see {trainer_log}")
+                    time.sleep(0.5)
+
+                producer_proc = subprocess.Popen([
+                    sys.executable, "-u", "producer.py",
+                    "--config", str(config_path),
+                ], cwd=ROOT, stdout=producer_out, stderr=subprocess.STDOUT, env=child_env())
+
+                collect_deadline = time.monotonic() + 300
+                while time.monotonic() < collect_deadline:
+                    time.sleep(1.0)
+                    try:
+                        req = urllib.request.Request(f"{url}/adapter/history")
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            history = data.get("history", [])
+                    except Exception:
+                        history = []
+
+                    trainer_recs = parse_trainer_publish_log(trainer_log)
+                    joined = join_propagation_timestamps(trainer_recs, history)
+                    if len(joined) >= target_trials:
+                        joined_trials = joined[:target_trials]
+                        break
+
+                    if trainer.poll() is not None:
+                        break
+
+                if len(joined_trials) < target_trials:
+                    trainer_recs = parse_trainer_publish_log(trainer_log)
+                    try:
+                        req = urllib.request.Request(f"{url}/adapter/history")
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            history = data.get("history", [])
+                    except Exception:
+                        history = []
+                    joined_trials = join_propagation_timestamps(trainer_recs, history)
+
+            finally:
+                for proc in (producer_proc, trainer, server):
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+
+        if not joined_trials:
+            raise RuntimeError(f"Propagation benchmark collected 0 trials; see logs in {server_log.parent}")
+
+        prop_dir = run.directory / "propagation"
+        prop_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = prop_dir / "raw.jsonl"
+        with raw_path.open("w", encoding="utf-8") as f:
+            for item in joined_trials:
+                f.write(json.dumps(item) + "\n")
+
+        prop_times = sorted([x["propagation_s"] for x in joined_trials])
+        pub_times = sorted([x["publish_s"] for x in joined_trials])
+        trans_times = sorted([x["transport_assemble_s"] for x in joined_trials])
+        app_times = sorted([x["apply_s"] for x in joined_trials])
+
+        n = len(joined_trials)
+        summary = {
+            "n": n,
+            "target_trials": target_trials,
+            "profile": args.profile,
+            "model": args.model,
+            "push_interval_s": args.push_interval,
+            "propagation_s": {
+                "min": prop_times[0],
+                "p50": nearest_rank_percentile(prop_times, 0.50),
+                "p95": nearest_rank_percentile(prop_times, 0.95),
+                "max": prop_times[-1],
+                "mean": round(sum(prop_times) / n, 4),
+            },
+            "breakdown_p50_s": {
+                "publish_s": nearest_rank_percentile(pub_times, 0.50),
+                "transport_assemble_s": nearest_rank_percentile(trans_times, 0.50),
+                "apply_s": nearest_rank_percentile(app_times, 0.50),
+            },
+            "boundary": "Measured wall-clock propagation from trainer LoRAProducer.send_weights invocation (t_publish_start) to DoubleBufferedAdapterRouter lock release in inference (t_applied)",
+            "raw_path": str(raw_path),
+            "raw_sha256": file_sha256(raw_path),
+        }
+        summary_path = prop_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
+    run.stage("propagation/execute", measure)
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1092,6 +1373,18 @@ def main():
     run_parser.add_argument("--soak-seconds", type=int, default=None)
     run_parser.add_argument("--soak-rate", type=float, default=1.0,
                             help="Target sequential requests per second")
+    run_parser.add_argument("--live-config", type=Path, default=ROOT / "configs/imdb_quantitative.yaml",
+                            help="Configuration YAML for live serving / streaming benchmark suites")
+    run_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                            help="Target compute device for benchmark suites")
+    run_parser.add_argument("--push-interval", type=float, default=5.0,
+                            help="Weight update push interval in seconds for streaming suites")
+    run_parser.add_argument("--trials", type=int, default=None,
+                            help="Number of trials/pushes to collect in empirical distribution suites")
+    run_parser.add_argument("--concurrency-levels", nargs="+", type=int, default=None,
+                            help="Concurrency level sweep for serving benchmark suites")
+    run_parser.add_argument("--split-mode", default=None, choices=[None, "colab_split", "none"],
+                            help="Cross-host clock sync mode for distributed benchmarking")
     status_parser = sub.add_parser("status", help="Show results and failures for a run")
     status_parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
@@ -1126,9 +1419,24 @@ def main():
     args.model_revision = args.model_revision or MODEL_REVISIONS.get(args.model)
     if not args.model_revision:
         parser.error("Custom --model requires --model-revision with an immutable Hub commit")
-    if args.model != "distilgpt2" and any(s in suites for s in
-            ("serving", "freshness", "pipeline", "soak", "swap_stress")):
-        parser.error("Live serving suites use the distilgpt2 project config; use --model distilgpt2")
+    import yaml
+    live_cfg_path = Path(args.live_config)
+    if not live_cfg_path.is_absolute():
+        live_cfg_path = ROOT / live_cfg_path
+    if not live_cfg_path.exists():
+        parser.error(f"--live-config not found: {args.live_config}")
+    live_cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+    live_model_name = live_cfg.get("model", {}).get("name")
+    live_suites = (
+        "serving", "freshness", "pipeline", "soak", "swap_stress",
+        "propagation", "cold_start", "fault_injection"
+    )
+    if any(s in suites for s in live_suites):
+        if args.model != live_model_name:
+            parser.error(
+                f"Config model name ({live_model_name!r} from --live-config {args.live_config}) "
+                f"must match --model ({args.model!r})"
+            )
     os.environ["INFINITUNE_MODEL_NAME"] = args.model
     os.environ["INFINITUNE_MODEL_REVISION"] = args.model_revision
     spec = {"suites": suites, "profile": args.profile, "seed": args.seed,
@@ -1143,6 +1451,12 @@ def main():
     spec["compile"] = args.compile
     spec["soak_seconds"] = args.soak_seconds
     spec["soak_rate"] = args.soak_rate
+    spec["live_config"] = str(args.live_config)
+    spec["device"] = args.device
+    spec["push_interval"] = args.push_interval
+    spec["trials"] = args.trials
+    spec["concurrency_levels"] = args.concurrency_levels
+    spec["split_mode"] = args.split_mode
     directory = args.run_dir or ROOT / "reports" / "benchmark_runs" / (
         datetime.now().strftime("%Y%m%d-%H%M%S") + "_" + uuid.uuid4().hex[:6])
     run = Run(directory, spec, external_checkpoint_inputs(args, suites))
@@ -1160,6 +1474,7 @@ def main():
         "precision": lambda: suite_precision(run, args),
         "soak": lambda: suite_soak(run, args),
         "swap_stress": lambda: suite_swap_stress(run, args),
+        "propagation": lambda: suite_propagation(run, args),
     }
     for suite in suites:
         try:

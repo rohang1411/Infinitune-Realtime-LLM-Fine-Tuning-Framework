@@ -334,6 +334,7 @@ class LoRAProducer:
         active_run_id = run_id or self.run_id
         active_seq = seq if seq is not None else (int(step_id) if isinstance(step_id, int) or (isinstance(step_id, str) and step_id.isdigit()) else 0)
 
+        t_publish_start = time.time()
         _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}', run_id='{active_run_id}', seq={active_seq}")
 
         if self.integrity == "none_v1_compat":
@@ -341,7 +342,7 @@ class LoRAProducer:
                 "step_id": step_tag,
                 "num_tensors": num_tensors,
                 "tensor_names": list(adapter_weights.keys()),
-                "timestamp": time.time(),
+                "timestamp": t_publish_start,
             }
             self.producer.send(
                 topic=self.topic,
@@ -368,6 +369,11 @@ class LoRAProducer:
                 value=commit_meta
             )
             self.producer.flush()
+            t_flushed = time.time()
+            _log(
+                f"Published adapter step={step_tag} seq={active_seq} run_id={active_run_id} "
+                f"t_publish_start={t_publish_start:.6f} t_flushed={t_flushed:.6f} publish_s={t_flushed - t_publish_start:.6f}"
+            )
             return
 
         # Protocol v2:
@@ -392,13 +398,12 @@ class LoRAProducer:
             }
             serialized_frames[name] = frame_bytes
 
-        created_at = time.time()
         manifest_meta = {
             "protocol_version": 2,
             "run_id": active_run_id,
             "step_id": step_tag,
             "seq": active_seq,
-            "created_at": created_at,
+            "created_at": t_publish_start,
             "num_tensors": len(sorted_names),
             "tensor_names": sorted_names,
             "tensors": tensors_meta,
@@ -444,6 +449,11 @@ class LoRAProducer:
             value=commit_bytes,
         )
         self.producer.flush()
+        t_flushed = time.time()
+        _log(
+            f"Published adapter step={step_tag} seq={active_seq} run_id={active_run_id} "
+            f"t_publish_start={t_publish_start:.6f} t_flushed={t_flushed:.6f} publish_s={t_flushed - t_publish_start:.6f}"
+        )
 
     def send_done_signal(self):
         """Send a sentinel message so the inference server knows training is over
