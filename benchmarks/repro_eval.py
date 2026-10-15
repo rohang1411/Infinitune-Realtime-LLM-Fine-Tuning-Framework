@@ -119,20 +119,17 @@ def read_rows(path):
 
 
 def device_name():
-    import torch
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    from utils.device import resolve_device
+    return resolve_device()
 
 
-def load_model(model_name, adapter=None, train=False):
+def load_model(model_name, adapter=None, train=False, device=None):
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from utils.device import resolve_device
 
-    device = device_name()
+    device = device or resolve_device()
     revision = (os.environ.get("INFINITUNE_MODEL_REVISION")
                 if os.environ.get("INFINITUNE_MODEL_NAME") == model_name
                 else MODEL_REVISIONS.get(model_name))

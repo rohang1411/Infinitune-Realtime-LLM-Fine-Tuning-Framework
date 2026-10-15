@@ -3029,7 +3029,7 @@ During the comprehensive audit, 12 critical defects were isolated and remediated
 | **WP-23** | ADWIN Drift Detector & Continual Engine | **COMPLETED** | `4969af6` | `utils/continual_engine.py` (ADWIN), `tests/test_continual_learning.py` |
 | **WP-24** | E2E NLG Fact Scoring & Hallucination | **COMPLETED** | — | `utils/eval_qualitative.py`, `benchmarks/e2e_facts.py`, `tests/test_e2e_facts.py` |
 | **WP-25** | GSM8K Regex Normalization & Alpaca Split | **COMPLETED** | — | `utils/eval_metrics_train.py`, `utils/holdout.py`, `tests/test_gsm8k_extract.py`, `tests/test_holdout_split.py` |
-| **WP-26** | Unified Device Resolver (`utils/device.py`) | **QUEUED** | — | Centralized device selector (`auto/cpu/cuda/mps/xpu`) & MPS half-precision |
+| **WP-26** | Unified Device Resolver (`utils/device.py`) | **COMPLETED** | — | `utils/device.py`, `utils/precision_manager.py`, `tests/test_device.py` |
 | **WP-27** | Google Colab v2 Execution Framework | **QUEUED** | — | Upgraded GPU notebooks and execution scripts for cloud acceleration |
 | **WP-28** | Split Deployment Distributed Harness | **QUEUED** | — | Distributed orchestration (Trainer on Colab/GPU, Serving on local laptop) |
 | **WP-20** | Streaming Quality Kafka Parity Run | **QUEUED** | — | End-to-end Kafka streaming run validating reproduction within bootstrap CI |

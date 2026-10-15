@@ -1834,6 +1834,8 @@ def main():
             )
     os.environ["INFINITUNE_MODEL_NAME"] = args.model
     os.environ["INFINITUNE_MODEL_REVISION"] = args.model_revision
+    if args.device and args.device != "auto":
+        os.environ["INFINITUNE_DEVICE"] = args.device
     spec = {"suites": suites, "profile": args.profile, "seed": args.seed,
             "seeds": args.seeds,
             "model": args.model, "model_revision": args.model_revision,

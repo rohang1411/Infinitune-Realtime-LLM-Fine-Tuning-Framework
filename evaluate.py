@@ -77,14 +77,10 @@ def load_config(path: str) -> dict:
 # Device detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_device(device_str: str = "auto") -> torch.device:
-    if device_str and device_str != "auto":
-        return torch.device(device_str)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+def _get_device(device_str: str = "auto", config: Optional[dict] = None) -> torch.device:
+    from utils.device import resolve_device
+    dev = resolve_device(config=config, cli_device=device_str)
+    return torch.device(dev)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

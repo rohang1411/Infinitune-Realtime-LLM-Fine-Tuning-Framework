@@ -503,6 +503,8 @@ if __name__ == "__main__":
                         help="Serving mode: 'router' uses DoubleBufferedAdapterRouter with ReadWriteLock; 'legacy_lock' uses global mutex")
     parser.add_argument("--port", type=int, default=8000,
                         help="Port to bind the Flask HTTP server to (default: 8000)")
+    parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                        help="Device to serve on (auto/cpu/cuda/mps/xpu)")
     args = parser.parse_args()
     if args.listen_updates and args.no_listen_updates:
         parser.error("Cannot specify both --listen-updates and --no-listen-updates.")
@@ -566,12 +568,9 @@ if __name__ == "__main__":
     )
 
     # Determine device
-    if torch.cuda.is_available():
-        DEVICE = "cuda"
-    elif torch.backends.mps.is_available():
-        DEVICE = "mps"
-    else:
-        DEVICE = "cpu"
+    from utils.device import resolve_device
+    from utils.precision_manager import PrecisionManager
+    DEVICE = resolve_device(config, cli_device=args.device)
     device_global = DEVICE
 
     _log("Initializing inference server with API endpoint...")
@@ -580,7 +579,9 @@ if __name__ == "__main__":
 
     BASE_MODEL_NAME = model_cfg['name']
     prec = model_cfg.get('precision', 'fp32')
-    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    allow_half_on_mps = model_cfg.get('allow_half_on_mps', False)
+    precision_mgr = PrecisionManager(precision=prec, device=device_global, allow_half_on_mps=allow_half_on_mps)
+    dtype = precision_mgr.torch_dtype
     
     model_revision = model_cfg.get('revision') or (
         os.environ.get('INFINITUNE_MODEL_REVISION')

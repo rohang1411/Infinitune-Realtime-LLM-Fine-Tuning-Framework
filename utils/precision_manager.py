@@ -50,12 +50,14 @@ class PrecisionManager:
         enable_compile: bool = False,
         compile_mode: str = "max-autotune",
         dynamic_shapes: bool = True,
+        allow_half_on_mps: bool = False,
     ):
         self.device = device.lower()
         self.requested_precision = str(precision).lower().strip()
         self.enable_compile = bool(enable_compile)
         self.compile_mode = compile_mode
         self.dynamic_shapes = dynamic_shapes
+        self.allow_half_on_mps = bool(allow_half_on_mps)
 
         self.active_precision = self._resolve_active_precision()
         self.scaler: Optional[torch.cuda.amp.GradScaler] = None
@@ -71,8 +73,21 @@ class PrecisionManager:
         if self.requested_precision not in self.SUPPORTED_PRECISIONS:
             return "fp32"
 
-        if self.device != "cuda":
-            # Apple Silicon MPS and CPU default to FP32 for numerical stability
+        if self.device == "cpu":
+            return "fp32"
+
+        if self.device == "mps":
+            if not self.allow_half_on_mps:
+                return "fp32"
+            if self.requested_precision in ("bf16", "fp16"):
+                if self.requested_precision == "bf16":
+                    try:
+                        a = torch.ones((2, 2), dtype=torch.bfloat16, device="mps")
+                        _ = a @ a
+                        return "bf16"
+                    except Exception:
+                        return "fp16"
+                return "fp16"
             return "fp32"
 
         if self.requested_precision == "bf16":
@@ -98,6 +113,13 @@ class PrecisionManager:
         if self.device == "cuda" and self.active_precision in ("bf16", "fp16"):
             cast_dtype = torch.bfloat16 if self.active_precision == "bf16" else torch.float16
             with torch.autocast(device_type="cuda", dtype=cast_dtype):
+                yield
+        elif self.device == "mps" and self.active_precision in ("bf16", "fp16"):
+            try:
+                cast_dtype = torch.bfloat16 if self.active_precision == "bf16" else torch.float16
+                with torch.autocast(device_type="mps", dtype=cast_dtype):
+                    yield
+            except (RuntimeError, ValueError):
                 yield
         else:
             # No-op context on CPU or standard FP32

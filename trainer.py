@@ -691,7 +691,7 @@ def build_lr_scheduler(optimizer, config):
 # --------------------------------------------------
 # Manual training loop function
 # --------------------------------------------------
-def train_model(config, config_path: str = "(unknown)"):
+def train_model(config, config_path: str = "(unknown)", cli_device: Optional[str] = None):
     _log("Starting preparation for training")
 
     model_cfg = config['model']
@@ -735,19 +735,26 @@ def train_model(config, config_path: str = "(unknown)"):
         task_type=model_cfg.get('task_type', 'CAUSAL_LM'),
     )
 
-    # Choose device. (On macs using MPS or defaulting to CPU/GPU.)
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # Unified device resolution
+    from utils.device import resolve_device
+    device_str = resolve_device(config, cli_device=cli_device)
+    device = torch.device(device_str)
     _log(f"Selected device: {device}")
-    
+
     model_name = model_cfg['name']
     prec = model_cfg.get('precision', 'fp32')
-    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
-    
+    allow_half_on_mps = model_cfg.get('allow_half_on_mps', False)
+
+    precision_mgr = PrecisionManager(
+        precision=prec,
+        device=str(device),
+        enable_compile=training_cfg.get('enable_compile', False),
+        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
+        allow_half_on_mps=allow_half_on_mps,
+    )
+    dtype = precision_mgr.torch_dtype
+    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, dtype={dtype}, compile={precision_mgr.enable_compile}")
+
     model_revision = model_cfg.get('revision') or (
         os.environ.get('INFINITUNE_MODEL_REVISION')
         if os.environ.get('INFINITUNE_MODEL_NAME') == model_name else None)
@@ -761,14 +768,7 @@ def train_model(config, config_path: str = "(unknown)"):
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)
     # Ensure there is a pad token
     tokenizer.pad_token = tokenizer.eos_token
-    
-    precision_mgr = PrecisionManager(
-        precision=model_cfg.get('precision', 'fp32'),
-        device=str(device),
-        enable_compile=training_cfg.get('enable_compile', False),
-        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
-    )
-    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, compile={precision_mgr.enable_compile}")
+
     _log("Loaded model; applying PEFT and LoRA adapter configuration...")
 
     model = get_peft_model(model, lora_config)
@@ -1362,8 +1362,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Trainer")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                        help="Compute device (auto/cpu/cuda/mps/xpu)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
-    train_model(config, config_path=args.config)
+    train_model(config, config_path=args.config, cli_device=args.device)
