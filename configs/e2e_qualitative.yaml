@@ -75,6 +75,7 @@ kafka:
     - "localhost:9092"
   training_topic: "training-data-e2e"
   lora_updates_topic: "lora-updates-e2e"
+  integrity: "sha256"
   enable_lora_streaming: false
   producer_send_interval: 0.05
   consumer_group_trainer: "trainer-group-e2e"

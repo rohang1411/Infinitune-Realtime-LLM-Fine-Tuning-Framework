@@ -507,13 +507,19 @@ class StructuredSlotCoverageMetric(QualitativeMetric):
             "adults only", "adult only",
             "no children", "not child-friendly",
         ]
-        has_positive = any(p in text for p in positive_phrases)
-        has_negative = any(n in text for n in negative_phrases)
+        has_negative = False
+        remaining_text = text
+        for n in sorted(negative_phrases, key=len, reverse=True):
+            if n in remaining_text:
+                has_negative = True
+                remaining_text = remaining_text.replace(n, " __NEG__ ")
+
+        has_positive = any(p in remaining_text for p in positive_phrases)
 
         if slot_value.lower() == "yes":
             return has_positive and not has_negative
         else:  # 'no'
-            return has_negative or not has_positive
+            return has_negative and not has_positive
 
     def _is_valid_restaurant_description(self, name_value: str, text: str) -> bool:
         """Fluency gate to combat false positives in early hallucinations."""
@@ -910,6 +916,11 @@ class QualitativeEvaluator:
         self._consistency_runs: int = int(ts_cfg.get("consistency_runs", 1))
         self._consistency_temperature: float = float(ts_cfg.get("consistency_temperature", 0.7))
         self._eval_batch_size: int = int(ts_cfg.get("eval_batch_size", 16))
+        self._generation_mode: str = str(ts_cfg.get("generation_mode", "batched")).strip().lower()
+        if self._generation_mode not in ("batched", "sequential"):
+            raise ValueError(
+                f"Unknown testing_strategy.generation_mode: {self._generation_mode!r}. Must be 'batched' or 'sequential'"
+            )
 
         # --- Jinja2 templates (for prompt construction during generation) ---
         preproc = config.get("preprocessing", {})
@@ -917,6 +928,7 @@ class QualitativeEvaluator:
 
         # --- Load eval data pool ---
         self.eval_data: list = []
+        self._pinned_eval_data: list = []
         self._eval_cursor: int = 0
         self._load_eval_data(ts_cfg)
 
@@ -926,7 +938,6 @@ class QualitativeEvaluator:
             return
 
         # --- Load pinned anchor samples (structured_slot_coverage only) ---
-        self._pinned_eval_data: list = []
         e2e_opts = ts_cfg.get("e2e_nlg_options") or {}
         raw_anchors = e2e_opts.get("pinned_anchors") or []
         if raw_anchors and self._method == "structured_slot_coverage":
@@ -1128,6 +1139,70 @@ class QualitativeEvaluator:
             model.eval()
         return predictions, references
 
+    def _generate_responses_sequential(
+        self, model, window: list, do_sample: bool = False, temperature: float = 1.0, num_return_sequences: int = 1
+    ) -> tuple:
+        """
+        Generate model responses for the eval window sequentially (one sample at a time),
+        mirroring the pre-batching loop before commit ca90937.
+
+        Returns (predictions, references) as parallel lists.
+        """
+        was_training = model.training
+        model.eval()
+        predictions = []
+        references = []
+
+        gen_config_kwargs = {
+            "max_new_tokens": self._max_new_tokens,
+            "do_sample": do_sample,
+            "num_return_sequences": num_return_sequences,
+            "pad_token_id": self.tokenizer.eos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_config_kwargs["temperature"] = temperature
+
+        gen_config = GenerationConfig(**gen_config_kwargs)
+        max_seq_length = self.config.get("model", {}).get("max_seq_length", 512)
+
+        for i, sample in enumerate(window):
+            prompt_text = self._prompt_template.render(**sample)
+            references.append(sample.get("reference"))
+
+            try:
+                inputs = self.tokenizer(
+                    prompt_text,
+                    return_tensors="pt",
+                    max_length=max_seq_length,
+                    truncation=True,
+                ).to(self.device)
+
+                prompt_token_len = inputs["input_ids"].shape[1]
+
+                with torch.inference_mode():
+                    output_ids = model.generate(**inputs, generation_config=gen_config)
+
+                generated_ids = output_ids[:, prompt_token_len:]
+                responses = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                for response in responses:
+                    predictions.append(response.strip())
+
+                del inputs
+                del output_ids
+                del generated_ids
+
+            except Exception as exc:
+                _log(f"  Warning: sequential generation failed for eval sample {i}: {exc}")
+                for _ in range(num_return_sequences):
+                    predictions.append("")
+
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+        return predictions, references
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public Entry Point
     # ──────────────────────────────────────────────────────────────────────────
@@ -1153,26 +1228,27 @@ class QualitativeEvaluator:
 
         window = self._get_eval_window()
         inputs = [sample.get("input", "") for sample in window]
-        
+        gen_fn = self._generate_responses if self._generation_mode == "batched" else self._generate_responses_sequential
+
         # Generalized Consistency Generation (GPU Parallelized)
         if self._consistency_runs > 1:
-            _log(f"  Running GPU-parallel matrix generation: {self._consistency_runs} runs per sample (temp={self._consistency_temperature})")
-            
-            # Generate all sequences in a single, massively parallel GPU forward pass
-            flat_preds, references = self._generate_responses(
+            _log(f"  Running matrix generation: {self._consistency_runs} runs per sample (temp={self._consistency_temperature}, mode={self._generation_mode})")
+
+            # Generate all sequences via selected mode
+            flat_preds, references = gen_fn(
                 model, window, do_sample=True, temperature=self._consistency_temperature, num_return_sequences=self._consistency_runs
             )
-            
+
             # Reshape 1D flat tensor response back into 2D (window_size x consistency_runs)
             predictions_matrix = []
             for i in range(len(window)):
                 start_idx = i * self._consistency_runs
                 end_idx = start_idx + self._consistency_runs
                 predictions_matrix.append(flat_preds[start_idx:end_idx])
-                
+
             predictions = [runs[0] for runs in predictions_matrix if runs]  # first run for universal metrics
         else:
-            predictions, references = self._generate_responses(model, window, do_sample=False)
+            predictions, references = gen_fn(model, window, do_sample=False)
             predictions_matrix = None
 
         if not any(p.strip() for p in predictions):
@@ -1195,7 +1271,7 @@ class QualitativeEvaluator:
                 _log(f"  Running pinned anchor generation: {len(self._pinned_eval_data)} anchors × {self._consistency_runs} runs")
                 pinned_matrix = [[] for _ in range(len(self._pinned_eval_data))]
                 for _ in range(self._consistency_runs):
-                    preds, _ = self._generate_responses(
+                    preds, _ = gen_fn(
                         model, self._pinned_eval_data,
                         do_sample=True, temperature=self._consistency_temperature
                     )

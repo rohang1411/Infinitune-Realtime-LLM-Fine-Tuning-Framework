@@ -318,6 +318,9 @@ class CheckpointManager:
         # --- Write checkpoint_meta.json ---
         meta = {
             "step": step,
+            "seq": step if isinstance(step, int) else (self._config.get("training", {}).get("max_steps", 0) if step == "final" else 0),
+            "run_id": self._run_dir,
+            "created_at": time.time(),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "model_name": self._model_name,
             "dataset_name": self._dataset_name,
@@ -346,13 +349,25 @@ class CheckpointManager:
             except Exception as exc:
                 _log(f"Warning: Could not write config_snapshot.yaml: {exc}")
 
+        # Write COMMITTED marker last to signal atomic completion to external watchers
+        committed_marker_path = os.path.join(save_path, "COMMITTED")
+        try:
+            with open(committed_marker_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": step,
+                    "run_id": self._run_dir,
+                    "committed_at": time.time(),
+                }) + "\n")
+        except Exception as exc:
+            _log(f"Warning: Could not write COMMITTED marker: {exc}")
+
         step_label = f"step {step}" if step != "final" else "final"
         _log(f"Checkpoint saved [{step_label}] -> {save_path} (run: {self._run_dir})")
         return save_path
 
     # -----------------------------------------------------------------------
 
-    def list_checkpoints(self) -> list:
+    def list_checkpoints(self, run_name: Optional[str] = None) -> list:
         """
         Return a sorted list of available checkpoints across ALL runs.
 
@@ -410,6 +425,7 @@ class CheckpointManager:
                 "step":      step_val,
                 "path":      path,
                 "run":       run_name,
+                "run_name":  run_name,
                 "timestamp": timestamp,
             })
 
@@ -427,13 +443,42 @@ class CheckpointManager:
                 # Legacy flat layout: step dirs directly under checkpoint_root
                 _load_step_dir(entry.path, name, run_name=None)
 
-        # Sort: numbered steps ascending, then "final" last
+        # Sort: by run first, then by step within the run.
+        # Run directory names are formatted as run_YYYYmmdd-HHMMSS_<uid4>,
+        # so lexicographical sorting of run strings sorts by time. Legacy flat layout has run=None ("") sorting first.
         def sort_key(c):
+            run = c.get("run_name") or ""          # legacy flat layout sorts first
             s = c["step"]
-            return (1, 0) if s == "final" else (0, s)
+            return (run, 1, 0) if s == "final" else (run, 0, s)
 
         checkpoints.sort(key=sort_key)
+        if run_name is not None:
+            checkpoints = [c for c in checkpoints if c.get("run_name") == run_name or c.get("run") == run_name]
         return checkpoints
+
+    def list_runs(self) -> list[str]:
+        """Return the sorted list of run directory names found under checkpoint_root."""
+        runs = set()
+        if os.path.exists(self.checkpoint_root):
+            for entry in os.scandir(self.checkpoint_root):
+                if entry.is_dir() and entry.name.startswith("run_"):
+                    runs.add(entry.name)
+        return sorted(runs)
+
+    def latest_checkpoint(self) -> Optional[dict]:
+        """Return the final of the newest run if that exists,
+        otherwise the highest step of the newest run that has any checkpoint,
+        otherwise None.
+        """
+        ckpts = self.list_checkpoints()
+        if not ckpts:
+            return None
+        newest_run = ckpts[-1].get("run_name")
+        newest_run_ckpts = [c for c in ckpts if c.get("run_name") == newest_run]
+        finals = [c for c in newest_run_ckpts if c["step"] == "final"]
+        if finals:
+            return finals[-1]
+        return newest_run_ckpts[-1]
 
     # -----------------------------------------------------------------------
 
@@ -445,7 +490,7 @@ class CheckpointManager:
         """
         return os.path.join(self._run_path, _step_dir_name(step))
 
-    def resolve_checkpoint_path(self, step) -> Optional[str]:
+    def resolve_checkpoint_path(self, step, run_name: Optional[str] = None) -> Optional[str]:
         """Resolve a checkpoint path by scanning all runs for a given step.
 
         Returns the path from the most-recent run that contains the step,
@@ -454,11 +499,11 @@ class CheckpointManager:
         """
         normalized_step = _normalize_step_value(step)
         target = _step_dir_name(normalized_step)
-        # list_checkpoints() is already sorted ascending by step then by run;
+        # list_checkpoints() is sorted ascending by run then by step within the run;
         # we want the latest run, so collect all matches and return the last.
         matches = [
             c["path"]
-            for c in self.list_checkpoints()
+            for c in self.list_checkpoints(run_name=run_name)
             if c["step"] == normalized_step
         ]
         return matches[-1] if matches else None
@@ -508,13 +553,38 @@ class CheckpointManager:
                 device = "cpu"
         _log(f"Loading base model '{model_name}' on device '{device}'...")
 
+        # --- Resolve precision & revision ---
+        model_cfg = self._config.get("model", {})
+        prec = model_cfg.get("precision", "fp32")
+        dtype_map = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        target_dtype = dtype_map.get(prec, torch.float32)
+        model_revision = model_cfg.get("revision")
+
+        load_kwargs = {
+            "torch_dtype": target_dtype,
+        }
+        if model_revision:
+            load_kwargs["revision"] = model_revision
+        if device == "cuda":
+            load_kwargs["device_map"] = "auto"
+
         # --- Load base model ---
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
+            **load_kwargs,
+
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if device != "cuda":
+            base_model = base_model.to(device)
+
+        tok_kwargs = {}
+        if model_revision:
+            tok_kwargs["revision"] = model_revision
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
         tokenizer.pad_token = tokenizer.eos_token
 
         # --- Attach LoRA adapter ---

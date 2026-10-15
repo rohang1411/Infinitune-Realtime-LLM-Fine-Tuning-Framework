@@ -6,12 +6,15 @@ import torch
 import threading
 import queue
 import os
+from collections import deque
 import traceback
 import yaml
 from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
 from utils.serving_router import DoubleBufferedAdapterRouter
-from utils.stream_protocol import SnapshotAssembler
+from utils.stream_protocol import SnapshotAssembler, deserialize_tensor, classify_rejection_reason
+from utils.serving_policy import should_listen_for_updates
+from utils.kafka_config import build_client_kwargs, redact_client_kwargs
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -62,8 +65,136 @@ def deserialize_tensor(value_bytes):
 # Kafka Consumer Thread
 # --------------------------------------------------
 _DONE_SENTINEL = ("__done__", None)
-stream_state_global = {"enabled": False, "consumer_ready": False,
-                       "consumer_error": None, "applier_error": None}
+stream_state_global = {
+    "enabled": False,
+    "consumer_ready": False,
+    "consumer_error": None,
+    "applier_error": None,
+    "counters": {
+        "rejected_frames": 0,
+        "rejected_by_reason": {},
+    },
+}
+initial_active_global = None
+adapter_history_global = deque(maxlen=200)
+
+
+def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional[tuple]:
+    """Return (step, batch) on a validated commit, else None. Never raises."""
+    try:
+        if not key or raw_value is None:
+            raise ValueError(f"Missing key or raw_value (key={key!r}, value_is_none={raw_value is None})")
+        return assembler.add(key, raw_value)
+    except Exception as exc:
+        if counters is not None:
+            counters["rejected_frames"] = counters.get("rejected_frames", 0) + 1
+            by_reason = counters.setdefault("rejected_by_reason", {})
+            reason_name = type(exc).__name__
+            by_reason[reason_name] = by_reason.get(reason_name, 0) + 1
+            granular = classify_rejection_reason(exc)
+            if granular and granular != reason_name:
+                by_reason[granular] = by_reason.get(granular, 0) + 1
+        msg = f"REJECTED adapter frame key={key!r} reason={type(exc).__name__}: {exc}"
+        if len(msg) > 300:
+            msg = msg[:300]
+        _log(msg)
+        return None
+
+
+def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0, stop_event=None, applied_set=None):
+    """
+    Mode C checkpoint watcher for split deployment (e.g. Colab Drive sync).
+    Watches watch_dir for subdirectories containing a COMMITTED marker file.
+    Validates manifest, loads weights, and swaps adapter through router.
+    Persists applied checkpoint directory names in applied_checkpoints.json.
+    """
+    from pathlib import Path
+    watch_path = Path(watch_dir)
+    state_file = watch_path / "applied_checkpoints.json"
+    applied_dirs = applied_set if applied_set is not None else set()
+    if state_file.is_file():
+        try:
+            stored = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(stored, list):
+                applied_dirs.update(stored)
+        except Exception:
+            pass
+
+    def _persist_state():
+        try:
+            state_file.write_text(json.dumps(sorted(applied_dirs), indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    _log(f"Checkpoint watcher started on directory: {watch_path}")
+    while True:
+        try:
+            if watch_path.is_dir():
+                for sub in sorted(watch_path.iterdir()):
+                    if not sub.is_dir() or sub.name in applied_dirs:
+                        continue
+                    marker = sub / "COMMITTED"
+                    if not marker.exists():
+                        continue
+                    manifest_file = sub / "manifest.json"
+                    weights_file = sub / "adapter_model.safetensors"
+                    if not weights_file.exists():
+                        weights_file = sub / "adapter_model.bin"
+                    if not weights_file.exists():
+                        continue
+
+                    # Verify manifest if present
+                    if manifest_file.exists():
+                        try:
+                            from utils.adapter_manifest import AdapterManifest
+                            manifest = AdapterManifest.from_file(str(manifest_file))
+                            if not manifest.verify_artifact():
+                                _log(f"REJECTED committed checkpoint '{sub.name}': checksum mismatch")
+                                applied_dirs.add(sub.name)
+                                _persist_state()
+                                continue
+                            swap_ms = router.swap_from_manifest(manifest)
+                            _log(f"Applied committed checkpoint '{sub.name}' from manifest in {swap_ms:.2f} ms")
+                            applied_dirs.add(sub.name)
+                            _persist_state()
+                            continue
+                        except Exception as m_exc:
+                            _log(f"REJECTED committed checkpoint '{sub.name}': {m_exc}")
+                            applied_dirs.add(sub.name)
+                            _persist_state()
+                            continue
+
+                    # Fallback for standard checkpoints without manifest.json
+                    try:
+                        from safetensors.torch import load_file
+                        state_dict = load_file(str(weights_file)) if str(weights_file).endswith(".safetensors") else torch.load(str(weights_file), map_location="cpu", weights_only=True)
+                        meta_file = sub / "checkpoint_meta.json"
+                        c_run = "drive_sync"
+                        c_seq = 0
+                        if meta_file.exists():
+                            with meta_file.open("r", encoding="utf-8") as mf:
+                                meta = json.load(mf)
+                            c_run = meta.get("run_id", c_run)
+                            c_seq = meta.get("seq", meta.get("step", 0))
+                        swap_ms = router.swap_weights(state_dict, version_tag=sub.name, run_id=c_run, seq=c_seq)
+                        _log(f"Applied committed checkpoint '{sub.name}' in {swap_ms:.2f} ms")
+                        applied_dirs.add(sub.name)
+                        _persist_state()
+                    except Exception as s_exc:
+                        _log(f"REJECTED committed checkpoint '{sub.name}': {s_exc}")
+                        applied_dirs.add(sub.name)
+                        _persist_state()
+        except Exception as exc:
+            _log(f"Error in checkpoint watcher: {exc}")
+        if stop_event is not None:
+            if stop_event.is_set():
+                break
+            stop_event.wait(poll_interval)
+            if stop_event.is_set():
+                break
+        else:
+            time.sleep(poll_interval)
+
 
 def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
@@ -77,15 +208,15 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     try:
         consumer_timeout_ms = int(kafka_cfg.get('consumer_timeout_ms', 1000))
         poll_timeout_ms = int(kafka_cfg.get('poll_timeout_ms', 1000))
-        _log(f"Connecting KafkaConsumer: bootstrap_servers={kafka_cfg['bootstrap_servers']}, group_id='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}', consumer_timeout_ms={consumer_timeout_ms}, poll_timeout_ms={poll_timeout_ms}")
+        consumer_kwargs = build_client_kwargs(kafka_cfg, "consumer")
+        _log(f"Connecting KafkaConsumer: kwargs={redact_client_kwargs(consumer_kwargs)}, group_id='{kafka_cfg.get('consumer_group_inference', 'inference-api-group')}', consumer_timeout_ms={consumer_timeout_ms}, poll_timeout_ms={poll_timeout_ms}")
         consumer = KafkaConsumer(
             topic,
-            bootstrap_servers=kafka_cfg['bootstrap_servers'],
             key_deserializer=lambda k: k.decode("utf-8") if k else None,
-            value_deserializer=deserialize_tensor,
             group_id=kafka_cfg.get('consumer_group_inference', 'inference-api-group'),
             auto_offset_reset="latest",
-            consumer_timeout_ms=consumer_timeout_ms
+            consumer_timeout_ms=consumer_timeout_ms,
+            **consumer_kwargs,
         )
         # A producer can publish only after this marker: `latest` offset is
         # established once the consumer has joined and received assignment.
@@ -100,7 +231,10 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
         received_count = 0
         last_heartbeat_time = time.time()
         heartbeat_every_s = 5.0
-        assembler = SnapshotAssembler()
+        assembler = SnapshotAssembler(
+            integrity=kafka_cfg.get("integrity", "sha256"),
+            initial_active=initial_active_global,
+        )
 
         while True:
             messages = consumer.poll(timeout_ms=poll_timeout_ms)
@@ -122,18 +256,17 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                         done = True
                         break
 
-                    if not key or val is None:
-                        continue
-
-                    try:
-                        complete = assembler.add(key, val)
-                    except (ValueError, TypeError) as exc:
-                        _log(f"REJECTED adapter message key={key!r}: {exc}")
-                        continue
+                    complete = process_adapter_record(
+                        assembler,
+                        key,
+                        val,
+                        counters=stream_state_global.get("counters"),
+                    )
                     if complete is not None:
+                        t_assembled = time.time()
                         step_id, batch = complete
                         received_count += 1
-                        update_queue.put((step_id, batch))
+                        update_queue.put((step_id, batch, getattr(assembler, "active", None), t_assembled))
                         _log(f"Committed complete adapter step {step_id}: tensors={len(batch)}")
                 if done:
                     break
@@ -173,7 +306,25 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log("Weight application thread received done signal. Stopping.")
                 break
 
-            step_or_layer, tensor_or_dict = item
+            active_run_id = None
+            active_seq = None
+            t_publish_start = None
+            t_assembled = None
+            if len(item) == 4:
+                step_or_layer, tensor_or_dict, active_meta, t_assembled = item
+                if active_meta:
+                    active_run_id, active_seq = active_meta[0], active_meta[1]
+                    if len(active_meta) >= 3:
+                        t_publish_start = float(active_meta[2])
+            elif len(item) == 3:
+                step_or_layer, tensor_or_dict, active_meta = item
+                if active_meta:
+                    active_run_id, active_seq = active_meta[0], active_meta[1]
+                    if len(active_meta) >= 3:
+                        t_publish_start = float(active_meta[2])
+            else:
+                step_or_layer, tensor_or_dict = item
+
             if isinstance(tensor_or_dict, dict):
                 # Complete atomic snapshot delivered via commit marker (prevents torn updates)
                 updates_to_apply = tensor_or_dict
@@ -184,10 +335,24 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        n_step, n_val = next_item
+                        if len(next_item) == 4:
+                            n_step, n_val, n_meta, n_tassembled = next_item
+                        elif len(next_item) == 3:
+                            n_step, n_val, n_meta = next_item
+                            n_tassembled = None
+                        else:
+                            n_step, n_val = next_item
+                            n_meta = None
+                            n_tassembled = None
                         if isinstance(n_val, dict):
                             updates_to_apply = n_val
                             version_tag = f"step_{n_step}"
+                            if n_meta:
+                                active_run_id, active_seq = n_meta[0], n_meta[1]
+                                if len(n_meta) >= 3:
+                                    t_publish_start = float(n_meta[2])
+                            if n_tassembled:
+                                t_assembled = n_tassembled
                         else:
                             updates_to_apply[n_step] = n_val
                     except queue.Empty:
@@ -202,7 +367,12 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        name, t = next_item
+                        if len(next_item) == 4:
+                            name, t, _, _ = next_item
+                        elif len(next_item) == 3:
+                            name, t, _ = next_item
+                        else:
+                            name, t = next_item
                         if isinstance(t, dict):
                             updates_to_apply = t
                             version_tag = f"step_{name}"
@@ -215,7 +385,12 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
                 global active_version_global
                 if serving_mode_global == "router" and router_global is not None:
-                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=version_tag)
+                    swap_ms = router_global.swap_weights(
+                        updates_to_apply,
+                        version_tag=version_tag,
+                        run_id=active_run_id,
+                        seq=active_seq,
+                    )
                     active_version_global = version_tag
                     applied_batches += 1
                     _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
@@ -230,6 +405,16 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                     swap_ms = (time.perf_counter() - swap_start) * 1000.0
                     applied_batches += 1
                     _log(f"Weight updates applied via legacy model_lock in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
+
+                t_applied = time.time()
+                adapter_history_global.append({
+                    "version": version_tag,
+                    "run_id": active_run_id,
+                    "seq": active_seq,
+                    "t_publish_start": t_publish_start,
+                    "t_assembled": t_assembled,
+                    "t_applied": t_applied,
+                })
 
             # If we hit the sentinel inside the drain loop, stop after this apply
             if item == _DONE_SENTINEL:
@@ -355,7 +540,46 @@ def get_metrics():
     """Returns real-time serving SLAs, latency percentiles, and hot-swap telemetry."""
     if router_global is not None:
         return jsonify({**router_global.get_metrics(), "stream": stream_state_global}), 200
-    return jsonify({"status": "router_not_initialized"}), 200
+    return jsonify({"status": "router_not_initialized", "stream": stream_state_global}), 200
+
+@app.route('/adapter', methods=['GET'])
+def get_adapter():
+    """Returns cryptographic state digest of the active adapter and verification status."""
+    if router_global is not None:
+        live_digest = router_global.adapter_state_digest()
+        expected = router_global.expected_state_sha256
+        match = bool(live_digest and expected and live_digest == expected)
+        return jsonify({
+            "active_version": router_global.active_version,
+            "run_id": router_global.active_run_id,
+            "seq": router_global.active_seq,
+            "adapter_state_sha256": live_digest,
+            "expected_state_sha256": expected,
+            "match": match,
+        }), 200
+
+    run_id = initial_active_global[0] if initial_active_global else None
+    seq = initial_active_global[1] if initial_active_global else None
+    return jsonify({
+        "active_version": active_version_global,
+        "run_id": run_id,
+        "seq": seq,
+        "adapter_state_sha256": None,
+        "expected_state_sha256": None,
+        "match": False,
+    }), 200
+
+@app.route('/adapter/history', methods=['GET'])
+def get_adapter_history():
+    """Returns bounded dictionary/list of applied adapter versions and latency timestamps."""
+    hist_list = list(adapter_history_global)
+    hist_dict = {entry["version"]: entry for entry in hist_list}
+    return jsonify({
+        "history": hist_list,
+        "versions": hist_dict,
+        **hist_dict,
+    }), 200
+
 
 # --------------------------------------------------
 # Main Execution Block
@@ -368,11 +592,21 @@ if __name__ == "__main__":
                         help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
     parser.add_argument("--listen-updates", action="store_true",
                         help="Continue consuming Kafka adapter snapshots after loading a checkpoint")
+    parser.add_argument("--no-listen-updates", action="store_true",
+                        help="Disable consuming Kafka adapter snapshots even if auto-loading checkpoints")
     parser.add_argument("--serving-mode", type=str, choices=["router", "legacy_lock"], default="router",
                         help="Serving mode: 'router' uses DoubleBufferedAdapterRouter with ReadWriteLock; 'legacy_lock' uses global mutex")
     parser.add_argument("--port", type=int, default=8000,
                         help="Port to bind the Flask HTTP server to (default: 8000)")
+    parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                        help="Device to serve on (auto/cpu/cuda/mps/xpu)")
+    parser.add_argument("--watch-checkpoints", type=str, default=None,
+                        help="Directory to watch for committed adapter checkpoints (Mode C Drive sync)")
+    parser.add_argument("--watch-poll-seconds", type=float, default=2.0,
+                        help="Polling interval in seconds for --watch-checkpoints (default: 2.0)")
     args = parser.parse_args()
+    if args.listen_updates and args.no_listen_updates:
+        parser.error("Cannot specify both --listen-updates and --no-listen-updates.")
 
     config = load_config(args.config)
     config_global = config
@@ -382,18 +616,21 @@ if __name__ == "__main__":
 
     # Resolve checkpoint path if provided
     resolved_checkpoint_path = None
+    checkpoint_source = None
     ckpt_mgr = CheckpointManager(config)
     if args.checkpoint:
+        checkpoint_source = "explicit"
         if os.path.isdir(args.checkpoint):
             resolved_checkpoint_path = args.checkpoint
         else:
             if args.checkpoint.lower() == "latest":
-                ckpts = ckpt_mgr.list_checkpoints()
-                if not ckpts:
+                latest_ckpt = ckpt_mgr.latest_checkpoint()
+                if not latest_ckpt:
                     _log("Warning: '--checkpoint latest' requested but no checkpoints found. Falling back to base model with empty LoRA adapter.")
                     resolved_checkpoint_path = None
+                    checkpoint_source = None
                 else:
-                    resolved_checkpoint_path = ckpts[-1]["path"]
+                    resolved_checkpoint_path = latest_ckpt["path"]
                     _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
             else:
                 candidate_path = ckpt_mgr.resolve_checkpoint_path(args.checkpoint)
@@ -406,9 +643,10 @@ if __name__ == "__main__":
     elif config.get('inference', {}).get('auto_load_latest_checkpoint', True):
         # Cold-start resilience: Auto-load latest saved checkpoint to avoid serving stale base weights
         try:
-            ckpts = ckpt_mgr.list_checkpoints()
-            if ckpts:
-                resolved_checkpoint_path = ckpts[-1]["path"]
+            latest_ckpt = ckpt_mgr.latest_checkpoint()
+            if latest_ckpt:
+                resolved_checkpoint_path = latest_ckpt["path"]
+                checkpoint_source = "auto"
                 _log(f"Cold-start recovery: Discovered existing latest checkpoint on disk: {resolved_checkpoint_path}")
         except Exception as e:
             _log(f"Cold-start checkpoint check skipped: {e}")
@@ -429,12 +667,9 @@ if __name__ == "__main__":
     )
 
     # Determine device
-    if torch.cuda.is_available():
-        DEVICE = "cuda"
-    elif torch.backends.mps.is_available():
-        DEVICE = "mps"
-    else:
-        DEVICE = "cpu"
+    from utils.device import resolve_device
+    from utils.precision_manager import PrecisionManager
+    DEVICE = resolve_device(config, cli_device=args.device)
     device_global = DEVICE
 
     _log("Initializing inference server with API endpoint...")
@@ -443,7 +678,9 @@ if __name__ == "__main__":
 
     BASE_MODEL_NAME = model_cfg['name']
     prec = model_cfg.get('precision', 'fp32')
-    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
+    allow_half_on_mps = model_cfg.get('allow_half_on_mps', False)
+    precision_mgr = PrecisionManager(precision=prec, device=device_global, allow_half_on_mps=allow_half_on_mps)
+    dtype = precision_mgr.torch_dtype
     
     model_revision = model_cfg.get('revision') or (
         os.environ.get('INFINITUNE_MODEL_REVISION')
@@ -489,13 +726,51 @@ if __name__ == "__main__":
     router_global = DoubleBufferedAdapterRouter(model, tokenizer, device=device_global)
     if resolved_checkpoint_path:
         router_global.active_version = os.path.basename(resolved_checkpoint_path)
+        c_run = os.path.basename(os.path.dirname(resolved_checkpoint_path))
+        c_seq = None
+        base_name = os.path.basename(resolved_checkpoint_path)
+        if base_name.startswith("step_"):
+            try:
+                c_seq = int(base_name.split("_", 1)[1])
+            except ValueError:
+                c_seq = None
+        c_created = None
+        meta_file = os.path.join(resolved_checkpoint_path, "checkpoint_meta.json")
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, encoding="utf-8") as f:
+                    c_meta = json.load(f)
+                if c_meta.get("run_id"):
+                    c_run = c_meta.get("run_id")
+                if c_meta.get("seq") is not None:
+                    c_seq = c_meta.get("seq")
+                elif c_meta.get("step") is not None:
+                    c_seq = c_meta.get("step")
+                c_created = c_meta.get("created_at")
+            except Exception as e:
+                _log(f"Cold-start active metadata read skipped: {e}")
+        if c_run and c_seq is not None:
+            c_created = c_created or time.time()
+            initial_active_global = (str(c_run), int(c_seq), float(c_created))
+            router_global.active_run_id = str(c_run)
+            router_global.active_seq = int(c_seq)
+            _log(f"Initialized active version from cold start: {initial_active_global}")
+        try:
+            router_global.expected_state_sha256 = router_global.adapter_state_digest()
+        except Exception as e:
+            _log(f"Cold-start adapter digest computation skipped: {e}")
     _log("Adapter router initialized with single-model read/write locking.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
-    #    We skip this entirely if a standalone checkpoint was provided and resolved.
-    if resolved_checkpoint_path and not args.listen_updates:
-        _log("Standalone mode (checkpoint provided). Skipping Kafka consumer threads.")
+    listen_updates = should_listen_for_updates(
+        checkpoint_source=checkpoint_source,
+        listen_flag=args.listen_updates,
+        no_listen_flag=args.no_listen_updates,
+    )
+    if not listen_updates:
+        _log(f"Kafka update listener disabled (checkpoint_source='{checkpoint_source}'). Skipping Kafka consumer threads.")
     else:
+        _log(f"Kafka update listener enabled (checkpoint_source='{checkpoint_source}'). Starting Kafka consumer and applier threads.")
         stream_state_global["enabled"] = True
         consumer_thread = threading.Thread(
             target=kafka_consumer_thread,
@@ -509,6 +784,15 @@ if __name__ == "__main__":
         )
         consumer_thread.start()
         applier_thread.start()
+
+    if args.watch_checkpoints:
+        _log(f"Starting checkpoint watcher thread on: '{args.watch_checkpoints}' (poll: {args.watch_poll_seconds}s)")
+        watcher_thread = threading.Thread(
+            target=checkpoint_watcher_thread,
+            args=(args.watch_checkpoints, router_global, args.watch_poll_seconds),
+            daemon=True
+        )
+        watcher_thread.start()
 
     FLASK_HOST = inference_cfg.get('host', '0.0.0.0')
     FLASK_PORT = args.port or inference_cfg.get('port', 8000)

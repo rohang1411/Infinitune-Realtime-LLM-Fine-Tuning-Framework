@@ -91,6 +91,7 @@ kafka:
     - "localhost:9092"
   training_topic: "training-data-qual-reasoning"
   lora_updates_topic: "lora-updates-qual-reasoning"
+  integrity: "sha256"
   enable_lora_streaming: false # If false, trainer will NOT broadcast weights to inference.py
   producer_send_interval: 0.1
   consumer_group_trainer: "trainer-group"
@@ -136,6 +137,7 @@ evaluation:
   eval_pool_size: 200          # total eval samples loaded from GSM8k test (1319 total)
   eval_batch_size: 20          # samples evaluated per sliding window
   answer_regex: "#### (\\d+)"  # Extracts final numeric answer from GSM8K format
+  answer_normalizer: "numeric" # canonicalizes numbers (commas, decimals, negatives) via Decimal.normalize()
   metrics:
     compute_loss: true
     compute_accuracy: true

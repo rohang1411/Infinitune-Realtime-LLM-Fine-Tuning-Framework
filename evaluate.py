@@ -44,6 +44,10 @@ import os
 import sys
 import time
 import uuid
+import signal
+import statistics
+from pathlib import Path
+from typing import Optional
 
 import torch
 import yaml
@@ -73,12 +77,10 @@ def load_config(path: str) -> dict:
 # Device detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+def _get_device(device_str: str = "auto", config: Optional[dict] = None) -> torch.device:
+    from utils.device import resolve_device
+    dev = resolve_device(config=config, cli_device=device_str)
+    return torch.device(dev)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +199,7 @@ def run_evaluation(
     evaluator_bundle: dict | None = None,
     run_quantitative: bool = True,
     run_qualitative: bool = True,
+    step: int = 0,
 ) -> dict:
     """
     Run the enabled evaluation suite for one checkpoint and return a flat dict
@@ -229,7 +232,7 @@ def run_evaluation(
             if evaluator.enabled and evaluator.eval_data:
                 pool_size = len(evaluator.eval_data)
                 evaluator.eval_batch_size = pool_size
-                quant_metrics = evaluator.evaluate(model, step=0) or {}
+                quant_metrics = evaluator.evaluate(model, step=step) or {}
                 combined_metrics.update(quant_metrics)
                 _log(f"Quantitative metrics: {list(quant_metrics.keys())}")
             else:
@@ -256,7 +259,7 @@ def run_evaluation(
                 qual_eval.device = device
             if qual_eval.enabled and qual_eval.eval_data:
                 qual_eval._eval_samples = len(qual_eval.eval_data)
-                qual_metrics = qual_eval.run(model, step=0) or {}
+                qual_metrics = qual_eval.run(model, step=step) or {}
                 combined_metrics.update(qual_metrics)
                 _log(f"Qualitative metrics: {list(qual_metrics.keys())}")
             else:
@@ -283,11 +286,14 @@ def evaluate_checkpoint(
     evaluator_bundle: dict | None = None,
     run_quantitative: bool = True,
     run_qualitative: bool = True,
+    step: int = 0,
+    device: torch.device | None = None,
 ) -> dict:
     """Load a checkpoint and run evaluation. Returns the combined metrics dict."""
     from utils.checkpoint_manager import CheckpointManager
 
-    device = _get_device()
+    if device is None:
+        device = _get_device()
     _log(f"Device: {device}")
 
     ckpt_manager = CheckpointManager(config, config_path=config_file)
@@ -303,6 +309,8 @@ def evaluate_checkpoint(
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
         model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     else:
         _log(f"Loading checkpoint: {ckpt_path}")
         model, tokenizer = ckpt_manager.load(ckpt_path, device=str(device))
@@ -315,6 +323,7 @@ def evaluate_checkpoint(
         evaluator_bundle=evaluator_bundle,
         run_quantitative=run_quantitative,
         run_qualitative=run_qualitative,
+        step=step,
     )
 
     # Free GPU/MPS memory
@@ -323,6 +332,232 @@ def evaluate_checkpoint(
         torch.cuda.empty_cache()
 
     return metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Offline Checkpoint Auditing Watch Service
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_checkpoint_complete(ckpt_dir: Path | str) -> bool:
+    """Check if checkpoint directory has valid checkpoint_meta.json and adapter weights file."""
+    p = Path(ckpt_dir)
+    if not p.is_dir():
+        return False
+    meta_path = p / "checkpoint_meta.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return False
+    except Exception:
+        return False
+
+    weights_exist = (
+        (p / "adapter_model.safetensors").is_file() or
+        (p / "adapter_model.bin").is_file()
+    )
+    return weights_exist
+
+
+def compute_watch_summary(eval_records: list) -> dict:
+    """Compute summary statistics (p50, p95, mean) for watch evaluation metrics."""
+    if not eval_records:
+        return {
+            "queue_delay_p50": 0.0,
+            "queue_delay_p95": 0.0,
+            "queue_delay_mean": 0.0,
+            "eval_latency_p50": 0.0,
+            "eval_latency_p95": 0.0,
+            "eval_latency_mean": 0.0,
+            "evaluated_count": 0,
+        }
+    q_delays = sorted(r["queue_delay_s"] for r in eval_records)
+    latencies = sorted(r["eval_latency_s"] for r in eval_records)
+
+    def _perc(vals, q):
+        if not vals:
+            return 0.0
+        from utils.serving_router import nearest_rank_percentile
+        return nearest_rank_percentile(vals, q)
+
+    return {
+        "queue_delay_p50": round(_perc(q_delays, 0.50), 4),
+        "queue_delay_p95": round(_perc(q_delays, 0.95), 4),
+        "queue_delay_mean": round(statistics.mean(q_delays), 4),
+        "eval_latency_p50": round(_perc(latencies, 0.50), 4),
+        "eval_latency_p95": round(_perc(latencies, 0.95), 4),
+        "eval_latency_mean": round(statistics.mean(latencies), 4),
+        "evaluated_count": len(eval_records),
+    }
+
+
+def run_watch_mode(
+    config: dict,
+    config_path: str,
+    run_name: Optional[str] = None,
+    poll_seconds: float = 15.0,
+    max_iterations: Optional[int] = None,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """
+    Offline checkpoint auditing service (evaluate.py --watch).
+    Polls checkpoint root and evaluates each new complete checkpoint once.
+    Persists evaluation progress in eval_watch_state.json and metrics in watch_metrics.json.
+    """
+    from utils.checkpoint_manager import CheckpointManager
+
+    output_dir = Path(config.get("project", {}).get("output_dir", "./output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_file = output_dir / "eval_watch_state.json"
+    metrics_file = output_dir / "watch_metrics.json"
+
+    done_checkpoints = set()
+    runs_state = {}
+    if state_file.exists():
+        try:
+            sdata = json.loads(state_file.read_text(encoding="utf-8"))
+            done_checkpoints = set(sdata.get("done_checkpoints", []))
+            runs_state = sdata.get("runs", {})
+            _log(f"[WATCH] Resumed state from {state_file}: {len(done_checkpoints)} checkpoint(s) already done.")
+        except Exception as exc:
+            _log(f"[WATCH] Warning: failed reading state file {state_file}: {exc}")
+
+    eval_records = []
+    if metrics_file.exists():
+        try:
+            mdata = json.loads(metrics_file.read_text(encoding="utf-8"))
+            eval_records = mdata.get("checkpoints", [])
+        except Exception:
+            pass
+
+    stop_requested = False
+    original_sigint = None
+
+    def sigint_handler(signum, frame):
+        nonlocal stop_requested
+        _log("[WATCH] SIGINT received: finishing current checkpoint and stopping cleanly...")
+        stop_requested = True
+
+    try:
+        original_sigint = signal.signal(signal.SIGINT, sigint_handler)
+    except (ValueError, AttributeError):
+        pass
+
+    iteration = 0
+    ckpt_manager = CheckpointManager(config, config_path=config_path)
+    evaluator_bundle = {}
+    max_steps = int(config.get("training", {}).get("max_steps", 1000))
+    target_device = device or _get_device("auto")
+
+    try:
+        while not stop_requested:
+            iteration += 1
+            runs = ckpt_manager.list_runs()
+            if run_name and run_name != "latest":
+                target_run = run_name
+            else:
+                target_run = runs[0] if runs else None
+
+            if target_run:
+                available = ckpt_manager.list_checkpoints(run_name=target_run)
+                for ckpt in available:
+                    if stop_requested:
+                        break
+
+                    ckpt_path = Path(ckpt["path"])
+                    ckpt_key = str(ckpt_path.resolve())
+                    if ckpt_key in done_checkpoints or ckpt["name"] in done_checkpoints:
+                        continue
+
+                    if not is_checkpoint_complete(ckpt_path):
+                        _log(f"[WATCH] Skipping incomplete checkpoint '{ckpt['name']}' until metadata and weights exist.")
+                        continue
+
+                    meta_file = ckpt_path / "checkpoint_meta.json"
+                    mtime = meta_file.stat().st_mtime
+                    eval_start = time.time()
+                    queue_delay_s = max(0.0, eval_start - mtime)
+
+                    raw_step = ckpt.get("step")
+                    if raw_step == "final" or str(raw_step).lower() == "final":
+                        eval_step = max_steps
+                    elif isinstance(raw_step, int):
+                        eval_step = raw_step
+                    elif isinstance(raw_step, str) and raw_step.isdigit():
+                        eval_step = int(raw_step)
+                    elif isinstance(raw_step, str) and raw_step.startswith("step_") and raw_step[5:].isdigit():
+                        eval_step = int(raw_step[5:])
+                    else:
+                        eval_step = 0
+
+                    _log(f"[WATCH] Evaluating new complete checkpoint: {ckpt['name']} at {ckpt_path} (step {eval_step})")
+                    try:
+                        metrics = evaluate_checkpoint(
+                            str(ckpt_path),
+                            config,
+                            config_path,
+                            evaluator_bundle=evaluator_bundle,
+                            step=eval_step,
+                            device=target_device,
+                        )
+                        eval_end = time.time()
+                        eval_latency_s = eval_end - eval_start
+
+                        out_dir = _make_eval_output_dir(config, ckpt["name"])
+                        _save_results(out_dir, metrics, config, str(ckpt_path))
+                        _generate_plots([{"step": eval_step, **metrics}], out_dir, config=config)
+
+                        rec = {
+                            "checkpoint": ckpt["name"],
+                            "path": ckpt_key,
+                            "checkpoint_mtime": mtime,
+                            "eval_start": eval_start,
+                            "eval_end": eval_end,
+                            "queue_delay_s": round(queue_delay_s, 4),
+                            "eval_latency_s": round(eval_latency_s, 4),
+                        }
+                        eval_records.append(rec)
+                        done_checkpoints.add(ckpt_key)
+                        done_checkpoints.add(ckpt["name"])
+                        runs_state.setdefault(target_run, []).append(ckpt["name"])
+
+                        state_payload = {
+                            "done_checkpoints": sorted(list(done_checkpoints)),
+                            "runs": runs_state,
+                            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        }
+                        state_file.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+
+                        summary_stats = compute_watch_summary(eval_records)
+                        metrics_payload = {
+                            "checkpoints": eval_records,
+                            "summary": summary_stats,
+                        }
+                        metrics_file.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+                        _log(f"[WATCH] Completed evaluation of '{ckpt['name']}' in {eval_latency_s:.2f}s (queue delay: {queue_delay_s:.2f}s)")
+
+                    except Exception as exc:
+                        _log(f"[WATCH] ERROR during evaluation of '{ckpt['name']}': {exc}")
+                        import traceback; traceback.print_exc()
+
+            if max_iterations and iteration >= max_iterations:
+                _log(f"[WATCH] Reached max_iterations={max_iterations}, exiting watch loop.")
+                break
+
+            poll_deadline = time.monotonic() + poll_seconds
+            while time.monotonic() < poll_deadline and not stop_requested:
+                time.sleep(0.25)
+
+    finally:
+        if original_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, original_sigint)
+            except Exception:
+                pass
+
+    return compute_watch_summary(eval_records)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,7 +578,7 @@ def main():
     # Checkpoint selection (mutually exclusive)
     ckpt_group = parser.add_mutually_exclusive_group()
     ckpt_group.add_argument(
-        "--step", type=int, default=None,
+        "--step", default=None,
         help="Evaluate the checkpoint saved at this optimizer step.",
     )
     ckpt_group.add_argument(
@@ -357,6 +592,30 @@ def main():
     ckpt_group.add_argument(
         "--list", action="store_true",
         help="List available checkpoints and exit without evaluating.",
+    )
+    ckpt_group.add_argument(
+        "--watch", action="store_true",
+        help="Poll the checkpoint root and evaluate each new complete checkpoint once.",
+    )
+    parser.add_argument(
+        "--poll-seconds", type=float, default=15.0,
+        help="Polling interval in seconds for --watch mode (default: 15.0).",
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, default=None,
+        help="Maximum polling iterations for --watch mode (testing only; default: unlimited).",
+    )
+    parser.add_argument(
+        "--run", default=None,
+        help="Run directory name to evaluate (default: newest run from list_runs()).",
+    )
+    parser.add_argument(
+        "--all-runs", action="store_true",
+        help="When used with --all-checkpoints, evaluate checkpoints across ALL runs rather than just the selected run.",
+    )
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda", "mps", "xpu"], default="auto",
+        help="Device to use for evaluation (default: auto).",
     )
 
     args = parser.parse_args()
@@ -375,10 +634,28 @@ def main():
         select_evaluation_checkpoints,
     )
     ckpt_manager = CheckpointManager(config, config_path=args.config)
+    runs = ckpt_manager.list_runs()
+    selected_run = args.run if args.run else (runs[0] if runs else None)
+    device = _get_device(args.device)
+
+    # ── --watch ──────────────────────────────────────────────────────────────
+    if args.watch:
+        _log("Starting offline checkpoint auditing service (--watch)...")
+        summary = run_watch_mode(
+            config,
+            args.config,
+            run_name=args.run,
+            poll_seconds=args.poll_seconds,
+            max_iterations=args.max_iterations,
+            device=device,
+        )
+        _log(f"Watch mode finished. Evaluated {summary.get('evaluated_count', 0)} checkpoints.")
+        sys.exit(0)
 
     # ── --list ───────────────────────────────────────────────────────────────
     if args.list:
-        checkpoints = ckpt_manager.list_checkpoints()
+        run_filter = None if args.all_runs else (args.run if args.run else selected_run)
+        checkpoints = ckpt_manager.list_checkpoints(run_name=run_filter)
         if not checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(0)
@@ -394,7 +671,8 @@ def main():
 
     # ── Resolve which checkpoints to evaluate ────────────────────────────────
     if args.all_checkpoints:
-        available_checkpoints = ckpt_manager.list_checkpoints()
+        run_filter = None if args.all_runs else selected_run
+        available_checkpoints = ckpt_manager.list_checkpoints(run_name=run_filter)
         if not available_checkpoints:
             _log(f"No checkpoints found in: {ckpt_manager.checkpoint_root}")
             sys.exit(1)
@@ -441,8 +719,11 @@ def main():
             "timestamp": None,
         }]
     elif args.step is not None:
-        ckpt_path = ckpt_manager.get_checkpoint_path(args.step)
-        if not os.path.isdir(ckpt_path):
+        target_step = int(args.step) if str(args.step).isdigit() else args.step
+        ckpt_path = ckpt_manager.resolve_checkpoint_path(target_step, run_name=selected_run)
+        if not ckpt_path and not args.run:
+            ckpt_path = ckpt_manager.resolve_checkpoint_path(target_step, run_name=None)
+        if not ckpt_path or not os.path.isdir(ckpt_path):
             _log(f"ERROR: No checkpoint found for step {args.step} at: {ckpt_path}")
             _log("Run with --list to see available checkpoints.")
             sys.exit(1)
@@ -454,8 +735,10 @@ def main():
         }]
     else:
         # Default: evaluate "final"
-        ckpt_path = ckpt_manager.get_checkpoint_path("final")
-        if not os.path.isdir(ckpt_path):
+        ckpt_path = ckpt_manager.resolve_checkpoint_path("final", run_name=selected_run)
+        if not ckpt_path and not args.run:
+            ckpt_path = ckpt_manager.resolve_checkpoint_path("final", run_name=None)
+        if not ckpt_path or not os.path.isdir(ckpt_path):
             _log(
                 f"No 'final' checkpoint found at: {ckpt_path}\n"
                 "Train with save_checkpoints.save_final: true (the default) or "
@@ -472,10 +755,27 @@ def main():
     # ── Run evaluation for each checkpoint ───────────────────────────────────
     all_results = []  # list of {step, checkpoint, **metrics} for multi-ckpt plots
     evaluator_bundle: dict = {}
+    failed = []
+    evaluated_count = 0
+    max_steps = int(config.get("training", {}).get("max_steps", 1000))
 
     for ckpt in checkpoints:
         ckpt_path = ckpt["path"]
         ckpt_name = ckpt["name"]
+        raw_step = ckpt.get("step")
+        if raw_step == "final" or str(raw_step).lower() == "final":
+            eval_step = max_steps
+        elif isinstance(raw_step, int):
+            eval_step = raw_step
+        elif isinstance(raw_step, str) and raw_step.isdigit():
+            eval_step = int(raw_step)
+        elif isinstance(raw_step, str) and raw_step.startswith("step_") and raw_step[5:].isdigit():
+            eval_step = int(raw_step[5:])
+        else:
+            try:
+                eval_step = int(raw_step)
+            except (ValueError, TypeError):
+                eval_step = 0
         run_quantitative = ckpt.get("run_quantitative", config.get("evaluation", {}).get("enabled", False))
         run_qualitative = ckpt.get("run_qualitative", config.get("testing_strategy", {}).get("enabled", False))
         targets = ckpt.get("evaluation_targets") or ((["quantitative"] if run_quantitative else []) + (["qualitative"] if run_qualitative else []))
@@ -493,10 +793,14 @@ def main():
                 evaluator_bundle=evaluator_bundle,
                 run_quantitative=run_quantitative,
                 run_qualitative=run_qualitative,
+                step=eval_step,
+                device=device,
             )
+            evaluated_count += 1
         except Exception as exc:
             _log(f"ERROR: Evaluation failed for '{ckpt_name}': {exc}")
             import traceback; traceback.print_exc()
+            failed.append(ckpt_name)
             continue
 
         if not metrics:
@@ -506,7 +810,7 @@ def main():
         # ── Save results for this checkpoint ─────────────────────────────────
         out_dir = _make_eval_output_dir(config, ckpt_name)
         _save_results(out_dir, metrics, config, ckpt_path)
-        _generate_plots([{"step": ckpt["step"], **metrics}], out_dir, config=config)
+        _generate_plots([{"step": eval_step, **metrics}], out_dir, config=config)
 
         # Print summary
         _log("── Metrics summary ──")
@@ -516,7 +820,7 @@ def main():
             else:
                 _log(f"  {k}: {v}")
 
-        all_results.append({"step": ckpt["step"], "checkpoint": ckpt_name, **metrics})
+        all_results.append({"step": eval_step, "checkpoint": ckpt_name, **metrics})
 
     # ── If multiple checkpoints, also produce combined plots ─────────────────
     if len(all_results) > 1:
@@ -536,7 +840,10 @@ def main():
         _log(f"Combined results CSV: {csv_path}")
         _log(f"Combined plots: {os.path.join(combined_out, 'plots')}")
 
-    _log("\nDecoupled evaluation complete.")
+    _log(f"\nEvaluated {evaluated_count} checkpoints, {len(failed)} failed: {failed}")
+    if failed:
+        sys.exit(2)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

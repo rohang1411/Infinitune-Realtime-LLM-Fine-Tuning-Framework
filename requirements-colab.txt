@@ -1,0 +1,21 @@
+# Tested Colab benchmark runtime (Python 3.10+ on Google Colab).
+# Torch, NumPy, and scikit-learn are omitted to preserve Colab's preinstalled
+# CUDA-enabled wheels, GPU drivers, and system C-extensions.
+transformers==5.5.3
+peft==0.18.1
+datasets==4.5.0
+huggingface-hub==1.10.1
+safetensors==0.5.2
+kafka-python==2.0.2
+PyYAML==6.0.2
+Jinja2==3.1.6
+Flask==3.1.0
+accelerate==1.15.0
+pytest==8.4.2
+matplotlib==3.10.9
+plotly==6.9.0
+sentence-transformers==5.7.0
+sacrebleu==2.6.0
+rouge-score==0.1.2
+psutil==7.2.2
+ntplib==0.4.0

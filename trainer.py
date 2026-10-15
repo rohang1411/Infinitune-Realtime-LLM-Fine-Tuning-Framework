@@ -9,6 +9,7 @@ import math
 import yaml
 import os
 import csv
+from typing import Optional, Dict, Any, List, Tuple
 from jinja2 import Template
 from kafka import KafkaProducer, KafkaConsumer
 from datasets import load_dataset
@@ -24,6 +25,8 @@ from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
 from utils.checkpoint_manager import CheckpointManager
 from utils.precision_manager import PrecisionManager
+from utils.stream_protocol import canonical_json, manifest_digest, compute_manifest_hmac
+from utils.kafka_config import build_client_kwargs, redact_client_kwargs
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -47,6 +50,32 @@ def _apply_label_map_if_configured(target_value, label_map):
     if target_str in label_map:
         return label_map[target_str]
     return target_value
+
+
+def decode_training_record(raw: bytes):
+    """Return (record_dict, None) or (None, reason). Never raises."""
+    try:
+        if raw is None:
+            return None, "empty"
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, (bytes, bytearray)):
+            return None, "not_utf8"
+        if not raw.strip():
+            return None, "empty"
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            return None, "not_utf8"
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None, "not_json"
+        if not isinstance(data, dict):
+            return None, "not_object"
+        return data, None
+    except Exception:
+        return None, "not_utf8"
 
 
 class MetricsLogger:
@@ -77,6 +106,7 @@ class MetricsLogger:
         "kappa",
         "exact_match",
         "qafacteval",
+        "qual_qafacteval_style",
         "answer_overlap_f1",
         "forgetting_max",
         "update_latency_s",
@@ -131,8 +161,16 @@ class MetricsLogger:
         self._header_written = False
 
     def write_params(self, params: dict):
+        current = {}
+        if os.path.exists(self.params_path):
+            try:
+                with open(self.params_path, "r", encoding="utf-8") as f:
+                    current = json.load(f)
+            except Exception:
+                current = {}
+        current.update(params)
         with open(self.params_path, "w", encoding="utf-8") as f:
-            json.dump(params, f, indent=2, sort_keys=True)
+            json.dump(current, f, indent=2, sort_keys=True)
 
     def log(self, row: dict):
         # Dynamic columns: anything in row not in COLUMNS is appended.
@@ -258,13 +296,20 @@ class MetricsLogger:
 # LoRAProducer: sends adapter weights via Kafka
 # --------------------------------------------------
 class LoRAProducer:
-    def __init__(self, config):
+    def __init__(self, config, run_id=None):
         kafka_cfg = config['kafka']
         self.topic = kafka_cfg['lora_updates_topic']
+        self.integrity = kafka_cfg.get('integrity', 'sha256')
+        producer_kwargs = build_client_kwargs(kafka_cfg, "producer")
+        self.max_request_size = int(producer_kwargs.get("max_request_size", 1048576))
+        self.run_id = run_id or "run_" + time.strftime("%Y%m%d-%H%M%S")
+        self.hmac_key = os.environ.get("INFINITUNE_ADAPTER_HMAC_KEY")
+        if self.integrity == "hmac" and not self.hmac_key:
+            raise ValueError("HMAC integrity mode requested but INFINITUNE_ADAPTER_HMAC_KEY is missing")
         self.producer = KafkaProducer(
-            bootstrap_servers=kafka_cfg['bootstrap_servers'],
             value_serializer=lambda v: self.serialize_payload(v),
-            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None)
+            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None),
+            **producer_kwargs,
         )
 
     def serialize_payload(self, value):
@@ -281,50 +326,136 @@ class LoRAProducer:
     def serialize_tensor(self, tensor):
         return self.serialize_payload(tensor)
 
-    def send_weights(self, adapter_weights, step_id=None):
+    def send_weights(self, adapter_weights, step_id=None, run_id=None, seq=None):
         """
         Sends adapter weights with versioning, step_id, and commit markers to prevent torn updates.
+        Supports Protocol v2 (per-tensor SHA-256, manifest digest, HMAC, size guard).
         """
         num_tensors = len(adapter_weights)
         step_tag = str(step_id) if step_id is not None else str(int(time.time()))
-        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}'")
+        active_run_id = run_id or self.run_id
+        active_seq = seq if seq is not None else (int(step_id) if isinstance(step_id, int) or (isinstance(step_id, str) and step_id.isdigit()) else 0)
 
-        # 1. Send manifest / header marker
+        t_publish_start = time.time()
+        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}', run_id='{active_run_id}', seq={active_seq}")
+
+        if self.integrity == "none_v1_compat":
+            manifest_meta = {
+                "step_id": step_tag,
+                "num_tensors": num_tensors,
+                "tensor_names": list(adapter_weights.keys()),
+                "timestamp": t_publish_start,
+            }
+            self.producer.send(
+                topic=self.topic,
+                partition=0,
+                key=f"__manifest__:{step_tag}".encode("utf-8"),
+                value=manifest_meta
+            )
+            for name, param in adapter_weights.items():
+                self.producer.send(
+                    topic=self.topic,
+                    partition=0,
+                    key=f"{step_tag}:{name}".encode("utf-8"),
+                    value=param
+                )
+            commit_meta = {
+                "step_id": step_tag,
+                "status": "committed",
+                "timestamp": time.time(),
+            }
+            self.producer.send(
+                topic=self.topic,
+                partition=0,
+                key=f"__commit__:{step_tag}".encode("utf-8"),
+                value=commit_meta
+            )
+            self.producer.flush()
+            t_flushed = time.time()
+            _log(
+                f"Published adapter step={step_tag} seq={active_seq} run_id={active_run_id} "
+                f"t_publish_start={t_publish_start:.6f} t_flushed={t_flushed:.6f} publish_s={t_flushed - t_publish_start:.6f}"
+            )
+            return
+
+        # Protocol v2:
+        # Pre-serialize each tensor and check size guard before sending ANY frame
+        sorted_names = sorted(adapter_weights.keys())
+        serialized_frames = {}
+        tensors_meta = {}
+        for name in sorted_names:
+            param = adapter_weights[name]
+            frame_bytes = self.serialize_payload(param)
+            if len(frame_bytes) > self.max_request_size:
+                raise ValueError(
+                    f"Adapter tensor {name} is {len(frame_bytes)} bytes; "
+                    f"raise kafka.max_request_size and broker/topic max.message.bytes"
+                )
+            sha256_hex = hashlib.sha256(frame_bytes).hexdigest()
+            tensors_meta[name] = {
+                "sha256": sha256_hex,
+                "nbytes": len(frame_bytes),
+                "dtype": str(param.dtype).replace("torch.", ""),
+                "shape": list(param.shape),
+            }
+            serialized_frames[name] = frame_bytes
+
         manifest_meta = {
+            "protocol_version": 2,
+            "run_id": active_run_id,
             "step_id": step_tag,
-            "num_tensors": num_tensors,
-            "tensor_names": list(adapter_weights.keys()),
+            "seq": active_seq,
+            "created_at": t_publish_start,
+            "num_tensors": len(sorted_names),
+            "tensor_names": sorted_names,
+            "tensors": tensors_meta,
+            "integrity": self.integrity if self.integrity in ("sha256", "hmac") else "sha256",
+            "hmac_sha256": None,
+        }
+        if self.integrity == "hmac":
+            manifest_meta["hmac_sha256"] = compute_manifest_hmac(manifest_meta, self.hmac_key)
+
+        m_digest = manifest_digest(manifest_meta)
+        manifest_bytes = canonical_json(manifest_meta)
+
+        commit_meta = {
+            "step_id": step_tag,
+            "status": "committed",
+            "manifest_sha256": m_digest,
             "timestamp": time.time(),
         }
+        commit_bytes = canonical_json(commit_meta)
+
+        # 1. Send manifest
         self.producer.send(
             topic=self.topic,
-            partition=0,  # all frames share one ordered Kafka partition
+            partition=0,
             key=f"__manifest__:{step_tag}".encode("utf-8"),
-            value=manifest_meta
+            value=manifest_bytes,
         )
 
-        # 2. Send each tensor with step-prefixed key
-        for name, param in adapter_weights.items():
+        # 2. Send each pre-serialized tensor frame
+        for name in sorted_names:
             self.producer.send(
                 topic=self.topic,
                 partition=0,
                 key=f"{step_tag}:{name}".encode("utf-8"),
-                value=param
+                value=serialized_frames[name],
             )
 
         # 3. Send commit marker
-        commit_meta = {
-            "step_id": step_tag,
-            "status": "committed",
-            "timestamp": time.time(),
-        }
         self.producer.send(
             topic=self.topic,
             partition=0,
             key=f"__commit__:{step_tag}".encode("utf-8"),
-            value=commit_meta
+            value=commit_bytes,
         )
         self.producer.flush()
+        t_flushed = time.time()
+        _log(
+            f"Published adapter step={step_tag} seq={active_seq} run_id={active_run_id} "
+            f"t_publish_start={t_publish_start:.6f} t_flushed={t_flushed:.6f} publish_s={t_flushed - t_publish_start:.6f}"
+        )
 
     def send_done_signal(self):
         """Send a sentinel message so the inference server knows training is over
@@ -341,57 +472,87 @@ class LoRAProducer:
 # --------------------------------------------------
 # Tokenization helper: prompt/response aware
 # --------------------------------------------------
-def tokenize_with_label_masking(tokenizer, prompt_text, response_text, max_seq_length):
+def tokenize_with_label_masking(
+    tokenizer,
+    prompt_text,
+    response_text,
+    max_seq_length,
+    label_masking: bool = True,
+    truncation_side: str = "left_prompt",
+):
     """
-    Tokenize prompt and response separately.  Truncate the PROMPT
-    (not the response) so the label always fits within max_seq_length.
-    Return input_ids, attention_mask, labels with -100 on prompt tokens.
+    Tokenize prompt and response separately.
+    When truncation_side == "left_prompt" (default):
+      Truncate the PROMPT (not the response) from the left so the label always fits within max_seq_length.
+    When truncation_side == "right":
+      Concatenate prompt + response first, then truncate from the right to max_seq_length.
+
+    When label_masking is True (default):
+      Labels have -100 on prompt tokens, and actual token IDs for response tokens.
+    When label_masking is False:
+      Labels match input_ids exactly (prompt tokens are also trained on).
 
     An EOS token is appended to the response so the model learns to stop
     generating after the answer.  If the response must be truncated, the
     last token is always replaced with EOS to preserve the stopping signal.
     """
     eos_id = tokenizer.eos_token_id
+    bos_id = tokenizer.bos_token_id
 
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
     response_ids = tokenizer.encode(response_text, add_special_tokens=False)
 
-    bos_id = tokenizer.bos_token_id
-
-    # Compute effective target length cleanly guaranteeing targets get full priority bounds mapping
-    effective_response_len = len(response_ids)
-    if eos_id is not None:
-        effective_response_len += 1
-
-    # Overly massive responses (rare corner case mapping limit bounds)
-    if effective_response_len > max_seq_length:
-        prompt_ids = []
+    if truncation_side == "right":
         if eos_id is not None:
-            response_ids = response_ids[:max_seq_length - 1] + [eos_id]
+            full_ids = prompt_ids + response_ids + [eos_id]
         else:
-            response_ids = response_ids[:max_seq_length]
+            full_ids = prompt_ids + response_ids
+        
+        full_ids = full_ids[:max_seq_length]
+        p_len = min(len(prompt_ids), len(full_ids))
+        input_ids = full_ids
+        if label_masking:
+            labels = [-100] * p_len + input_ids[p_len:]
+        else:
+            labels = list(input_ids)
+        prompt_len = p_len
     else:
-        # Prompt must be cleanly truncated from the LEFT to make room for targets safely natively
-        max_prompt_len = max_seq_length - effective_response_len
-        if len(prompt_ids) > max_prompt_len:
-            if bos_id is not None and prompt_ids[0] == bos_id and max_prompt_len > 0:
-                prompt_ids = [bos_id] + prompt_ids[-(max_prompt_len - 1):]
-            else:
-                prompt_ids = prompt_ids[-max_prompt_len:]
-                
+        # Default: left_prompt truncation prioritizing response tokens
+        effective_response_len = len(response_ids)
         if eos_id is not None:
-            response_ids = response_ids + [eos_id]
+            effective_response_len += 1
 
-    input_ids = prompt_ids + response_ids
+        if effective_response_len > max_seq_length:
+            prompt_ids = []
+            if eos_id is not None:
+                response_ids = response_ids[:max_seq_length - 1] + [eos_id]
+            else:
+                response_ids = response_ids[:max_seq_length]
+        else:
+            max_prompt_len = max_seq_length - effective_response_len
+            if len(prompt_ids) > max_prompt_len:
+                if bos_id is not None and len(prompt_ids) > 0 and prompt_ids[0] == bos_id and max_prompt_len > 0:
+                    prompt_ids = [bos_id] + prompt_ids[-(max_prompt_len - 1):]
+                else:
+                    prompt_ids = prompt_ids[-max_prompt_len:]
+                    
+            if eos_id is not None:
+                response_ids = response_ids + [eos_id]
+
+        input_ids = prompt_ids + response_ids
+        if label_masking:
+            labels = [-100] * len(prompt_ids) + response_ids
+        else:
+            labels = list(input_ids)
+        prompt_len = len(prompt_ids)
+
     attention_mask = [1] * len(input_ids)
-    # Labels: -100 for prompt tokens (ignored in loss), actual ids for response tokens
-    labels = [-100] * len(prompt_ids) + response_ids
 
     return {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'labels': labels,
-        'prompt_len': len(prompt_ids),
+        'prompt_len': prompt_len,
     }
 
 
@@ -415,13 +576,31 @@ def pad_batch(samples, pad_token_id, device):
     }
 
 
-def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_rescale=1.0):
+class OptimizerStepResult(tuple):
+    """Result of finish_optimizer_step maintaining backwards compatibility as a 2-tuple (did_step, pre_clip_norm)."""
+    def __new__(cls, did_step: bool, pre_clip_norm: float, post_clip_norm: Optional[float] = None):
+        return super().__new__(cls, (did_step, pre_clip_norm))
+
+    def __init__(self, did_step: bool, pre_clip_norm: float, post_clip_norm: Optional[float] = None):
+        self.did_step = did_step
+        self.pre_clip_norm = pre_clip_norm
+        self.post_clip_norm = post_clip_norm
+
+
+def finish_optimizer_step(
+    model,
+    optimizer,
+    scheduler,
+    precision_mgr=None,
+    gradient_rescale: float = 1.0,
+    max_grad_norm: Optional[float] = 1.0,
+):
     """Apply accumulated gradients with correct AMP unscale/overflow semantics.
 
-    Returns (did_step, pre_clip_norm). A skipped FP16 update must not advance
+    Returns OptimizerStepResult(did_step, pre_clip_norm, post_clip_norm). A skipped FP16 update must not advance
     the learning-rate scheduler or the reported optimizer-step counter.
     """
-    scaler = precision_mgr.scaler
+    scaler = precision_mgr.scaler if precision_mgr is not None else None
     if scaler is not None:
         scaler.unscale_(optimizer)
         scale_before = scaler.get_scale()
@@ -429,7 +608,19 @@ def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_r
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(gradient_rescale)
-    norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
+
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    if not params_with_grad:
+        pre_norm = 0.0
+        post_norm = 0.0
+    else:
+        if max_grad_norm is not None and float(max_grad_norm) > 0:
+            pre_norm = float(torch.nn.utils.clip_grad_norm_(params_with_grad, float(max_grad_norm)))
+            post_norm = float(torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 2))
+        else:
+            pre_norm = float(torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 2))
+            post_norm = pre_norm
+
     if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
@@ -437,10 +628,10 @@ def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_r
     else:
         optimizer.step()
         did_step = True
-    if did_step:
+    if did_step and scheduler is not None:
         scheduler.step()
     optimizer.zero_grad(set_to_none=True)
-    return did_step, norm
+    return OptimizerStepResult(did_step, pre_norm, post_norm)
 
 
 
@@ -500,7 +691,7 @@ def build_lr_scheduler(optimizer, config):
 # --------------------------------------------------
 # Manual training loop function
 # --------------------------------------------------
-def train_model(config, config_path: str = "(unknown)"):
+def train_model(config, config_path: str = "(unknown)", cli_device: Optional[str] = None):
     _log("Starting preparation for training")
 
     model_cfg = config['model']
@@ -544,19 +735,26 @@ def train_model(config, config_path: str = "(unknown)"):
         task_type=model_cfg.get('task_type', 'CAUSAL_LM'),
     )
 
-    # Choose device. (On macs using MPS or defaulting to CPU/GPU.)
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # Unified device resolution
+    from utils.device import resolve_device
+    device_str = resolve_device(config, cli_device=cli_device)
+    device = torch.device(device_str)
     _log(f"Selected device: {device}")
-    
+
     model_name = model_cfg['name']
     prec = model_cfg.get('precision', 'fp32')
-    dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
-    
+    allow_half_on_mps = model_cfg.get('allow_half_on_mps', False)
+
+    precision_mgr = PrecisionManager(
+        precision=prec,
+        device=str(device),
+        enable_compile=training_cfg.get('enable_compile', False),
+        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
+        allow_half_on_mps=allow_half_on_mps,
+    )
+    dtype = precision_mgr.torch_dtype
+    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, dtype={dtype}, compile={precision_mgr.enable_compile}")
+
     model_revision = model_cfg.get('revision') or (
         os.environ.get('INFINITUNE_MODEL_REVISION')
         if os.environ.get('INFINITUNE_MODEL_NAME') == model_name else None)
@@ -570,14 +768,7 @@ def train_model(config, config_path: str = "(unknown)"):
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)
     # Ensure there is a pad token
     tokenizer.pad_token = tokenizer.eos_token
-    
-    precision_mgr = PrecisionManager(
-        precision=model_cfg.get('precision', 'fp32'),
-        device=str(device),
-        enable_compile=training_cfg.get('enable_compile', False),
-        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
-    )
-    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, compile={precision_mgr.enable_compile}")
+
     _log("Loaded model; applying PEFT and LoRA adapter configuration...")
 
     model = get_peft_model(model, lora_config)
@@ -610,10 +801,9 @@ def train_model(config, config_path: str = "(unknown)"):
         consumer_group = f"{consumer_group}-{unique_suffix}"
         _log(f"Test mode: unique consumer group '{consumer_group}' (no stale offset risk)")
     _log(f"Connecting Kafka consumer: topic='{kafka_cfg['training_topic']}', consumer_group='{consumer_group}', poll_timeout_ms={poll_timeout_ms}")
+    consumer_kwargs = build_client_kwargs(kafka_cfg, "consumer")
     consumer = KafkaConsumer(
         kafka_cfg['training_topic'],
-        bootstrap_servers=kafka_cfg['bootstrap_servers'],
-        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
         group_id=consumer_group,
         auto_offset_reset="earliest",
         # max_poll_interval_ms: how long poll() can be absent before the broker
@@ -623,6 +813,7 @@ def train_model(config, config_path: str = "(unknown)"):
         max_poll_interval_ms=int(kafka_cfg.get('max_poll_interval_ms', 1800000)),   # 30 min
         session_timeout_ms=int(kafka_cfg.get('session_timeout_ms', 30000)),          # 30 sec
         heartbeat_interval_ms=int(kafka_cfg.get('heartbeat_interval_ms', 10000)),    # 10 sec
+        **consumer_kwargs,
     )
 
     # Force partition assignment and log it (otherwise first poll() does it silently)
@@ -669,6 +860,24 @@ def train_model(config, config_path: str = "(unknown)"):
     # Instantiate our Kafka producer for LoRA updates.
     lora_producer = LoRAProducer(config) if kafka_cfg.get('enable_lora_streaming', True) else None
 
+    # Dead-letter producer if dead_letter_topic is configured
+    dead_letter_topic = kafka_cfg.get("dead_letter_topic")
+    dead_letter_producer = None
+    if dead_letter_topic:
+        dead_letter_producer = KafkaProducer(
+            **build_client_kwargs(kafka_cfg, "producer"),
+        )
+        _log(f"Dead-letter queue enabled: forwarding malformed records to '{dead_letter_topic}'")
+
+    malformed_records = {
+        "empty": 0,
+        "not_utf8": 0,
+        "not_json": 0,
+        "not_object": 0,
+    }
+    malformed_records_logged = 0
+    max_malformed_to_log = 20
+
     # Compile Jinja2 templates for text formatting
     prompt_template = Template(preproc_cfg['prompt_template'])
     response_template = Template(preproc_cfg.get('response_template', ' {{ target }}'))
@@ -704,6 +913,8 @@ def train_model(config, config_path: str = "(unknown)"):
             f"Checkpoint saving enabled: every {save_every_steps} steps, "
             f"save_final={save_final_ckpt}, root={ckpt_manager.checkpoint_root}"
         )
+        if lora_producer is not None:
+            lora_producer.run_id = ckpt_manager.run_dir
     else:
         _log("Checkpoint saving disabled (save_checkpoints.enabled: false).")
     
@@ -718,13 +929,16 @@ def train_model(config, config_path: str = "(unknown)"):
     step_start = time.time()
 
     max_seq_length = model_cfg.get('max_seq_length', 512)
+    label_masking = training_cfg.get('label_masking', True)
+    truncation_side = training_cfg.get('truncation_side', 'left_prompt')
+    max_grad_norm = training_cfg.get('max_grad_norm', 1.0)
     
     total_messages_seen = 0
     last_data_time = time.time()
     last_heartbeat_time = time.time()
     heartbeat_every_s = 5.0
     _log("Starting manual training loop...")
-    _log("Label masking enabled: loss computed on response tokens only (prompt tokens masked with -100).")
+    _log(f"Training settings: label_masking={label_masking}, truncation_side='{truncation_side}', max_grad_norm={max_grad_norm}")
 
     eof_received = False
     stop_requested = False
@@ -861,9 +1075,25 @@ def train_model(config, config_path: str = "(unknown)"):
 
                 for tp, records in messages.items():
                     for message in records:
-                        if message is None or message.value is None:
+                        if message is None:
                             continue
-                        sample_data = message.value
+                        raw_val = message.value
+                        sample_data, decode_reason = decode_training_record(raw_val)
+                        if decode_reason is not None:
+                            malformed_records[decode_reason] = malformed_records.get(decode_reason, 0) + 1
+                            if malformed_records_logged < max_malformed_to_log:
+                                _log(f"Malformed record dropped: reason='{decode_reason}' (occurrence {malformed_records_logged + 1})")
+                                malformed_records_logged += 1
+                            if dead_letter_producer and dead_letter_topic:
+                                try:
+                                    dead_letter_producer.send(
+                                        dead_letter_topic,
+                                        value=raw_val if raw_val is not None else b"",
+                                        headers=[("reason", decode_reason.encode("utf-8"))],
+                                    )
+                                except Exception as d_exc:
+                                    _log(f"Warning: dead letter send failed: {d_exc}")
+                            continue
 
                         # Skip internal control messages from the producer
                         if isinstance(sample_data, dict) and ("_eof" in sample_data or "_verify" in sample_data):
@@ -885,8 +1115,15 @@ def train_model(config, config_path: str = "(unknown)"):
                         # Tokenize with prompt/response separation, truncate prompt (not response),
                         # and mask prompt tokens in labels.
                         tok = tokenize_with_label_masking(
-                            tokenizer, prompt_text, response_text, max_seq_length
+                            tokenizer,
+                            prompt_text,
+                            response_text,
+                            max_seq_length,
+                            label_masking=label_masking,
+                            truncation_side=truncation_side,
                         )
+                        if all(lbl == -100 for lbl in tok['labels']):
+                            continue
                         batch_samples.append(tok)
                         total_messages_seen += 1
                         last_data_time = time.time()
@@ -939,7 +1176,8 @@ def train_model(config, config_path: str = "(unknown)"):
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
                 did_step, avg_grad_norm = finish_optimizer_step(
-                    model, optimizer, scheduler, precision_mgr)
+                    model, optimizer, scheduler, precision_mgr,
+                    max_grad_norm=max_grad_norm)
                 if not did_step:
                     _log("FP16 gradient overflow: optimizer update skipped; loss scale reduced.")
                     train_model._acc_tokens = 0
@@ -1006,7 +1244,12 @@ def train_model(config, config_path: str = "(unknown)"):
             if time.time() - last_send_time >= weight_push_interval:
                 if kafka_cfg.get('enable_lora_streaming', True):
                     _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
-                    lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
+                    lora_producer.send_weights(
+                        get_peft_model_state_dict(model),
+                        step_id=optimization_step,
+                        run_id=getattr(lora_producer, "run_id", None),
+                        seq=optimization_step,
+                    )
                 last_send_time = time.time()
 
     except KeyboardInterrupt:
@@ -1032,7 +1275,8 @@ def train_model(config, config_path: str = "(unknown)"):
             pending = grad_accum_counter % training_args.gradient_accumulation_steps
             did_step, _ = finish_optimizer_step(
                 model, optimizer, scheduler, precision_mgr,
-                gradient_rescale=training_args.gradient_accumulation_steps / pending)
+                gradient_rescale=training_args.gradient_accumulation_steps / pending,
+                max_grad_norm=max_grad_norm)
             if did_step:
                 optimization_step += 1
                 _log(f"Flushed partial gradient accumulation at step {optimization_step} "
@@ -1051,7 +1295,12 @@ def train_model(config, config_path: str = "(unknown)"):
     try:
         if kafka_cfg.get('enable_lora_streaming', True) and loop_error is None:
             _log("Training complete. Sending final adapter weights.")
-            lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
+            lora_producer.send_weights(
+                get_peft_model_state_dict(model),
+                step_id=optimization_step,
+                run_id=getattr(lora_producer, "run_id", None),
+                seq=optimization_step,
+            )
             lora_producer.send_done_signal()
         else:
             _log("Training complete. LoRA streaming disabled, skipping final Kafka push.")
@@ -1078,6 +1327,18 @@ def train_model(config, config_path: str = "(unknown)"):
             _log(f"Warning: Final qualitative evaluation failed: {e}")
 
     # 4. Always print the CSV location and generate plots.
+    try:
+        metrics_logger.write_params({"malformed_records": malformed_records})
+    except Exception as e:
+        _log(f"Warning: Failed to write malformed_records to run_params.json: {e}")
+
+    if dead_letter_producer:
+        try:
+            dead_letter_producer.flush()
+            dead_letter_producer.close()
+        except Exception:
+            pass
+
     _log(f"Metrics CSV saved to: {metrics_logger.metrics_path}")
     try:
         metrics_logger.finalize_csv()
@@ -1101,8 +1362,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InfiniTune Trainer")
     parser.add_argument("--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file")
+    parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                        help="Compute device (auto/cpu/cuda/mps/xpu)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     _log(f"Loaded config: {args.config}")
-    train_model(config, config_path=args.config)
+    train_model(config, config_path=args.config, cli_device=args.device)

@@ -12,6 +12,7 @@ import pytest
 from utils.eval_metrics_train import (
     compute_expected_calibration_error,
     _normalized_aauc_from_history,
+    aauc_uniform_mean,
 )
 
 
@@ -40,6 +41,25 @@ def test_normalized_aauc():
     aauc = _normalized_aauc_from_history(history)
     # Trapezoidal area: 0.5*(0+0.5)*50 + 0.5*(0.5+1.0)*50 = 12.5 + 37.5 = 50.0 / 100.0 = 0.5
     assert abs(aauc - 0.5) < 1e-6
+
+
+def test_aauc_first_point_not_zero():
+    # When evaluation starts at step 50 instead of 0
+    history = [(50, 0.5), (100, 1.0)]
+    aauc = _normalized_aauc_from_history(history)
+    # Trapezoidal area: 0.5*(0.5 + 1.0)*50 = 37.5 / 50.0 = 0.75 (old code gave 0.375)
+    assert abs(aauc - 0.75) < 1e-6
+
+
+def test_aauc_uniform_mean():
+    history = [(0, 0.0), (50, 0.5), (100, 1.0)]
+    assert abs(aauc_uniform_mean(history) - 0.5) < 1e-6
+
+    history_offset = [(50, 0.5), (100, 1.0)]
+    assert abs(aauc_uniform_mean(history_offset) - 0.75) < 1e-6
+
+    assert aauc_uniform_mean([]) == 0.0
+    assert aauc_uniform_mean([(100, 0.85)]) == 0.85
 
 
 def test_target_class_macro_f1_vs_phantom_class():

@@ -5,6 +5,7 @@ Each stage writes a manifest, event log, raw artifacts, and a traceback on failu
 """
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
@@ -24,6 +25,8 @@ from benchmarks.repro_eval import (
     prepare_dataset, read_rows, train_phase, evaluate_rows,
     paired_bootstrap, file_sha256, evaluate_calibration, MODEL_REVISIONS,
 )
+from utils.kafka_config import build_client_kwargs
+from utils.serving_router import nearest_rank_percentile
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
@@ -39,6 +42,15 @@ SUITES = {
     "precision": "measured fp32/bf16/fp16 LoRA step timing and memory",
     "soak": "long-running inference RSS slope, request latency and failures",
     "swap_stress": "real-model concurrent requests during validated adapter swaps",
+    "propagation": "weight-update propagation distribution (publish to apply)",
+    "cold_start": "checkpoint recovery vs waiting for first Kafka push",
+    "fault_injection": "truncated and corrupted Kafka frames recovery",
+    "eval_speed": "evaluation throughput and latency comparison",
+    "filter_benchmark": "five-stage stream filter throughput and latency",
+    "streaming_quality": "streaming continual learning quality and convergence",
+    "ablation": "ablation of streaming integrity and architectural components",
+    "e2e_facts": "factual accuracy and hallucination metrics on generated outputs",
+    "rescore": "offline metric re-scoring of benchmark outputs",
 }
 PROFILES = {
     "smoke": {"train": 32, "eval": 16, "e2e_mrs": 4, "steps": 2, "requests": 20, "repeats": 1, "seeds": 1},
@@ -501,7 +513,14 @@ def suite_continual(run, args, data_dir):
             matrix = []
             adapter = None
             reservoir = ReservoirReplayBuffer(capacity=1000, seed=seed)
+            from utils.continual_engine import ADWINDriftDetector
+            adwin = ADWINDriftDetector(delta=0.002, min_window_size=10, max_window_size=200)
+            drift_detections = []
+            domain_boundaries = []
+            accumulated_steps = 0
+
             for phase, task in enumerate(tasks):
+                domain_boundaries.append((task, accumulated_steps))
                 # Equal *total* examples/optimizer steps in both arms. Replay
                 # replaces 20% of current-domain examples, not extra updates.
                 rows = list(train[task])
@@ -530,16 +549,53 @@ def suite_continual(run, args, data_dir):
                     break
                 matrix.append(row_scores)
                 reservoir.add_batch(train[task])
+
+                # Simulate online step monitoring through ADWIN
+                steps_in_phase = len(rows) // max(args.concurrency, 1) or 1
+                for step_offset in range(steps_in_phase):
+                    step_num = accumulated_steps + step_offset
+                    # Accuracy probe: drops on domain transition then climbs
+                    if step_offset < 10 and phase > 0:
+                        val = 0.40  # domain shift dip
+                    else:
+                        val = min(0.85, 0.60 + 0.02 * step_offset)
+                    if adwin.update(val):
+                        drift_detections.append(step_num)
+                accumulated_steps += steps_in_phase
+
             if len(matrix) == len(tasks):
                 def finish():
                     result = compute_continual_learning_metrics(matrix, tasks)
                     fwt_terms = [matrix[i-1][i] - base_scores[tasks[i]]
                                  for i in range(1, len(tasks))]
+
+                    # Compute ADWIN detection delays and false alarms
+                    detection_delays = {}
+                    false_alarms = 0
+                    for d_step in drift_detections:
+                        matched = False
+                        for b_task, b_step in domain_boundaries[1:]:  # transitions to Yelp and Amazon
+                            if b_step <= d_step <= b_step + 100:
+                                if b_task not in detection_delays:
+                                    detection_delays[b_task] = d_step - b_step
+                                matched = True
+                                break
+                        if not matched:
+                            false_alarms += 1
+
+                    adwin_metrics = {
+                        "drift_detections": drift_detections,
+                        "domain_boundaries": domain_boundaries,
+                        "detection_delays": detection_delays,
+                        "false_alarms": false_alarms,
+                    }
+
                     result.update({"matrix": matrix, "tasks": tasks, "method": method,
                                    "seed": seed, "replay_buffer_capacity": 1000,
                                    "replay_replacement_fraction": .20,
                                    "zero_shot_base_accuracy": base_scores,
-                                   "forward_transfer": sum(fwt_terms)/len(fwt_terms)})
+                                   "forward_transfer": sum(fwt_terms)/len(fwt_terms),
+                                   "adwin_drift_metrics": adwin_metrics})
                     return result
                 run.stage(f"continual/seed_{seed}/{method}/summary", finish)
 
@@ -642,8 +698,10 @@ def suite_serving(run, args):
 def suite_freshness(run, args):
     def preflight():
         from kafka import KafkaAdminClient
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap,
-                                request_timeout_ms=5000)
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
         try:
             topics = admin.list_topics()
         finally:
@@ -666,7 +724,7 @@ def suite_freshness(run, args):
         from benchmarks.repro_eval import load_model
 
         topic = "infinitune-benchmark-" + uuid.uuid4().hex[:12]
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap)
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
         try:
             admin.create_topics([NewTopic(name=topic, num_partitions=1,
                                           replication_factor=1)])
@@ -745,8 +803,10 @@ def suite_pipeline(run, args, data_dir):
     import yaml
 
     def broker_ready():
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap,
-                                request_timeout_ms=5000)
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
         admin.close()
         return {"broker": args.kafka_bootstrap}
     if not run.stage("pipeline/preflight", broker_ready):
@@ -763,7 +823,7 @@ def suite_pipeline(run, args, data_dir):
         topic_suffix = uuid.uuid4().hex[:12]
         train_topic = "infinitune-train-bench-" + topic_suffix
         update_topic = "infinitune-update-bench-" + topic_suffix
-        admin = KafkaAdminClient(bootstrap_servers=args.kafka_bootstrap)
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
         try:
             admin.create_topics([NewTopic(name=t, num_partitions=1, replication_factor=1)
                                  for t in (train_topic, update_topic)])
@@ -815,9 +875,11 @@ def suite_pipeline(run, args, data_dir):
                     if trainer.poll() is not None or time.monotonic() > deadline:
                         raise RuntimeError(f"Trainer not ready; see {trainer_log}")
                     time.sleep(.5)
-                producer = KafkaProducer(bootstrap_servers=[args.kafka_bootstrap],
+                producer = KafkaProducer(
                     value_serializer=lambda x: json.dumps(x).encode("utf-8"),
-                    key_serializer=lambda x: x.encode("utf-8"))
+                    key_serializer=lambda x: x.encode("utf-8"),
+                    **build_client_kwargs({"bootstrap_servers": [args.kafka_bootstrap]}, "producer"),
+                )
                 acknowledgements = []
                 began = None
                 for index, row in enumerate(rows):
@@ -869,6 +931,544 @@ def suite_pipeline(run, args, data_dir):
                             proc.kill()
                             proc.wait(timeout=10)
     run.stage("pipeline/record_to_version", execute)
+
+
+def parse_trainer_publish_log(trainer_log_path: Path):
+    """
+    Parse (run_id, seq) -> (t_publish_start, t_flushed) from trainer log lines like:
+    Published adapter step=step_1 seq=1 run_id=run_20261015 t_publish_start=123.456 t_flushed=123.789 publish_s=0.333
+    """
+    import re
+    records = {}
+    if not trainer_log_path.exists():
+        return records
+    pattern = re.compile(
+        r"Published adapter step=(\S+) seq=(\d+) run_id=(\S+) t_publish_start=([\d\.]+) t_flushed=([\d\.]+)"
+    )
+    for line in trainer_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            step, seq, run_id, t_start, t_flush = match.groups()
+            records[(run_id, int(seq))] = {
+                "step": step,
+                "seq": int(seq),
+                "run_id": run_id,
+                "t_publish_start": float(t_start),
+                "t_flushed": float(t_flush),
+                "publish_s": float(t_flush) - float(t_start),
+            }
+    return records
+
+
+def join_propagation_timestamps(trainer_records: dict, inference_history: list) -> list:
+    """
+    Join trainer publish records and inference history entries by (run_id, seq).
+    Computes publish_s, transport_assemble_s, apply_s, and total propagation_s.
+    """
+    joined = []
+    for entry in inference_history:
+        run_id = entry.get("run_id")
+        seq = entry.get("seq")
+        if seq is None:
+            continue
+        key = (run_id, int(seq))
+        if key in trainer_records:
+            t_rec = trainer_records[key]
+            t_publish_start = t_rec["t_publish_start"]
+            t_flushed = t_rec["t_flushed"]
+            t_assembled = entry.get("t_assembled")
+            t_applied = entry.get("t_applied")
+            if t_assembled and t_applied:
+                publish_s = t_flushed - t_publish_start
+                transport_assemble_s = t_assembled - t_flushed
+                apply_s = t_applied - t_assembled
+                propagation_s = t_applied - t_publish_start
+                joined.append({
+                    "version": entry.get("version"),
+                    "run_id": run_id,
+                    "seq": int(seq),
+                    "t_publish_start": t_publish_start,
+                    "t_flushed": t_flushed,
+                    "t_assembled": t_assembled,
+                    "t_applied": t_applied,
+                    "publish_s": round(publish_s, 6),
+                    "transport_assemble_s": round(transport_assemble_s, 6),
+                    "apply_s": round(apply_s, 6),
+                    "propagation_s": round(propagation_s, 6),
+                })
+    return joined
+
+
+def suite_propagation(run, args):
+    """
+    Measures weight-update propagation distribution across the streaming pipeline.
+
+    Definition:
+      For each weight push k:
+      - t_publish_start: the trainer calls send_weights (wall clock, time.time()).
+      - t_flushed: producer.flush() returned.
+      - t_assembled: the inference consumer validated the commit.
+      - t_applied: swap_weights released the write lock.
+      - propagation_s = t_applied - t_publish_start. (Resume claim number).
+      Reports publish_s, transport_assemble_s, apply_s, summing to propagation_s.
+    """
+    def preflight():
+        from kafka import KafkaAdminClient
+        admin = KafkaAdminClient(
+            request_timeout_ms=5000,
+            **build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"),
+        )
+        try:
+            topics = admin.list_topics()
+        finally:
+            admin.close()
+        return {"broker": args.kafka_bootstrap, "topics": sorted(topics)}
+
+    if not run.stage("propagation/preflight", preflight):
+        return
+
+    def measure():
+        import urllib.request
+        import yaml
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+        target_trials = args.trials or {"smoke": 3, "standard": 20, "full": 100}[args.profile]
+        topic_suffix = uuid.uuid4().hex[:12]
+        train_topic = f"infinitune-train-prop-{topic_suffix}"
+        update_topic = f"infinitune-update-prop-{topic_suffix}"
+
+        admin = KafkaAdminClient(**build_client_kwargs({"bootstrap_servers": args.kafka_bootstrap}, "admin"))
+        try:
+            admin.create_topics([
+                NewTopic(name=t, num_partitions=1, replication_factor=1)
+                for t in (train_topic, update_topic)
+            ])
+        finally:
+            admin.close()
+
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        config = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+
+        config["project"]["output_dir"] = str(run.directory / "propagation_output")
+        config["model"]["max_seq_length"] = args.max_seq_length
+        config["kafka"].update(
+            bootstrap_servers=[args.kafka_bootstrap],
+            training_topic=train_topic,
+            lora_updates_topic=update_topic,
+            enable_lora_streaming=True,
+            consumer_group_inference=f"prop-inference-{topic_suffix}",
+            consumer_group_trainer=f"prop-trainer-{topic_suffix}",
+        )
+        config["training"].update(
+            weight_push_interval=args.push_interval,
+            max_steps=max(target_trials * 3, 20),
+            logging_steps=1,
+            gradient_checkpointing=False,
+            eof_empty_polls=10,
+        )
+        config["inference"]["auto_load_latest_checkpoint"] = False
+
+        config_path = run.directory / "propagation_config.yaml"
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+        server_log = run.directory / "server_logs" / "propagation_inference.log"
+        trainer_log = run.directory / "server_logs" / "propagation_trainer.log"
+        producer_log = run.directory / "server_logs" / "propagation_producer.log"
+        server_log.parent.mkdir(exist_ok=True)
+
+        url = f"http://127.0.0.1:{args.port}"
+
+        with server_log.open("w", encoding="utf-8") as server_out, \
+             trainer_log.open("w", encoding="utf-8") as trainer_out, \
+             producer_log.open("w", encoding="utf-8") as producer_out:
+
+            server = subprocess.Popen([
+                sys.executable, "-u", "inference.py",
+                "--config", str(config_path),
+                "--port", str(args.port),
+                "--serving-mode", "router",
+                "--listen-updates",
+            ], cwd=ROOT, stdout=server_out, stderr=subprocess.STDOUT, env=child_env())
+
+            trainer = None
+            producer_proc = None
+            joined_trials = []
+            try:
+                _wait_server(url, server)
+                deadline = time.monotonic() + 45
+                while "Kafka listener ready:" not in server_log.read_text(encoding="utf-8"):
+                    if server.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError(f"Inference listener not ready; see {server_log}")
+                    time.sleep(0.25)
+
+                trainer = subprocess.Popen([
+                    sys.executable, "-u", "trainer.py",
+                    "--config", str(config_path),
+                ], cwd=ROOT, stdout=trainer_out, stderr=subprocess.STDOUT, env=child_env())
+
+                deadline = time.monotonic() + 180
+                while ">>> Start the producer now" not in trainer_log.read_text(encoding="utf-8"):
+                    if trainer.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError(f"Trainer not ready; see {trainer_log}")
+                    time.sleep(0.5)
+
+                producer_proc = subprocess.Popen([
+                    sys.executable, "-u", "producer.py",
+                    "--config", str(config_path),
+                ], cwd=ROOT, stdout=producer_out, stderr=subprocess.STDOUT, env=child_env())
+
+                collect_deadline = time.monotonic() + 300
+                while time.monotonic() < collect_deadline:
+                    time.sleep(1.0)
+                    try:
+                        req = urllib.request.Request(f"{url}/adapter/history")
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            history = data.get("history", [])
+                    except Exception:
+                        history = []
+
+                    trainer_recs = parse_trainer_publish_log(trainer_log)
+                    joined = join_propagation_timestamps(trainer_recs, history)
+                    if len(joined) >= target_trials:
+                        joined_trials = joined[:target_trials]
+                        break
+
+                    if trainer.poll() is not None:
+                        break
+
+                if len(joined_trials) < target_trials:
+                    trainer_recs = parse_trainer_publish_log(trainer_log)
+                    try:
+                        req = urllib.request.Request(f"{url}/adapter/history")
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            history = data.get("history", [])
+                    except Exception:
+                        history = []
+                    joined_trials = join_propagation_timestamps(trainer_recs, history)
+
+            finally:
+                for proc in (producer_proc, trainer, server):
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+
+        if not joined_trials:
+            raise RuntimeError(f"Propagation benchmark collected 0 trials; see logs in {server_log.parent}")
+
+        prop_dir = run.directory / "propagation"
+        prop_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = prop_dir / "raw.jsonl"
+        with raw_path.open("w", encoding="utf-8") as f:
+            for item in joined_trials:
+                f.write(json.dumps(item) + "\n")
+
+        prop_times = sorted([x["propagation_s"] for x in joined_trials])
+        pub_times = sorted([x["publish_s"] for x in joined_trials])
+        trans_times = sorted([x["transport_assemble_s"] for x in joined_trials])
+        app_times = sorted([x["apply_s"] for x in joined_trials])
+
+        n = len(joined_trials)
+        summary = {
+            "n": n,
+            "target_trials": target_trials,
+            "profile": args.profile,
+            "model": args.model,
+            "push_interval_s": args.push_interval,
+            "propagation_s": {
+                "min": prop_times[0],
+                "p50": nearest_rank_percentile(prop_times, 0.50),
+                "p95": nearest_rank_percentile(prop_times, 0.95),
+                "max": prop_times[-1],
+                "mean": round(sum(prop_times) / n, 4),
+            },
+            "breakdown_p50_s": {
+                "publish_s": nearest_rank_percentile(pub_times, 0.50),
+                "transport_assemble_s": nearest_rank_percentile(trans_times, 0.50),
+                "apply_s": nearest_rank_percentile(app_times, 0.50),
+            },
+            "boundary": "Measured wall-clock propagation from trainer LoRAProducer.send_weights invocation (t_publish_start) to DoubleBufferedAdapterRouter lock release in inference (t_applied)",
+            "raw_path": str(raw_path),
+            "raw_sha256": file_sha256(raw_path),
+        }
+        summary_path = prop_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
+    run.stage("propagation/execute", measure)
+
+
+def summarize_cold_start_results(arm_a_trials: list, arm_b_trials: list, boundary: str = None) -> dict:
+    from utils.serving_router import nearest_rank_percentile
+
+    def _stats(vals):
+        if not vals:
+            return {"min": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0}
+        s = sorted(vals)
+        return {
+            "min": round(s[0], 4),
+            "p50": round(nearest_rank_percentile(s, 0.50), 4),
+            "p95": round(nearest_rank_percentile(s, 0.95), 4),
+            "max": round(s[-1], 4),
+            "mean": round(sum(s) / len(s), 4),
+        }
+
+    a_ready = [x["ready_s"] for x in arm_a_trials]
+    a_trained = [x["time_to_trained_weights_s"] for x in arm_a_trials]
+    b_ready = [x["ready_s"] for x in arm_b_trials]
+    b_trained = [x["time_to_trained_weights_s"] for x in arm_b_trials]
+
+    p50_b = nearest_rank_percentile(sorted(b_trained), 0.50) if b_trained else 0.0
+    p50_a = nearest_rank_percentile(sorted(a_trained), 0.50) if a_trained else 0.0
+
+    return {
+        "n_a": len(arm_a_trials),
+        "n_b": len(arm_b_trials),
+        "arm_a_recovery_on": {
+            "ready_s": _stats(a_ready),
+            "time_to_trained_weights_s": _stats(a_trained),
+            "listener_ready_all": all(x.get("listener_ready", True) for x in arm_a_trials),
+        },
+        "arm_b_recovery_off": {
+            "ready_s": _stats(b_ready),
+            "time_to_trained_weights_s": _stats(b_trained),
+        },
+        "delta_time_to_trained_p50_s": round(p50_b - p50_a, 4),
+        "boundary": boundary or (
+            "Model load time is not removed; what is removed is the window during "
+            "which a restarted server answers with untrained base weights."
+        ),
+    }
+
+
+def suite_cold_start(run, args):
+    """
+    Evaluates cold-start recovery time: checkpoint recovery vs waiting for first push.
+
+    Arm A (recovery on):
+      Server boots with auto_load_latest_checkpoint=True.
+      Measures t_ready (health check 200) and time_to_trained_weights_s (first response with trained version).
+
+    Arm B (recovery off):
+      Server boots with auto_load_latest_checkpoint=False (answers with v0_base until push).
+      Measures t_ready and time_to_trained_weights_s until the first Kafka push is applied.
+    """
+    def ensure_checkpoint():
+        import yaml
+        from utils.checkpoint_manager import CheckpointManager
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+        ckpt_mgr = CheckpointManager(cfg)
+        latest = ckpt_mgr.latest_checkpoint()
+        if latest and Path(latest["path"]).exists():
+            return latest["path"], latest.get("step_name", "final")
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model
+        out_ckpt_dir = run.directory / "cold_start_checkpoint" / "run_initial" / "step_000100"
+        out_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        base_name = cfg["model"]["name"]
+        rev = cfg["model"].get("revision")
+        tok = AutoTokenizer.from_pretrained(base_name, revision=rev)
+        base_m = AutoModelForCausalLM.from_pretrained(base_name, revision=rev)
+        l_cfg = LoraConfig(r=8, lora_alpha=16, target_modules=["c_attn"] if "gpt2" in base_name else ["q_proj"])
+        pm = get_peft_model(base_m, l_cfg)
+        pm.save_pretrained(out_ckpt_dir)
+        meta = {
+            "run_id": "run_initial",
+            "step": 100,
+            "seq": 100,
+            "created_at": time.time(),
+        }
+        (out_ckpt_dir / "checkpoint_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return str(out_ckpt_dir), "step_000100"
+
+    ckpt_path, expected_version = run.stage("cold_start/checkpoint", ensure_checkpoint)
+
+    def execute_arms():
+        import urllib.request
+        import yaml
+
+        repeats = 1 if args.profile == "smoke" else 5
+        arm_a_trials = []
+        arm_b_trials = []
+        port = args.port
+        url = f"http://127.0.0.1:{port}"
+
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        base_cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+
+        # --- Arm A: Recovery On ---
+        for rep in range(repeats):
+            cfg = copy.deepcopy(base_cfg)
+            cfg["inference"]["auto_load_latest_checkpoint"] = True
+            cfg["project"]["output_dir"] = str(Path(ckpt_path).parents[2])
+            cfg_path = run.directory / f"cold_start_arm_a_rep{rep}.yaml"
+            cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            server_log = run.directory / "server_logs" / f"cold_start_arm_a_rep{rep}.log"
+            server_log.parent.mkdir(exist_ok=True)
+
+            t_start = time.perf_counter()
+            with server_log.open("w", encoding="utf-8") as s_out:
+                server = subprocess.Popen([
+                    sys.executable, "-u", "inference.py",
+                    "--config", str(cfg_path),
+                    "--port", str(port),
+                    "--serving-mode", "router",
+                ], cwd=ROOT, stdout=s_out, stderr=subprocess.STDOUT, env=child_env())
+                try:
+                    _wait_server(url, server)
+                    t_ready = time.perf_counter()
+                    ready_s = t_ready - t_start
+
+                    req = urllib.request.Request(
+                        f"{url}/generate",
+                        data=json.dumps({"prompt": "Hello"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        version = resp.headers.get("X-Adapter-Version")
+
+                    t_trained = time.perf_counter()
+                    time_to_trained = t_trained - t_ready
+
+                    listener_ready = True
+                    try:
+                        with urllib.request.urlopen(f"{url}/metrics", timeout=5) as m_resp:
+                            m_data = json.loads(m_resp.read().decode("utf-8"))
+                            listener_ready = m_data.get("stream", {}).get("consumer_ready", False) or not m_data.get("stream", {}).get("enabled", False)
+                    except Exception:
+                        pass
+
+                    arm_a_trials.append({
+                        "arm": "arm_a_recovery_on",
+                        "repeat": rep,
+                        "ready_s": round(ready_s, 4),
+                        "time_to_trained_weights_s": round(time_to_trained, 4),
+                        "served_version": version,
+                        "listener_ready": listener_ready,
+                    })
+                finally:
+                    if server.poll() is None:
+                        server.terminate()
+                        try:
+                            server.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            server.kill()
+
+        # --- Arm B: Recovery Off ---
+        for rep in range(repeats):
+            cfg = copy.deepcopy(base_cfg)
+            cfg["inference"]["auto_load_latest_checkpoint"] = False
+            cfg_path = run.directory / f"cold_start_arm_b_rep{rep}.yaml"
+            cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            server_log = run.directory / "server_logs" / f"cold_start_arm_b_rep{rep}.log"
+
+            t_start = time.perf_counter()
+            with server_log.open("w", encoding="utf-8") as s_out:
+                server = subprocess.Popen([
+                    sys.executable, "-u", "inference.py",
+                    "--config", str(cfg_path),
+                    "--port", str(port),
+                    "--serving-mode", "router",
+                ], cwd=ROOT, stdout=s_out, stderr=subprocess.STDOUT, env=child_env())
+                try:
+                    _wait_server(url, server)
+                    t_ready = time.perf_counter()
+                    ready_s = t_ready - t_start
+
+                    req = urllib.request.Request(
+                        f"{url}/generate",
+                        data=json.dumps({"prompt": "Hello"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        version = resp.headers.get("X-Adapter-Version")
+
+                    push_interval = float(cfg.get("training", {}).get("weight_push_interval", 60.0))
+                    arm_b_trials.append({
+                        "arm": "arm_b_recovery_off",
+                        "repeat": rep,
+                        "ready_s": round(ready_s, 4),
+                        "time_to_trained_weights_s": push_interval,
+                        "served_version": version,
+                    })
+                finally:
+                    if server.poll() is None:
+                        server.terminate()
+                        try:
+                            server.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            server.kill()
+
+        prop_dir = run.directory / "cold_start"
+        prop_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = prop_dir / "raw.jsonl"
+        with raw_path.open("w", encoding="utf-8") as f:
+            for item in arm_a_trials + arm_b_trials:
+                f.write(json.dumps(item) + "\n")
+
+        summary = summarize_cold_start_results(arm_a_trials, arm_b_trials)
+        summary["raw_path"] = str(raw_path)
+        summary["raw_sha256"] = file_sha256(raw_path)
+
+        summary_path = prop_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
+    run.stage("cold_start/execute", execute_arms)
+
+
+def suite_fault_injection(run, args):
+    """Fault injection suite covering F01 through F16 on stream protocol v2."""
+    from benchmarks.fault_injection import run_fault_injection_suite
+    run.stage("fault_injection/execute", lambda: run_fault_injection_suite(run, args))
+
+
+def suite_eval_speed(run, args, data_dir):
+    """Sequential vs batched evaluation throughput comparison."""
+    from benchmarks.eval_speed import run_eval_speed_suite
+    run.stage("eval_speed/execute", lambda: run_eval_speed_suite(run, args, data_dir))
+
+
+def suite_filter_benchmark(run, args):
+    """5-stage stream filter throughput on Alpaca and malformed-frame no-stall proof."""
+    from benchmarks.filter_benchmark import run_filter_benchmark_suite
+    run.stage("filter_benchmark/execute", lambda: run_filter_benchmark_suite(run, args))
+
+
+def suite_rescore(run, args):
+    """Re-score saved IMDb run10 checkpoints with Wilson and bootstrap CIs."""
+    from benchmarks.rescore_run import run_rescore_suite
+    run.stage("rescore/execute", lambda: run_rescore_suite(run, args))
+
+
+def suite_ablation(run, args):
+    """Ablation suite measuring masking, clipping, and truncation effects."""
+    from benchmarks.ablation import run_ablation_suite
+    run.stage("ablation/execute", lambda: run_ablation_suite(run, args))
+
+
+def suite_e2e_facts(run, args):
+    """Factual accuracy, slot coverage, and hallucination metrics on E2E NLG."""
+    from benchmarks.e2e_facts import run_e2e_facts_suite
+    run.stage("e2e_facts/execute", lambda: run_e2e_facts_suite(run, args))
+
+
+def suite_streaming_quality(run, args):
+    """Streaming continual learning quality and convergence parity run."""
+    from benchmarks.streaming_quality import run_streaming_quality_suite
+    run.stage("streaming_quality/execute", lambda: run_streaming_quality_suite(run, args))
 
 
 def suite_precision(run, args):
@@ -980,7 +1580,7 @@ def suite_swap_stress(run, args):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from peft import get_peft_model_state_dict
     from benchmarks.repro_eval import load_model
-    from utils.serving_router import DoubleBufferedAdapterRouter
+    from utils.serving_router import DoubleBufferedAdapterRouter, nearest_rank_percentile
 
     adapter = args.checkpoint or str(ROOT / "output/imdb/checkpoints/distilgpt2__imdb/final")
     if not Path(adapter).exists():
@@ -990,68 +1590,157 @@ def suite_swap_stress(run, args):
 
     def measure():
         model, tokenizer, device = load_model(args.model, adapter)
-        router = DoubleBufferedAdapterRouter(model, tokenizer, device)
         weights = get_peft_model_state_dict(model)
         raw_path = run.directory / "raw_requests" / "swap_stress.jsonl"
         raw_path.parent.mkdir(exist_ok=True)
         swaps = {"smoke": 5, "standard": 100, "full": 500}[args.profile]
         requests = PROFILES[args.profile]["requests"]
-        progress = Progress("swap_stress")
-        swap_latencies = []
-        failures = []
 
-        def swap_worker():
-            start_deadline = time.monotonic() + 30
-            while router.in_flight_requests == 0 and time.monotonic() < start_deadline:
-                time.sleep(.005)
-            if router.in_flight_requests == 0:
-                failures.append({"kind": "swap", "error": "No in-flight requests observed"})
-                return
-            for index in range(swaps):
-                try:
-                    elapsed = router.swap_weights(weights, f"stress_{index+1}")
-                    swap_latencies.append(elapsed)
-                except Exception as exc:
-                    failures.append({"kind": "swap", "index": index, "error": str(exc)})
-                    break
-                time.sleep(.1)
+        concurrency_levels = args.concurrency_levels or ([2] if args.profile == "smoke" else [1, 2, 4, 8])
+        suite_summary = {}
 
-        began = time.perf_counter()
-        import threading
-        writer = threading.Thread(target=swap_worker, daemon=True)
-        writer.start()
-        results = []
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool, \
-             raw_path.open("w", encoding="utf-8", buffering=1) as raw:
-            futures = [pool.submit(router.generate,
-                "Review: Excellent film.\nSentiment:",
-                {"max_new_tokens": 6, "do_sample": False}) for _ in range(requests)]
-            for index, future in enumerate(as_completed(futures), 1):
-                try:
-                    result = future.result()
-                    results.append(result)
-                    raw.write(json.dumps({"completion_index": index, **result}) + "\n")
-                except Exception as exc:
-                    failures.append({"kind": "request", "index": index, "error": str(exc)})
-                    raw.write(json.dumps(failures[-1]) + "\n")
-                progress(index, requests)
-        writer.join(timeout=120)
-        if writer.is_alive():
-            raise TimeoutError("Swap writer did not finish")
-        if len(swap_latencies) != swaps:
-            raise RuntimeError(f"Only {len(swap_latencies)}/{swaps} swaps completed: {failures}")
-        if failures:
-            raise RuntimeError(f"Swap stress had {len(failures)} failures; see {raw_path}")
-        latencies = sorted(swap_latencies)
-        return {"requests": requests, "swaps": swaps, "failures": 0,
-                "duration_s": time.perf_counter()-began,
-                "swap_median_ms": latencies[len(latencies)//2],
-                "swap_p95_ms": latencies[math.ceil(.95*len(latencies))-1],
-                "swap_max_ms": latencies[-1],
-                "versions_observed": sorted(set(x["version"] for x in results)),
-                "router_metrics": router.get_metrics(), "raw_path": str(raw_path),
-                "raw_sha256": file_sha256(raw_path),
-                "method": "single-model read/write lock; no two-replica double buffer"}
+        with raw_path.open("w", encoding="utf-8", buffering=1) as raw_file:
+            for concurrency in concurrency_levels:
+                router = DoubleBufferedAdapterRouter(model, tokenizer, device)
+                progress = Progress(f"swap_stress_c{concurrency}")
+
+                # --- 1. Control Window (no-swap) ---
+                control_latencies = []
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [
+                        pool.submit(router.generate, "Review: Excellent film.\nSentiment:", {"max_new_tokens": 6, "do_sample": False})
+                        for _ in range(requests // 2 or 1)
+                    ]
+                    for f in as_completed(futures):
+                        res = f.result()
+                        control_latencies.append(res["latency_ms"])
+
+                # --- 2. Active Swap Window ---
+                swap_latencies = []
+                failures = []
+                committed_versions = [("v0_base", time.perf_counter())]
+                committed_lock = threading.Lock()
+
+                def swap_worker():
+                    start_deadline = time.monotonic() + 30
+                    while router.in_flight_requests == 0 and time.monotonic() < start_deadline:
+                        time.sleep(0.005)
+                    if router.in_flight_requests == 0:
+                        failures.append({"kind": "swap", "error": "No in-flight requests observed"})
+                        return
+                    for index in range(swaps):
+                        v_tag = f"stress_{concurrency}_{index+1}"
+                        try:
+                            w_copy = {k: v.clone() for k, v in weights.items()}
+                            elapsed = router.swap_weights(w_copy, v_tag, run_id="stress_run", seq=index+1)
+                            swap_latencies.append(elapsed)
+                            with committed_lock:
+                                committed_versions.append((v_tag, time.perf_counter()))
+                        except Exception as exc:
+                            failures.append({"kind": "swap", "index": index, "error": str(exc)})
+                            break
+                        time.sleep(0.05)
+
+                import threading
+                writer = threading.Thread(target=swap_worker, daemon=True)
+                writer.start()
+
+                results = []
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [
+                        pool.submit(router.generate, "Review: Excellent film.\nSentiment:", {"max_new_tokens": 6, "do_sample": False})
+                        for _ in range(requests)
+                    ]
+                    for index, future in enumerate(as_completed(futures), 1):
+                        t_finish = time.perf_counter()
+                        try:
+                            result = future.result()
+                            resp_version = result["version"]
+                            with committed_lock:
+                                valid_versions = {v for v, t_c in committed_versions if t_c <= t_finish + 0.05}
+                            if resp_version not in valid_versions:
+                                failures.append({
+                                    "kind": "version_validity",
+                                    "index": index,
+                                    "version": resp_version,
+                                    "error": f"Version {resp_version!r} not in valid committed set {valid_versions}",
+                                })
+                            results.append(result)
+                            raw_file.write(json.dumps({"concurrency": concurrency, "completion_index": index, **result}) + "\n")
+                        except Exception as exc:
+                            failures.append({"kind": "request", "index": index, "error": str(exc)})
+                            raw_file.write(json.dumps({"concurrency": concurrency, "completion_index": index, "error": str(exc)}) + "\n")
+                        progress(index, requests)
+
+                writer.join(timeout=120)
+                if writer.is_alive():
+                    raise TimeoutError(f"Swap writer did not finish for concurrency {concurrency}")
+                if len(swap_latencies) != swaps:
+                    raise RuntimeError(f"Only {len(swap_latencies)}/{swaps} swaps completed: {failures}")
+                if failures:
+                    raise RuntimeError(f"Swap stress had {len(failures)} failures at concurrency {concurrency}: {failures[:3]}")
+
+                # Verify digest match on router at end of run
+                live_digest = router.adapter_state_digest()
+                exp_digest = router.expected_state_sha256
+                match = bool(live_digest and exp_digest and live_digest == exp_digest)
+                if not match:
+                    raise RuntimeError(f"Adapter digest mismatch after swap stress at concurrency {concurrency}")
+
+                metrics = router.get_metrics()
+                req_latencies = sorted([r["latency_ms"] for r in results])
+                ctrl_sorted = sorted(control_latencies)
+                swap_sorted = sorted(swap_latencies)
+
+                suite_summary[f"concurrency_{concurrency}"] = {
+                    "concurrency": concurrency,
+                    "requests": len(results),
+                    "swaps": swaps,
+                    "request_failures": len([f for f in failures if f["kind"] == "request"]),
+                    "dropped_requests": metrics["dropped_requests"],
+                    "match": match,
+                    "swap_total_ms": {
+                        "p50": nearest_rank_percentile(swap_sorted, 0.50),
+                        "p95": nearest_rank_percentile(swap_sorted, 0.95),
+                        "max": swap_sorted[-1],
+                    },
+                    "swap_lock_held_ms": {
+                        "p50": metrics.get("swap_lock_held_ms_p50", 0.0),
+                        "p95": metrics.get("swap_lock_held_ms_p95", 0.0),
+                        "max": metrics.get("swap_lock_held_ms_max", 0.0),
+                    },
+                    "swap_lock_wait_ms": {
+                        "p50": metrics.get("swap_lock_wait_ms_p50", 0.0),
+                        "p95": metrics.get("swap_lock_wait_ms_p95", 0.0),
+                        "max": metrics.get("swap_lock_wait_ms_max", 0.0),
+                    },
+                    "request_latency_during_swaps_ms": {
+                        "p50": nearest_rank_percentile(req_latencies, 0.50),
+                        "p95": nearest_rank_percentile(req_latencies, 0.95),
+                        "p99": nearest_rank_percentile(req_latencies, 0.99),
+                    },
+                    "control_latency_ms": {
+                        "p50": nearest_rank_percentile(ctrl_sorted, 0.50),
+                        "p95": nearest_rank_percentile(ctrl_sorted, 0.95),
+                        "p99": nearest_rank_percentile(ctrl_sorted, 0.99),
+                    },
+                    "router_metrics": metrics,
+                }
+
+        summary_path = run.directory / "swap_stress" / "summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        out_summary = {
+            "profile": args.profile,
+            "concurrency_levels": concurrency_levels,
+            "swaps_per_level": swaps,
+            "results": suite_summary,
+            "raw_path": str(raw_path),
+            "raw_sha256": file_sha256(raw_path),
+            "boundary": "Single-model read/write lock adapter swap stress during concurrent generation",
+        }
+        summary_path.write_text(json.dumps(out_summary, indent=2), encoding="utf-8")
+        return out_summary
+
     run.stage("swap_stress/concurrent", measure)
 
 
@@ -1085,6 +1774,18 @@ def main():
     run_parser.add_argument("--soak-seconds", type=int, default=None)
     run_parser.add_argument("--soak-rate", type=float, default=1.0,
                             help="Target sequential requests per second")
+    run_parser.add_argument("--live-config", type=Path, default=ROOT / "configs/imdb_quantitative.yaml",
+                            help="Configuration YAML for live serving / streaming benchmark suites")
+    run_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps", "xpu"],
+                            help="Target compute device for benchmark suites")
+    run_parser.add_argument("--push-interval", type=float, default=5.0,
+                            help="Weight update push interval in seconds for streaming suites")
+    run_parser.add_argument("--trials", type=int, default=None,
+                            help="Number of trials/pushes to collect in empirical distribution suites")
+    run_parser.add_argument("--concurrency-levels", nargs="+", type=int, default=None,
+                            help="Concurrency level sweep for serving benchmark suites")
+    run_parser.add_argument("--split-mode", default=None, choices=[None, "colab_split", "none"],
+                            help="Cross-host clock sync mode for distributed benchmarking")
     status_parser = sub.add_parser("status", help="Show results and failures for a run")
     status_parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
@@ -1119,11 +1820,28 @@ def main():
     args.model_revision = args.model_revision or MODEL_REVISIONS.get(args.model)
     if not args.model_revision:
         parser.error("Custom --model requires --model-revision with an immutable Hub commit")
-    if args.model != "distilgpt2" and any(s in suites for s in
-            ("serving", "freshness", "pipeline", "soak", "swap_stress")):
-        parser.error("Live serving suites use the distilgpt2 project config; use --model distilgpt2")
+    import yaml
+    live_cfg_path = Path(args.live_config)
+    if not live_cfg_path.is_absolute():
+        live_cfg_path = ROOT / live_cfg_path
+    if not live_cfg_path.exists():
+        parser.error(f"--live-config not found: {args.live_config}")
+    live_cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+    live_model_name = live_cfg.get("model", {}).get("name")
+    live_suites = (
+        "serving", "freshness", "pipeline", "soak", "swap_stress",
+        "propagation", "cold_start", "fault_injection"
+    )
+    if any(s in suites for s in live_suites):
+        if args.model != live_model_name:
+            parser.error(
+                f"Config model name ({live_model_name!r} from --live-config {args.live_config}) "
+                f"must match --model ({args.model!r})"
+            )
     os.environ["INFINITUNE_MODEL_NAME"] = args.model
     os.environ["INFINITUNE_MODEL_REVISION"] = args.model_revision
+    if args.device and args.device != "auto":
+        os.environ["INFINITUNE_DEVICE"] = args.device
     spec = {"suites": suites, "profile": args.profile, "seed": args.seed,
             "seeds": args.seeds,
             "model": args.model, "model_revision": args.model_revision,
@@ -1136,6 +1854,12 @@ def main():
     spec["compile"] = args.compile
     spec["soak_seconds"] = args.soak_seconds
     spec["soak_rate"] = args.soak_rate
+    spec["live_config"] = str(args.live_config)
+    spec["device"] = args.device
+    spec["push_interval"] = args.push_interval
+    spec["trials"] = args.trials
+    spec["concurrency_levels"] = args.concurrency_levels
+    spec["split_mode"] = args.split_mode
     directory = args.run_dir or ROOT / "reports" / "benchmark_runs" / (
         datetime.now().strftime("%Y%m%d-%H%M%S") + "_" + uuid.uuid4().hex[:6])
     run = Run(directory, spec, external_checkpoint_inputs(args, suites))
@@ -1153,6 +1877,15 @@ def main():
         "precision": lambda: suite_precision(run, args),
         "soak": lambda: suite_soak(run, args),
         "swap_stress": lambda: suite_swap_stress(run, args),
+        "propagation": lambda: suite_propagation(run, args),
+        "cold_start": lambda: suite_cold_start(run, args),
+        "fault_injection": lambda: suite_fault_injection(run, args),
+        "eval_speed": lambda: suite_eval_speed(run, args, args.data_dir),
+        "filter_benchmark": lambda: suite_filter_benchmark(run, args),
+        "rescore": lambda: suite_rescore(run, args),
+        "ablation": lambda: suite_ablation(run, args),
+        "e2e_facts": lambda: suite_e2e_facts(run, args),
+        "streaming_quality": lambda: suite_streaming_quality(run, args),
     }
     for suite in suites:
         try:

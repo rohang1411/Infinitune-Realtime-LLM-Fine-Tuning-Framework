@@ -16,7 +16,7 @@ from utils.serving_router import DoubleBufferedAdapterRouter
 
 
 def test_snapshot_rejects_incomplete_commit_and_undeclared_tensor():
-    assembler = SnapshotAssembler()
+    assembler = SnapshotAssembler(integrity="none_v1_compat")
     manifest = {"step_id": "7", "num_tensors": 2,
                 "tensor_names": ["a", "b"]}
     assert assembler.add("__manifest__:7", manifest) is None
@@ -28,7 +28,7 @@ def test_snapshot_rejects_incomplete_commit_and_undeclared_tensor():
 
 
 def test_snapshot_complete_only_after_commit():
-    assembler = SnapshotAssembler()
+    assembler = SnapshotAssembler(integrity="none_v1_compat")
     assert assembler.add("__manifest__:8", {"step_id": "8", "num_tensors": 1,
                                             "tensor_names": ["x"]}) is None
     assert assembler.add("8:x", torch.ones(2)) is None
