@@ -44,6 +44,10 @@ import os
 import sys
 import time
 import uuid
+import signal
+import statistics
+from pathlib import Path
+from typing import Optional
 
 import torch
 import yaml
@@ -335,6 +339,232 @@ def evaluate_checkpoint(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Offline Checkpoint Auditing Watch Service
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_checkpoint_complete(ckpt_dir: Path | str) -> bool:
+    """Check if checkpoint directory has valid checkpoint_meta.json and adapter weights file."""
+    p = Path(ckpt_dir)
+    if not p.is_dir():
+        return False
+    meta_path = p / "checkpoint_meta.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return False
+    except Exception:
+        return False
+
+    weights_exist = (
+        (p / "adapter_model.safetensors").is_file() or
+        (p / "adapter_model.bin").is_file()
+    )
+    return weights_exist
+
+
+def compute_watch_summary(eval_records: list) -> dict:
+    """Compute summary statistics (p50, p95, mean) for watch evaluation metrics."""
+    if not eval_records:
+        return {
+            "queue_delay_p50": 0.0,
+            "queue_delay_p95": 0.0,
+            "queue_delay_mean": 0.0,
+            "eval_latency_p50": 0.0,
+            "eval_latency_p95": 0.0,
+            "eval_latency_mean": 0.0,
+            "evaluated_count": 0,
+        }
+    q_delays = sorted(r["queue_delay_s"] for r in eval_records)
+    latencies = sorted(r["eval_latency_s"] for r in eval_records)
+
+    def _perc(vals, q):
+        if not vals:
+            return 0.0
+        from utils.serving_router import nearest_rank_percentile
+        return nearest_rank_percentile(vals, q)
+
+    return {
+        "queue_delay_p50": round(_perc(q_delays, 0.50), 4),
+        "queue_delay_p95": round(_perc(q_delays, 0.95), 4),
+        "queue_delay_mean": round(statistics.mean(q_delays), 4),
+        "eval_latency_p50": round(_perc(latencies, 0.50), 4),
+        "eval_latency_p95": round(_perc(latencies, 0.95), 4),
+        "eval_latency_mean": round(statistics.mean(latencies), 4),
+        "evaluated_count": len(eval_records),
+    }
+
+
+def run_watch_mode(
+    config: dict,
+    config_path: str,
+    run_name: Optional[str] = None,
+    poll_seconds: float = 15.0,
+    max_iterations: Optional[int] = None,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """
+    Offline checkpoint auditing service (evaluate.py --watch).
+    Polls checkpoint root and evaluates each new complete checkpoint once.
+    Persists evaluation progress in eval_watch_state.json and metrics in watch_metrics.json.
+    """
+    from utils.checkpoint_manager import CheckpointManager
+
+    output_dir = Path(config.get("project", {}).get("output_dir", "./output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_file = output_dir / "eval_watch_state.json"
+    metrics_file = output_dir / "watch_metrics.json"
+
+    done_checkpoints = set()
+    runs_state = {}
+    if state_file.exists():
+        try:
+            sdata = json.loads(state_file.read_text(encoding="utf-8"))
+            done_checkpoints = set(sdata.get("done_checkpoints", []))
+            runs_state = sdata.get("runs", {})
+            _log(f"[WATCH] Resumed state from {state_file}: {len(done_checkpoints)} checkpoint(s) already done.")
+        except Exception as exc:
+            _log(f"[WATCH] Warning: failed reading state file {state_file}: {exc}")
+
+    eval_records = []
+    if metrics_file.exists():
+        try:
+            mdata = json.loads(metrics_file.read_text(encoding="utf-8"))
+            eval_records = mdata.get("checkpoints", [])
+        except Exception:
+            pass
+
+    stop_requested = False
+    original_sigint = None
+
+    def sigint_handler(signum, frame):
+        nonlocal stop_requested
+        _log("[WATCH] SIGINT received: finishing current checkpoint and stopping cleanly...")
+        stop_requested = True
+
+    try:
+        original_sigint = signal.signal(signal.SIGINT, sigint_handler)
+    except (ValueError, AttributeError):
+        pass
+
+    iteration = 0
+    ckpt_manager = CheckpointManager(config, config_path=config_path)
+    evaluator_bundle = {}
+    max_steps = int(config.get("training", {}).get("max_steps", 1000))
+    target_device = device or _get_device("auto")
+
+    try:
+        while not stop_requested:
+            iteration += 1
+            runs = ckpt_manager.list_runs()
+            if run_name and run_name != "latest":
+                target_run = run_name
+            else:
+                target_run = runs[0] if runs else None
+
+            if target_run:
+                available = ckpt_manager.list_checkpoints(run_name=target_run)
+                for ckpt in available:
+                    if stop_requested:
+                        break
+
+                    ckpt_path = Path(ckpt["path"])
+                    ckpt_key = str(ckpt_path.resolve())
+                    if ckpt_key in done_checkpoints or ckpt["name"] in done_checkpoints:
+                        continue
+
+                    if not is_checkpoint_complete(ckpt_path):
+                        _log(f"[WATCH] Skipping incomplete checkpoint '{ckpt['name']}' until metadata and weights exist.")
+                        continue
+
+                    meta_file = ckpt_path / "checkpoint_meta.json"
+                    mtime = meta_file.stat().st_mtime
+                    eval_start = time.time()
+                    queue_delay_s = max(0.0, eval_start - mtime)
+
+                    raw_step = ckpt.get("step")
+                    if raw_step == "final" or str(raw_step).lower() == "final":
+                        eval_step = max_steps
+                    elif isinstance(raw_step, int):
+                        eval_step = raw_step
+                    elif isinstance(raw_step, str) and raw_step.isdigit():
+                        eval_step = int(raw_step)
+                    elif isinstance(raw_step, str) and raw_step.startswith("step_") and raw_step[5:].isdigit():
+                        eval_step = int(raw_step[5:])
+                    else:
+                        eval_step = 0
+
+                    _log(f"[WATCH] Evaluating new complete checkpoint: {ckpt['name']} at {ckpt_path} (step {eval_step})")
+                    try:
+                        metrics = evaluate_checkpoint(
+                            str(ckpt_path),
+                            config,
+                            config_path,
+                            evaluator_bundle=evaluator_bundle,
+                            step=eval_step,
+                            device=target_device,
+                        )
+                        eval_end = time.time()
+                        eval_latency_s = eval_end - eval_start
+
+                        out_dir = _make_eval_output_dir(config, ckpt["name"])
+                        _save_results(out_dir, metrics, config, str(ckpt_path))
+                        _generate_plots([{"step": eval_step, **metrics}], out_dir, config=config)
+
+                        rec = {
+                            "checkpoint": ckpt["name"],
+                            "path": ckpt_key,
+                            "checkpoint_mtime": mtime,
+                            "eval_start": eval_start,
+                            "eval_end": eval_end,
+                            "queue_delay_s": round(queue_delay_s, 4),
+                            "eval_latency_s": round(eval_latency_s, 4),
+                        }
+                        eval_records.append(rec)
+                        done_checkpoints.add(ckpt_key)
+                        done_checkpoints.add(ckpt["name"])
+                        runs_state.setdefault(target_run, []).append(ckpt["name"])
+
+                        state_payload = {
+                            "done_checkpoints": sorted(list(done_checkpoints)),
+                            "runs": runs_state,
+                            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        }
+                        state_file.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+
+                        summary_stats = compute_watch_summary(eval_records)
+                        metrics_payload = {
+                            "checkpoints": eval_records,
+                            "summary": summary_stats,
+                        }
+                        metrics_file.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+                        _log(f"[WATCH] Completed evaluation of '{ckpt['name']}' in {eval_latency_s:.2f}s (queue delay: {queue_delay_s:.2f}s)")
+
+                    except Exception as exc:
+                        _log(f"[WATCH] ERROR during evaluation of '{ckpt['name']}': {exc}")
+                        import traceback; traceback.print_exc()
+
+            if max_iterations and iteration >= max_iterations:
+                _log(f"[WATCH] Reached max_iterations={max_iterations}, exiting watch loop.")
+                break
+
+            poll_deadline = time.monotonic() + poll_seconds
+            while time.monotonic() < poll_deadline and not stop_requested:
+                time.sleep(0.25)
+
+    finally:
+        if original_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, original_sigint)
+            except Exception:
+                pass
+
+    return compute_watch_summary(eval_records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -366,6 +596,18 @@ def main():
     ckpt_group.add_argument(
         "--list", action="store_true",
         help="List available checkpoints and exit without evaluating.",
+    )
+    ckpt_group.add_argument(
+        "--watch", action="store_true",
+        help="Poll the checkpoint root and evaluate each new complete checkpoint once.",
+    )
+    parser.add_argument(
+        "--poll-seconds", type=float, default=15.0,
+        help="Polling interval in seconds for --watch mode (default: 15.0).",
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, default=None,
+        help="Maximum polling iterations for --watch mode (testing only; default: unlimited).",
     )
     parser.add_argument(
         "--run", default=None,
@@ -399,6 +641,20 @@ def main():
     runs = ckpt_manager.list_runs()
     selected_run = args.run if args.run else (runs[0] if runs else None)
     device = _get_device(args.device)
+
+    # ── --watch ──────────────────────────────────────────────────────────────
+    if args.watch:
+        _log("Starting offline checkpoint auditing service (--watch)...")
+        summary = run_watch_mode(
+            config,
+            args.config,
+            run_name=args.run,
+            poll_seconds=args.poll_seconds,
+            max_iterations=args.max_iterations,
+            device=device,
+        )
+        _log(f"Watch mode finished. Evaluated {summary.get('evaluated_count', 0)} checkpoints.")
+        sys.exit(0)
 
     # ── --list ───────────────────────────────────────────────────────────────
     if args.list:
