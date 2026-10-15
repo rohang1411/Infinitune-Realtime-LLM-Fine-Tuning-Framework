@@ -276,6 +276,10 @@ Infinitune-Realtime-LLM-Fine-Tuning-Framework/
 |-- evaluate.py           # Decoupled evaluator: loads any checkpoint, runs full eval
 |
 |-- configs/
+|   |-- overlays/
+|   |   |-- managed_kafka.yaml    # Managed Kafka overlay (SASL_SSL PLAIN, HMAC integrity)
+|   |   |-- colab_gpu.yaml        # Colab GPU overlay (cuda, bf16, batch 2, grad-accum 4)
+|   |   `-- drive_sync.yaml       # Google Drive checkpoint sync overlay
 |   |-- imdb_quantitative.yaml    # IMDb sentiment classification (distilgpt2, class_match)
 |   |-- imdb_qualitative.yaml     # IMDb domain generation (Qwen2.5-1.5B, keyword_density)
 |   |-- gsm8k_quantitative.yaml   # GSM8K math reasoning (Qwen2.5-3B, regex_extract)
@@ -284,6 +288,7 @@ Infinitune-Realtime-LLM-Fine-Tuning-Framework/
 |   `-- e2e_qualitative.yaml      # E2E NLG slot-to-text (gpt2-medium, structured_slot_coverage)
 |
 |-- utils/
+|   |-- config_overlay.py         # Recursive deep_merge & load_config_with_overlay helper
 |   |-- stream_filter.py          # 5-stage fail-closed data quality filter with FilterStats
 |   |-- checkpoint_manager.py     # CheckpointManager: deterministic (ts, kind, step) ordering & COMMITTED markers
 |   |-- eval_metrics_train.py     # Quantitative metrics (accuracy, F1 macro, MCC, AAUC, extract_final_number)
@@ -299,7 +304,7 @@ Infinitune-Realtime-LLM-Fine-Tuning-Framework/
 |   |-- kafka_config.py           # Kafka client kwargs builder, secret isolation, frame size guards
 |   |-- device.py                 # Centralized device resolution hierarchy (CLI > Env > Config > Auto)
 |   |-- holdout.py                # Deterministic sha256 hash-based train/eval holdout partition
-|   |-- precision_manager.py      # PrecisionManager: CUDA BF16/FP16, MPS half-precision base loading, FP32 CPU
+|   |-- precision_manager.py      # PrecisionManager: CUDA BF16/FP16, MPS/CPU half-precision loading, FP32 default
 |   |-- replay_buffer.py          # ReservoirReplayBuffer (Algorithm R) with domain tracking
 |   `-- continual_engine.py       # Online ADWIN drift detector (Bifet & Gavaldà 2007) with Hoeffding bounds
 |
@@ -338,13 +343,14 @@ Infinitune-Realtime-LLM-Fine-Tuning-Framework/
 |   |-- serving_ab/               # Historical unequal-load A/B artifacts (not a causal speedup)
 |   `-- benchmark_runs/           # New raw runs and tracebacks (Git-ignored)
 |
-|-- tests/                       # 230+ automated pytest unit & regression tests (100% pass rate)
+|-- tests/                       # 240+ automated pytest unit & regression tests (100% pass rate)
 |   |-- test_adapter_manifest.py  # HMAC-SHA256 signing, SHA-256 integrity, safe loading
 |   |-- test_benchmarks.py        # Benchmark harness & continual learning metric calculation
 |   |-- test_checkpoint_manager.py# Deterministic sorting, run timestamps, COMMITTED markers
 |   |-- test_claims.py            # Master evidence ledger thresholds and markdown rendering
 |   |-- test_colab_notebook.py    # Colab v2 notebook structure, script, and requirements validation
 |   |-- test_cold_start.py        # Arm A vs Arm B startup latency and version serving
+|   |-- test_config_overlay.py    # Recursive config deep-merge and overlay loader validation
 |   |-- test_continual_learning.py# Reservoir replay buffer sampling & real ADWIN drift detector
 |   |-- test_device.py            # Device resolution hierarchy (CLI > Env > Config > Auto)
 |   |-- test_e2e_facts.py         # E2E NLG slot scoring, alias tables, negation resolution
@@ -1394,6 +1400,7 @@ model:
                           # fp32 is the stable default (prevents NaN on MPS)
   max_seq_length: 512     # Max tokens per sample (prompt + response)
   allow_half_on_mps: false # false (default) | true: allow half-precision (fp16/bf16) base model on MPS
+  allow_half_on_cpu: false # false (default) | true: allow half-precision (fp16/bf16) base model on CPU (halves RAM for 3B models)
   device: null            # Device string ("cuda", "mps", "cpu") or null for auto-resolution hierarchy
   revision: null          # Immutable git commit hash on Hugging Face Hub (null = repo default)
 
@@ -1604,8 +1611,18 @@ The table below catalogs all configuration keys introduced or updated during the
 | `testing_strategy.generation_mode` | `str` | `"batched"` | No (new key) | **WP-17** | Uses PyTorch left-padded batched generation for qualitative evaluations, achieving an order-of-magnitude speedup over sequential generation. |
 | `dataset.holdout` | `dict \| null` | `null` | No (new key) | **WP-25** | Configures deterministic sha256 hash train/eval splitting (`size: 0.1, seed: 42`), resolving evaluation leakage on datasets like Alpaca. |
 | `model.allow_half_on_mps` | `bool` | `false` | No (new key) | **WP-26** | Allows loading frozen base model weights in fp16/bf16 on Apple Silicon MPS while keeping trainable LoRA weights in fp32. |
+| `model.allow_half_on_cpu` | `bool` | `false` | No (new key) | **Colab Split** | Opt-in flag allowing base model weights in fp16/bf16 on CPU, cutting memory footprint for 3B models from ~12.4 GB down to ~6.2 GB RAM for local inference. |
 | `model.device` | `str \| null` | `null` | No (new key) | **WP-26** | Device override (`"cuda"`, `"mps"`, `"cpu"`), integrated into `utils/device.py` resolution hierarchy. |
 | `model.revision` | `str \| null` | `null` | No (new key) | **WP-08** | Immutable git commit hash on Hugging Face Hub, guaranteeing model weight immutability across evaluation runs. |
+
+#### Configuration Overlays (`--config-overlay`)
+
+InfiniTune supports modular configuration overlays to patch base task configs without modifying root YAML files. Implemented in `utils/config_overlay.py` via recursive dictionary merge (`deep_merge`), `--config-overlay <path.yaml>` is supported across `producer.py`, `trainer.py`, `inference.py`, `evaluate.py`, and `benchmarks/run.py`.
+
+Pre-packaged overlays in `configs/overlays/`:
+- `colab_gpu.yaml`: Overrides device to `cuda`, sets mixed precision `bf16`, tunes batch size 2 and gradient accumulation 4 for Colab T4 GPUs.
+- `managed_kafka.yaml`: Configures SASL_SSL PLAIN authentication and HMAC integrity for managed cloud Kafka brokers (e.g., Confluent Cloud).
+- `drive_sync.yaml`: Overrides checkpoint and logging output directories to mounted Google Drive paths (`/content/drive/MyDrive/infinitune_experiments/output`).
 
 ---
 
@@ -2336,9 +2353,10 @@ Exposes real-time operational telemetry from `DoubleBufferedAdapterRouter.get_me
 
 For distributed or cloud environments where direct Kafka broker networking across WAN boundaries is restricted, `inference.py` supports **Mode C Watcher Mode** via `--watch-checkpoints <DIR>`:
 - The serving process starts `checkpoint_watcher_thread`, polling the specified shared directory (e.g. Google Drive sync folder or network volume) at 2-second intervals.
-- **Atomic `COMMITTED` Marker:** A newly written checkpoint directory is ignored until an atomic `COMMITTED` marker file is detected. The trainer creates this marker strictly *after* all LoRA weight tensors, tokenizer configs, and `manifest.json` are fully flushed.
-- **Manifest Integrity Check:** The watcher reads `manifest.json`, validates its SHA-256 hash, and initiates a hot-swap via `router.swap_from_manifest`.
-- **State Idempotence:** Applied versions are recorded in `applied_checkpoints.json` within the watched folder, preventing redundant re-swaps across restarts.
+- **Auto-Generated Manifest & Atomic `COMMITTED` Marker:** Every checkpoint save in `CheckpointManager.save()` automatically computes SHA-256 digests across `adapter_model.safetensors` and `adapter_config.json`, writing `manifest.json` before dropping the atomic `COMMITTED` marker. The `COMMITTED` file records the timestamp, adapter file size, and primary payload SHA-256 checksum.
+- **Manifest Integrity Check:** The watcher reads `manifest.json`, validates its SHA-256 hash against actual file bytes, and initiates an in-memory hot-swap via `router.swap_from_manifest`.
+- **Transient Sync Retry Logic (Cloud Drive Resilience):** Cloud sync clients (such as Google Drive Desktop or OneDrive) write files non-atomically and may present temporary file locks or partially transferred frames (`.tmp`). To prevent premature blacklisting of valid checkpoints during ongoing file sync, `checkpoint_watcher_thread` includes exponential backoff retries (up to 5 attempts with 1-second backoff). Only if corruption persists after all retries are exhausted (or in explicit one-shot test invocations) is the directory blacklisted in `applied_checkpoints.json`.
+- **State Idempotence:** Successfully applied checkpoint versions and verified digests are recorded in `applied_checkpoints.json` within the watched folder, preventing redundant re-swaps across server restarts.
 
 ---
 
@@ -2877,14 +2895,41 @@ curl -s -X POST http://localhost:5000/generate \
   | python3 -m json.tool
 ```
 
-### 15.4 Google Colab v2 Execution (Cloud Acceleration)
+### 15.4 Google Colab v2 Execution & Distributed Split Deployment (Cloud Acceleration)
 
-For training and evaluation runs that exceed local laptop capacity (e.g. Qwen2.5-3B training, full-dataset runs, or GPU evaluation speed benchmarks), InfiniTune provides a dedicated Google Colab framework governed by WP-27:
-- **Notebook:** `notebooks/infinitune_colab_v2.ipynb` executes the real streaming framework (not a mock iterator).
-- **Automated KRaft Daemon:** `scripts/colab/start_kafka.sh` installs headless OpenJDK 17, downloads Kafka 3.9, formats KRaft storage in `/content/kafka-data`, and launches the background daemon.
+For training and evaluation runs that exceed local laptop capacity (e.g., Qwen2.5-3B training, full-dataset runs, or GPU evaluation speed benchmarks), InfiniTune provides a comprehensive Google Colab framework governed by WP-27 and WP-28:
+- **Notebook:** `notebooks/infinitune_colab_v2.ipynb` executes the real streaming framework (cloning from repository, with GitHub token support via Colab Secrets).
+- **Automated KRaft Daemon:** `scripts/colab/start_kafka.sh` installs headless OpenJDK 17, downloads Kafka 3.9, formats KRaft storage in `/content/kafka-data`, and launches the background daemon (idempotent against already running brokers).
 - **Dependencies:** `requirements-colab.txt` preserves Colab's preinstalled GPU PyTorch and NumPy builds while installing framework requirements.
 - **Storage Persistence:** Caches Hugging Face models to `$PERSIST/hf_cache` on Google Drive, allowing runs to resume gracefully across runtime disconnects.
-- Detailed step-by-step instructions and run profiles are documented in [Section 7 of the Implementation Plan](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/docs/ImplementationPlan/04_Benchmark_Implementation_and_Verification_Plan.md#7-colab-testing).
+
+#### Deployment Modes for GPU Acceleration & Split Execution
+
+InfiniTune supports three distinct operational topologies to fit available hardware:
+
+1. **Mode A: All-in-Colab Autonomous Run**
+   - Producer, Trainer, and Evaluator run entirely inside the Colab instance using local KRaft Kafka.
+   - Ideal for end-to-end benchmark execution (e.g. `eval_speed`, `ablation`, full IMDb 1,563-step run) leveraging free-tier T4 GPU.
+   - Checkpoints and metrics persist directly to `/content/drive/MyDrive/infinitune_experiments/output`.
+
+2. **Mode B: Managed Kafka Split Deployment (WAN Streaming)**
+   - **Colab GPU:** Runs `trainer.py` with `--config-overlay configs/overlays/managed_kafka.yaml --config-overlay configs/overlays/colab_gpu.yaml`. Streams LoRA adapter weights via SASL_SSL to a managed cloud broker (e.g., Confluent Cloud or Upstash).
+   - **Local Laptop (CPU):** Runs `producer.py` (streaming data upstream) and `inference.py` (receiving weight updates over WAN).
+   - Latencies are joined via `benchmarks/merge_split_propagation.py` with bidirectional NTP clock-offset correction (`time.google.com`).
+
+3. **Mode C: Google Drive Sync Directory Watcher (Zero-Infra Offload)**
+   - **Colab GPU:** Runs `producer.py` and `trainer.py` with `--config-overlay configs/overlays/drive_sync.yaml --config-overlay configs/overlays/colab_gpu.yaml`, writing checkpoints directly to Google Drive.
+   - **Local Laptop (CPU):** Runs Google Drive Desktop to synchronize files locally, and serves requests via:
+     ```powershell
+     python inference.py --config configs/imdb_quantitative.yaml --watch-checkpoints "G:\My Drive\infinitune_experiments\output\imdb\checkpoints\distilgpt2__imdb"
+     ```
+   - Features atomic `COMMITTED` marker detection, SHA-256 `manifest.json` verification, and transient sync retry logic to handle partial cloud sync downloads.
+
+#### Low-Memory Local Inference on CPU (`allow_half_on_cpu`)
+
+When serving inference for larger models (such as `Qwen/Qwen2.5-3B` or `Qwen/Qwen2.5-1.5B`) on a local laptop without a dedicated GPU, standard FP32 weights require ~12.4 GB RAM, risking system thrashing. Setting `model.allow_half_on_cpu: true` (or passing the overlay) loads base weights in `bfloat16`/`float16` on CPU, halving memory consumption to ~6.2 GB RAM and enabling reliable local serving.
+
+For complete step-by-step instructions, see Section 5 of [Benchmark Testing Guide](file:///c:/Users/rohan/Documents/Projects/Infinitune-Realtime-LLM-Fine-Tuning-Framework/docs/ImplementationPlan/05_Benchmark_Testing_Guide.md#5-google-colab-evaluation--gpu-benchmarking).
 
 ### 15.5 Environment Variables Reference
 
