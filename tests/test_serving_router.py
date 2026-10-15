@@ -10,7 +10,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from utils.serving_router import ReadWriteLock, DoubleBufferedAdapterRouter
+from utils.serving_router import (
+    ReadWriteLock,
+    DoubleBufferedAdapterRouter,
+    nearest_rank_percentile,
+)
 
 
 def test_read_write_lock_concurrent_readers():
@@ -160,3 +164,49 @@ def test_concurrent_generation_during_swap():
     assert metrics["dropped_requests"] == 0
     assert metrics["requests_served"] == 60
     assert metrics["swap_count"] == 5
+
+
+def test_nearest_rank_percentile_known_values():
+    values = list(range(1, 101))
+    assert nearest_rank_percentile(values, 0.50) == 50.0
+    assert nearest_rank_percentile(values, 0.95) == 95.0
+    assert nearest_rank_percentile(values, 0.99) == 99.0
+
+    single = [42.0]
+    for q in [0.0, 0.1, 0.5, 0.95, 0.99, 1.0]:
+        assert nearest_rank_percentile(single, q) == 42.0
+
+    assert nearest_rank_percentile([], 0.50) == 0.0
+
+
+def test_lock_wait_includes_reader_drain():
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    router = DoubleBufferedAdapterRouter(mock_model, mock_tokenizer, device="cpu")
+    reader_acquired = threading.Event()
+
+    def slow_reader():
+        router.rw_lock.acquire_read()
+        reader_acquired.set()
+        try:
+            time.sleep(0.20)  # Hold read lock for 200ms
+        finally:
+            router.rw_lock.release_read()
+
+    t_reader = threading.Thread(target=slow_reader)
+    t_reader.start()
+
+    assert reader_acquired.wait(timeout=2.0)
+    # Reader is currently holding the read lock; swap_weights must wait for reader to drain
+    swap_total_ms = router.swap_weights({"w": torch.randn(2, 2)}, version_tag="v_drain_test")
+    t_reader.join()
+
+    assert router.last_swap_lock_wait_ms >= 150.0
+    assert router.last_swap_lock_held_ms < router.last_swap_lock_wait_ms
+    assert swap_total_ms == router.last_swap_lock_wait_ms + router.last_swap_lock_held_ms
+
+    metrics = router.get_metrics()
+    assert metrics["swap_lock_wait_ms_max"] >= 150.0
+    assert metrics["swap_lock_held_ms_max"] < metrics["swap_lock_wait_ms_max"]
+    assert "swap_prepare_ms_p50" in metrics
+

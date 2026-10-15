@@ -14,14 +14,29 @@ Key Production Architectural Improvements:
    guarantees zero dropped requests during active updates.
 """
 
+import math
 import time
 import threading
-from typing import Dict, Any, Optional, List
+from collections import deque
+from typing import Dict, Any, Optional, List, Sequence
 import torch
 from peft import PeftModel
 from transformers import AutoTokenizer, GenerationConfig
 
 from utils.adapter_manifest import AdapterManifest, load_adapter_weights
+
+
+def nearest_rank_percentile(sorted_values: Sequence[float], q: float) -> float:
+    """
+    Calculate nearest-rank percentile for a pre-sorted sequence of numbers.
+    Uses rank = ceil(q * n) with 1-indexing clamped to [1, n].
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    rank = max(1, min(n, math.ceil(q * n)))
+    return float(sorted_values[rank - 1])
+
 
 
 class ReadWriteLock:
@@ -85,6 +100,9 @@ class DoubleBufferedAdapterRouter:
         self.swap_count = 0
         self.last_swap_duration_ms = 0.0
         self.total_swap_duration_ms = 0.0
+        self.last_swap_prepare_ms = 0.0
+        self.last_swap_lock_wait_ms = 0.0
+        self.last_swap_lock_held_ms = 0.0
         self.dropped_requests = 0
         self.requests_served = 0
         self.in_flight_requests = 0
@@ -93,6 +111,11 @@ class DoubleBufferedAdapterRouter:
         self._latency_history_lock = threading.Lock()
         self._recent_latencies_ms: List[float] = []
         self._max_latency_history = 1000
+
+        # Swap metrics tracking
+        self._swap_prepare_history: deque = deque(maxlen=1000)
+        self._swap_lock_wait_history: deque = deque(maxlen=1000)
+        self._swap_lock_held_history: deque = deque(maxlen=1000)
 
     def generate(
         self,
@@ -173,6 +196,7 @@ class DoubleBufferedAdapterRouter:
         """
         from peft import get_peft_model_state_dict
 
+        t_prep_start = time.perf_counter()
         if not new_state_dict or not version_tag:
             raise ValueError("A swap requires a non-empty snapshot and version")
         if isinstance(self.model, PeftModel):
@@ -201,9 +225,12 @@ class DoubleBufferedAdapterRouter:
             # inference always takes the validated PEFT branch above.
             destinations = None
             prepared_weights = {k: v.to(self.device) for k, v in new_state_dict.items()}
+        t_prep_end = time.perf_counter()
+        prepare_ms = (t_prep_end - t_prep_start) * 1000.0
 
-        swap_start = time.perf_counter()
+        t_request = time.perf_counter()
         self.rw_lock.acquire_write()
+        t_acquired = time.perf_counter()
         try:
             if destinations is None:
                 self.model.load_state_dict(prepared_weights, strict=False)
@@ -215,12 +242,24 @@ class DoubleBufferedAdapterRouter:
             self.swap_count += 1
         finally:
             self.rw_lock.release_write()
+            t_released = time.perf_counter()
 
-        swap_duration_ms = (time.perf_counter() - swap_start) * 1000.0
-        self.last_swap_duration_ms = swap_duration_ms
-        self.total_swap_duration_ms += swap_duration_ms
+        lock_wait_ms = (t_acquired - t_request) * 1000.0
+        lock_held_ms = (t_released - t_acquired) * 1000.0
+        swap_total_ms = lock_wait_ms + lock_held_ms
 
-        return swap_duration_ms
+        self.last_swap_prepare_ms = prepare_ms
+        self.last_swap_lock_wait_ms = lock_wait_ms
+        self.last_swap_lock_held_ms = lock_held_ms
+        self.last_swap_duration_ms = swap_total_ms
+        self.total_swap_duration_ms += swap_total_ms
+
+        with self._latency_history_lock:
+            self._swap_prepare_history.append(prepare_ms)
+            self._swap_lock_wait_history.append(lock_wait_ms)
+            self._swap_lock_held_history.append(lock_held_ms)
+
+        return swap_total_ms
 
     def swap_from_manifest(self, manifest: AdapterManifest) -> float:
         """
@@ -235,9 +274,9 @@ class DoubleBufferedAdapterRouter:
             latencies = sorted(self._recent_latencies_ms)
             n = len(latencies)
             if n > 0:
-                p50 = latencies[int(n * 0.50)]
-                p95 = latencies[int(n * 0.95)]
-                p99 = latencies[min(int(n * 0.99), n - 1)]
+                p50 = nearest_rank_percentile(latencies, 0.50)
+                p95 = nearest_rank_percentile(latencies, 0.95)
+                p99 = nearest_rank_percentile(latencies, 0.99)
                 avg_lat = sum(latencies) / n
             else:
                 p50 = p95 = p99 = avg_lat = 0.0
@@ -248,11 +287,42 @@ class DoubleBufferedAdapterRouter:
                 else 0.0
             )
 
+            if self._swap_lock_wait_history:
+                wait_sorted = sorted(self._swap_lock_wait_history)
+                wait_p50 = nearest_rank_percentile(wait_sorted, 0.50)
+                wait_p95 = nearest_rank_percentile(wait_sorted, 0.95)
+                wait_max = max(wait_sorted)
+            else:
+                wait_p50 = wait_p95 = wait_max = 0.0
+
+            if self._swap_lock_held_history:
+                held_sorted = sorted(self._swap_lock_held_history)
+                held_p50 = nearest_rank_percentile(held_sorted, 0.50)
+                held_p95 = nearest_rank_percentile(held_sorted, 0.95)
+                held_max = max(held_sorted)
+            else:
+                held_p50 = held_p95 = held_max = 0.0
+
+            if self._swap_prepare_history:
+                prep_sorted = sorted(self._swap_prepare_history)
+                prep_p50 = nearest_rank_percentile(prep_sorted, 0.50)
+                prep_p95 = nearest_rank_percentile(prep_sorted, 0.95)
+            else:
+                prep_p50 = prep_p95 = 0.0
+
             return {
                 "active_version": self.active_version,
                 "swap_count": self.swap_count,
                 "last_swap_duration_ms": round(self.last_swap_duration_ms, 2),
                 "avg_swap_duration_ms": round(avg_swap, 2),
+                "swap_lock_wait_ms_p50": round(wait_p50, 2),
+                "swap_lock_wait_ms_p95": round(wait_p95, 2),
+                "swap_lock_wait_ms_max": round(wait_max, 2),
+                "swap_lock_held_ms_p50": round(held_p50, 2),
+                "swap_lock_held_ms_p95": round(held_p95, 2),
+                "swap_lock_held_ms_max": round(held_max, 2),
+                "swap_prepare_ms_p50": round(prep_p50, 2),
+                "swap_prepare_ms_p95": round(prep_p95, 2),
                 "requests_served": self.requests_served,
                 "in_flight_requests": self.in_flight_requests,
                 "dropped_requests": self.dropped_requests,
