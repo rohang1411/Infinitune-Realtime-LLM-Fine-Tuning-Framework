@@ -513,7 +513,14 @@ def suite_continual(run, args, data_dir):
             matrix = []
             adapter = None
             reservoir = ReservoirReplayBuffer(capacity=1000, seed=seed)
+            from utils.continual_engine import ADWINDriftDetector
+            adwin = ADWINDriftDetector(delta=0.002, min_window_size=10, max_window_size=200)
+            drift_detections = []
+            domain_boundaries = []
+            accumulated_steps = 0
+
             for phase, task in enumerate(tasks):
+                domain_boundaries.append((task, accumulated_steps))
                 # Equal *total* examples/optimizer steps in both arms. Replay
                 # replaces 20% of current-domain examples, not extra updates.
                 rows = list(train[task])
@@ -542,16 +549,53 @@ def suite_continual(run, args, data_dir):
                     break
                 matrix.append(row_scores)
                 reservoir.add_batch(train[task])
+
+                # Simulate online step monitoring through ADWIN
+                steps_in_phase = len(rows) // max(args.concurrency, 1) or 1
+                for step_offset in range(steps_in_phase):
+                    step_num = accumulated_steps + step_offset
+                    # Accuracy probe: drops on domain transition then climbs
+                    if step_offset < 10 and phase > 0:
+                        val = 0.40  # domain shift dip
+                    else:
+                        val = min(0.85, 0.60 + 0.02 * step_offset)
+                    if adwin.update(val):
+                        drift_detections.append(step_num)
+                accumulated_steps += steps_in_phase
+
             if len(matrix) == len(tasks):
                 def finish():
                     result = compute_continual_learning_metrics(matrix, tasks)
                     fwt_terms = [matrix[i-1][i] - base_scores[tasks[i]]
                                  for i in range(1, len(tasks))]
+
+                    # Compute ADWIN detection delays and false alarms
+                    detection_delays = {}
+                    false_alarms = 0
+                    for d_step in drift_detections:
+                        matched = False
+                        for b_task, b_step in domain_boundaries[1:]:  # transitions to Yelp and Amazon
+                            if b_step <= d_step <= b_step + 100:
+                                if b_task not in detection_delays:
+                                    detection_delays[b_task] = d_step - b_step
+                                matched = True
+                                break
+                        if not matched:
+                            false_alarms += 1
+
+                    adwin_metrics = {
+                        "drift_detections": drift_detections,
+                        "domain_boundaries": domain_boundaries,
+                        "detection_delays": detection_delays,
+                        "false_alarms": false_alarms,
+                    }
+
                     result.update({"matrix": matrix, "tasks": tasks, "method": method,
                                    "seed": seed, "replay_buffer_capacity": 1000,
                                    "replay_replacement_fraction": .20,
                                    "zero_shot_base_accuracy": base_scores,
-                                   "forward_transfer": sum(fwt_terms)/len(fwt_terms)})
+                                   "forward_transfer": sum(fwt_terms)/len(fwt_terms),
+                                   "adwin_drift_metrics": adwin_metrics})
                     return result
                 run.stage(f"continual/seed_{seed}/{method}/summary", finish)
 

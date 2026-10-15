@@ -79,3 +79,88 @@ def test_adwin_drift_detector():
             break
 
     assert drift_seen is True
+
+
+def test_adwin_properties_width_total_variance():
+    detector = ADWINDriftDetector(delta=0.002, min_window_size=10, max_window_size=100)
+    for v in [0.2, 0.4, 0.6, 0.8]:
+        detector.update(v)
+
+    assert detector.width == 4
+    assert round(detector.total, 4) == 2.0
+    assert detector.variance > 0.0
+
+
+def test_adwin_no_false_alarm_on_stationary_bernoulli():
+    import random
+    rng = random.Random(0)
+    detector = ADWINDriftDetector(
+        delta=0.002, min_window_size=10, max_window_size=1000, clock=1
+    )
+
+    detections = 0
+    # 5,000 Bernoulli(0.3) draws
+    for _ in range(5000):
+        val = 1.0 if rng.random() < 0.3 else 0.0
+        if detector.update(val):
+            detections += 1
+
+    # False alarm rate strictly bound: <= 1 detection over 5,000 stationary trials
+    assert detections <= 1
+
+
+def test_adwin_detects_mean_shift_with_bounded_delay():
+    import random
+    rng = random.Random(42)
+    detector = ADWINDriftDetector(
+        delta=0.002, min_window_size=10, max_window_size=1000, clock=1
+    )
+
+    # 1,000 samples of Bernoulli(0.2)
+    for _ in range(1000):
+        val = 1.0 if rng.random() < 0.2 else 0.0
+        detector.update(val)
+
+    # Shift to Bernoulli(0.8) — must detect within 100 samples
+    detected = False
+    delay = 0
+    for step in range(1, 101):
+        val = 1.0 if rng.random() < 0.8 else 0.0
+        if detector.update(val):
+            detected = True
+            delay = step
+            break
+
+    assert detected is True
+    assert delay <= 100
+
+
+def test_adwin_matches_river_oracle():
+    import importlib.util
+    if importlib.util.find_spec("river") is None:
+        pytest.skip("river package not installed; skipping optional oracle comparison")
+
+    from river import drift
+    river_adwin = drift.ADWIN(delta=0.002)
+    our_adwin = ADWINDriftDetector(delta=0.002, min_window_size=10, max_window_size=1000)
+
+    import random
+    rng = random.Random(1337)
+    # Stream with sudden shift
+    stream = [1.0 if rng.random() < 0.2 else 0.0 for _ in range(500)] + \
+             [1.0 if rng.random() < 0.8 else 0.0 for _ in range(500)]
+
+    river_detections = []
+    our_detections = []
+
+    for i, val in enumerate(stream):
+        river_adwin.update(val)
+        if river_adwin.drift_detected:
+            river_detections.append(i)
+        if our_adwin.update(val):
+            our_detections.append(i)
+
+    # Both should detect shift around step 500 within +- 64 samples
+    assert len(our_detections) >= 1
+    assert any(480 <= d <= 580 for d in our_detections)
+

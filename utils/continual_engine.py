@@ -101,52 +101,108 @@ class GoldenCanaryEvaluator:
 
 class ADWINDriftDetector:
     """
-    Adaptive Windowing (ADWIN) Drift Detector.
+    Adaptive Windowing (ADWIN) Drift Detector (Bifet & Gavaldà, 2007).
     Maintains a variable-sized window of scalar observations. When the difference
-    between two sub-windows exceeds the Hoeffding bound threshold, drift is flagged.
+    between two sub-windows exceeds the variance-aware Hoeffding bound threshold,
+    concept drift is detected, older observations are dropped, and drift is flagged.
     """
 
-    def __init__(self, delta: float = 0.002, min_window_size: int = 10, max_window_size: int = 200):
-        self.delta = delta
-        self.min_window_size = min_window_size
-        self.max_window_size = max_window_size
+    def __init__(
+        self,
+        delta: float = 0.002,
+        min_window_size: int = 10,
+        max_window_size: int = 200,
+        clock: int = 1,
+        value_range: Tuple[float, float] = (0.0, 1.0),
+    ):
+        self.delta = float(delta)
+        self.min_window_size = int(min_window_size)
+        self.max_window_size = int(max_window_size)
+        self.clock = int(clock)
+        self.value_range = (float(value_range[0]), float(value_range[1]))
         self.window: List[float] = []
         self.drift_detected = False
+        self._updates_count = 0
+
+    @property
+    def width(self) -> int:
+        """Current length of the observation window."""
+        return len(self.window)
+
+    @property
+    def total(self) -> float:
+        """Sum of all observations currently in the window."""
+        return sum(self.window)
+
+    @property
+    def variance(self) -> float:
+        """Empirical variance of observations in the window."""
+        n = len(self.window)
+        if n < 2:
+            return 0.0
+        mean = sum(self.window) / float(n)
+        return max(0.0, sum((x - mean) ** 2 for x in self.window) / float(n))
 
     def update(self, value: float) -> bool:
-        """Add observation and check for drift. Returns True if drift detected."""
-        self.window.append(float(value))
+        """Add observation, normalize to [0, 1], and check for drift across all cut points.
+
+        Returns True if drift detected, False otherwise.
+        """
+        lo, hi = self.value_range
+        val = float(value)
+        if hi > lo:
+            norm_val = max(0.0, min(1.0, (val - lo) / (hi - lo)))
+        else:
+            norm_val = max(0.0, min(1.0, val))
+
+        self.window.append(norm_val)
         if len(self.window) > self.max_window_size:
             self.window.pop(0)
 
+        self._updates_count += 1
         self.drift_detected = False
+
+        if self._updates_count % self.clock != 0:
+            return False
+
         n = len(self.window)
         if n < self.min_window_size * 2:
             return False
 
-        # Split window into two halves and check if difference is statistically significant
-        mid = n // 2
-        w0 = self.window[:mid]
-        w1 = self.window[mid:]
+        # Build prefix sums for O(n) scan across all valid split points
+        prefix_sum = [0.0] * (n + 1)
+        prefix_sq_sum = [0.0] * (n + 1)
+        for idx, x in enumerate(self.window):
+            prefix_sum[idx + 1] = prefix_sum[idx] + x
+            prefix_sq_sum[idx + 1] = prefix_sq_sum[idx] + (x * x)
 
-        n0 = len(w0)
-        n1 = len(w1)
-        mean0 = sum(w0) / n0
-        mean1 = sum(w1) / n1
+        tot_sum = prefix_sum[n]
+        tot_sq = prefix_sq_sum[n]
+        mean_w = tot_sum / float(n)
+        var_w = max(0.0, (tot_sq / float(n)) - (mean_w * mean_w))
+        delta_prime = max(self.delta / float(n), 1e-12)
+        ln_term = math.log(2.0 / delta_prime)
 
-        # Hoeffding epsilon bound: sqrt((1/(2*m)) * ln(4/delta))
-        m = 1.0 / (1.0 / n0 + 1.0 / n1)
-        eps = math.sqrt((1.0 / (2.0 * m)) * math.log(4.0 / self.delta))
+        # Check every split point i from min_window_size to n - min_window_size
+        for i in range(self.min_window_size, n - self.min_window_size + 1):
+            n0 = i
+            n1 = n - i
+            m = (n0 * n1) / float(n)  # harmonic mean factor: 1 / (1/n0 + 1/n1)
+            eps = math.sqrt((2.0 / m) * var_w * ln_term) + (2.0 / (3.0 * m)) * ln_term
 
-        if abs(mean0 - mean1) > eps:
-            self.drift_detected = True
-            # Shrink window upon drift
-            self.window = self.window[mid:]
-            return True
+            mean0 = prefix_sum[i] / float(n0)
+            mean1 = (tot_sum - prefix_sum[i]) / float(n1)
+
+            if abs(mean0 - mean1) >= eps:
+                self.drift_detected = True
+                # Drop older subwindow W0, preserve newer W1
+                self.window = self.window[i:]
+                return True
 
         return False
 
     def reset(self) -> None:
-        """Reset the detector window."""
+        """Reset the detector window and internal state."""
         self.window.clear()
         self.drift_detected = False
+        self._updates_count = 0
