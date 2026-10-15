@@ -2597,7 +2597,7 @@ The current benchmark source has changed since the 66-stage smoke run, so its ma
 | Kafka record-to-version pipeline | Eight acknowledged records, two optimizer steps, `step_2` visible in 7.593 s from last-send initiation | Real trainer and inference processes on isolated topics; no learned-behavior flip asserted. | **WP-13 / WP-20** (end-to-end streaming quality run over Kafka with bootstrap CIs) |
 | Precision | FP32 steady step 0.772 s in a two-step synthetic probe; BF16/FP16 unsupported on this CPU path | Diagnostic timing, not a production throughput or MFU result. | **WP-26** (`utils/device.py` & precision manager with MPS half-precision base loading) |
 | Memory soak | 11 successful requests over ten seconds; loaded inference process RSS 705.7 to 706.7 MB | Too short to infer a leak. The earlier roughly 5 MB launcher-process trace is invalid. | **WP-15 / WP-16** (soak and swap stress load tests tracking RSS) |
-| Swap stress | 20 requests, five swaps, zero failures; median 140 ms, maximum 307 ms lock-held swap | Observed in one small run; the historical sub-millisecond claim is false on this CPU. | **WP-09 / WP-15** (decoupled swap held vs wait time, median 82 ms, p95 128 ms lock-held) |
+| Swap stress | 20 requests, five swaps, zero failures; median 140 ms, maximum 307 ms lock-held swap | Observed in one small run; the historical sub-millisecond claim is false on this CPU. | **WP-09 / WP-15** (decouples swap held vs wait time; multi-trial p50/p95 benchmark suite in `benchmarks/run.py`) |
 
 The temporary Kafka 3.9 KRaft broker ran on port 19092. A separate first live freshness smoke took 1.58 s, and an earlier pipeline run took 7.78 s; these differences show why one measurement is not a latency distribution. Another matched serving smoke measured router 4.41 QPS versus legacy 3.86 QPS, reversing the final pair's ordering. None of these smoke results is a resume-ready scale or quality claim.
 ### 13.2 Evaluation dashboard and command-line runner
@@ -3246,24 +3246,24 @@ Evaluated across all 33 stored checkpoints from `output/imdb/checkpoints/distilg
 - **Wilson Binomial Confidence Interval (95% CI):** $[0.8145, 0.8379]$.
 - **Percentile Bootstrap Confidence Interval (1,000 draws, 95% CI):** $[0.8148, 0.8380]$.
 
-#### 4. Stream Filter Benchmark (`WP-19`)
-- **Part A (Spam & Repetition Adversarial Test):** Evaluated against clean Alpaca instructions blended with 2,000 synthetic spam records (zlib repetitive strings, sequence loops, and spam keywords).
-  - Repetition and content stage recall: **100.0%** (2,000 out of 2,000 malicious samples rejected, exceeding the $\ge 99\%$ requirement).
-  - False positive rejection rate on clean Alpaca instructions: **0.0%**.
-- **Part B (Malformed Payload Resilience):** Streamed 50 malformed frames (missing JSON brackets, null bytes, non-UTF-8 payloads, and corrupt schema types).
-  - Rejection handling: **100.0%** captured and rejected.
-  - Broker and consumer status: Zero thread deadlocks, zero stalled consumers, and zero pipeline crashes.
+#### 4. Stream Filter Architecture & Integrity Verification (`WP-19`)
+- **Automated Unit Verification (`tests/test_filter_benchmark.py`):**
+  - Evaluated against synthetic spam generators across 4 failure modes (`repeated_phrase`, `symbol_noise`, `url_spam`, `length_bounds`). All categories achieved $\ge 99\%$ recall in automated unit testing.
+  - Malformed payload rejection: 50 malformed frames (missing JSON brackets, null bytes, non-UTF-8 payloads, and corrupt schema types) were captured and rejected with 0 exceptions raised, while 50 valid records passed through without interference.
+- **Benchmark Suite Status:** The full 2,000-record benchmark suite is implemented in `benchmarks/filter_benchmark.py` (`filter_benchmark`); live cluster run results are tracked in `reports/claims/CLAIMS.md` (`NOT RUN` until a full cluster run manifest is generated).
 
-#### 5. Serving Router & Dynamic Weight Swap Telemetry (`WP-09`, `WP-15`)
-- **Lock Contention Decoupling:** Decoupled `lock_wait_time_ms` (time spent waiting for in-flight inference readers to exit) from `lock_held_time_ms` (actual memory copy duration of LoRA tensors).
-- **Uncontended Weight Swap Duration:** DistilGPT-2 LoRA rank 16 adapter swap duration strictly measures $\le 140\text{ ms}$ (median 82 ms, p95 128 ms).
-- **Concurrent Request Resilience:** Evaluated under concurrent client sweeps ($N \in \{1, 2, 4, 8\}$ concurrent worker threads). Zero requests dropped ($0.0\%$ failure rate), with 100% of responses served from cryptographically valid adapter versions.
+#### 5. Serving Router & Dynamic Weight Swap Architecture (`WP-09`, `WP-15`)
+- **Lock Contention Decoupling:** Decoupled `lock_wait_time_ms` (time spent waiting for in-flight inference readers to exit) from `lock_held_time_ms` (actual memory copy duration of LoRA tensors), ensuring queueing delay does not inflate measured swap duration.
+- **NIST Nearest-Rank Percentiles:** Upgraded `get_metrics()` to compute percentiles via the NIST nearest-rank method, eliminating upward bias on small discrete request samples.
+- **Concurrency & Version Integrity Verification (`tests/test_swap_stress.py`):** Stress-tested under multi-threaded concurrency sweeps ($N \in \{1, 2, 4, 8\}$ concurrent worker threads), verifying zero state corruptions, atomic write-lock mutual exclusion, and 100% valid version attribution.
+- **Benchmark Suite Status:** The live `swap_stress` benchmark suite is implemented in `benchmarks/run.py`; empirical multi-trial p50/p95 swap SLA numbers will be populated upon execution on target hardware (`NOT RUN` in `CLAIMS.md`).
 
 #### 6. Wire Integrity Protocol v2 Verification (`WP-10`, `WP-11`, `WP-16`)
-- **SHA-256 Frame Hashing:** Every individual tensor frame carries its payload SHA-256 digest in its Kafka header.
+- **SHA-256 Frame Hashing & Monotonic Guards:** Every individual tensor frame carries its payload SHA-256 digest in its Kafka header, with monotonic `(run_id, seq)` sequence guards preventing stale offset replay.
 - **Cryptographic Commit Digest:** The final commit frame includes a combined SHA-256 hash over all received tensor frames. Mismatches abort weight assembly without mutating memory.
 - **Live Serving Introspection:** The `/adapter` HTTP endpoint exposes `{model_name, version, sha256_digest, num_tensors}` allowing live verification that the serving model state matches the trainer commit digest.
-- **Fault Catalogue Resilience:** Proved zero state corruptions across all 16 fault injection scenarios (F01–F16), including truncated frames, out-of-order commits, and malformed safetensors bytes.
+- **Fault Catalogue Unit Verification (`tests/test_fault_injection.py`):** Automated unit tests verify fail-safe rejection across all 16 fault injection scenarios (F01–F16), including truncated frames, out-of-order commits, and malformed safetensors bytes.
+- **Benchmark Suite Status:** The full live Kafka fault-injection benchmark is implemented in `benchmarks/fault_injection.py`; live cluster run results are tracked in `CLAIMS.md` (`NOT RUN` until cluster execution).
 
 #### 7. Training Core Mechanics & Ablation Suite (`WP-22`)
 - **Response-Only Label Masking:** Verified in `tests/test_training_core.py`. Tokens belonging to the prompt prefix have labels set strictly to `-100`, ensuring cross-entropy loss gradients are generated solely by the generated response tokens. In an unmasked regime, the model expends capacity learning to predict the static prompt, resulting in higher final evaluation perplexity.
@@ -3276,10 +3276,10 @@ Evaluated across all 33 stored checkpoints from `output/imdb/checkpoints/distilg
 - **Bifet & Gavaldà (2007) Formulation:** Implemented online ADWIN in `utils/continual_engine.py` with exponential bucket trees and Hoeffding bound variance checks:
   $$\epsilon_{\text{cut}} = \sqrt{\frac{1}{2m} \cdot \ln\frac{4n}{\delta}}, \quad m = \frac{1}{\frac{1}{n_0} + \frac{1}{n_1}}$$
   where $n_0, n_1$ are sub-window widths, $\delta = 0.002$ is the confidence threshold, and $m$ is the harmonic mean of window observations.
-- **Empirical Test Verification (`tests/test_continual_learning.py`):**
+- **Empirical Unit Test Verification (`tests/test_continual_learning.py`):**
   - **Stationary Stream:** Evaluated on 1,000 Bernoulli draws ($p=0.20$). ADWIN registered **0 false positive drift detections**, maintaining window stability.
   - **Abrupt Concept Drift:** Injected a step shift ($p=0.20 \to p=0.80$). ADWIN detected drift and dropped stale observations within **52 observations**, successfully signaling the continual learning engine.
-- **Continual Suite Integration (`benchmarks/run.py`):** Integrated into `suite_continual` across IMDb $\to$ Yelp $\to$ Amazon domains with Algorithm-R reservoir replay buffer ($M=200$), measuring Backward Transfer (BWT) and Forgetting-Max.
+- **Benchmark Suite Status:** The multi-phase continual streaming fine-tuning benchmark across IMDb $\to$ Yelp $\to$ Amazon domains with Algorithm-R reservoir replay buffer ($M=200$) is implemented in `benchmarks/run.py` (`suite_continual`); live multi-domain BWT metrics will be recorded upon full stream execution (`NOT RUN` in `CLAIMS.md`).
 
 #### 9. E2E NLG Fact Scorer & Boolean Negation Resolution (`WP-24`)
 - **Boolean Negation Omission Bug Fixed:** In `utils/eval_qualitative.py` (`StructuredSlotCoverageMetric._check_boolean_negation`), previously line 516 had:
@@ -3340,20 +3340,20 @@ The 32-package modernization program has executed to completion across Phases 0 
 
 | Claim ID | Resume Bullet Subject | Target Threshold | Measured Empirical Value | Status in `CLAIMS.md` | Authoritative Source Artifact | Suggested Resume Bullet Template |
 |---|---|---|---|---|---|---|
-| **SDE-1** | Propagation latency over Kafka to live serving | $< 8.0\text{ s}$ (p95) | *Awaiting cluster run* | `NOT RUN` | `reports/benchmark_runs/*` (`propagation`) | "…propagating LoRA weight updates to live serving in **X s (p95)** on <machine> for <model>" |
-| **SDE-2 (swap)** | In-memory LoRA adapter swap duration | $\le 140\text{ ms}$ (p50) | Median $82\text{ ms}$, p95 $128\text{ ms}$ | `PASS` (local) | `tests/test_swap_stress.py` | "…in-memory LoRA swaps holding the write lock for **82 ms (p50)**" |
-| **SDE-2 (cold-start)** | Checkpoint recovery eliminating 60s push delay | $\ge 50\text{ s}$ saved | Immediate cold load | `PASS` (local) | `tests/test_cold_start.py` | "…restarts serve the latest trained adapter immediately instead of base weights until the next 60 s push" |
-| **SDE-3** | Protocol v2 frame integrity & HMAC | $0$ state corruptions | $0$ corruptions | `PASS` (local) | `tests/test_stream_protocol_v2.py` | "Enforced cryptographic frame hashes and commit digests over Kafka, ensuring zero corrupted states across network disconnects" |
-| **SDE-4 (speed)** | Batched qualitative evaluation speedup | $\ge 85\%$ time cut | Sequential vs Batched | `NOT RUN` (T4 req) | `benchmarks/eval_speed.py` | "…cutting **3,340-generation** evaluation from **A min to B min (C%)** on a T4" |
-| **SDE-4 (audit)** | Offline auditing service latency | $\le 30\text{ s}$ trigger | Background daemon | `PASS` (local) | `tests/test_eval_watch.py` | "Implemented background checkpoint evaluation service auditing newly saved adapters via `evaluate.py --watch`" |
-| **SDE-5** | Fault injection & pipeline resilience | $0$ failures, $0$ corruptions | $0$ errors across F01–F16 | `PASS` (local) | `benchmarks/fault_injection.py` | "Stress-tested serving runtime against 16 fault scenarios, achieving 0 request failures and 0 corrupted weight states" |
-| **SDE-6** | Multi-stage fail-closed data quality gate | $\ge 99\%$ spam recall | $100.0\%$ (2,000/2,000) | `PASS` (local) | `benchmarks/filter_benchmark.py` | "Constructed fail-closed data filter achieving 100% recall on 2,000 injected spam records with zero pipeline stalls" |
+| **SDE-1** | Propagation latency over Kafka to live serving | $< 8.0\text{ s}$ (p95) | *Not Recorded (Awaiting cluster run)* | `NOT RUN` | `reports/benchmark_runs/*` (`benchmarks/run.py propagation`) | "…propagating LoRA weight updates to live serving in **X s (p95)** on <machine> for <model>" |
+| **SDE-2 (swap)** | In-memory LoRA adapter swap duration | $\le 140\text{ ms}$ (p50) | *Not Recorded (Suite implemented; awaiting benchmark run)* | `NOT RUN` | `reports/benchmark_runs/*` (`tests/test_swap_stress.py`) | "…in-memory LoRA swaps holding the write lock for **X ms (p50)**" |
+| **SDE-2 (cold-start)** | Checkpoint recovery eliminating 60s push delay | $\ge 50\text{ s}$ saved | *Not Recorded (Suite implemented; awaiting benchmark run)* | `NOT RUN` | `reports/benchmark_runs/*` (`tests/test_cold_start.py`) | "…restarts serve latest checkpoint immediately, eliminating ~60s cold-start delay waiting for first push" |
+| **SDE-3** | Protocol v2 frame integrity & HMAC | $0$ state corruptions | *Not Recorded (Framing verified in unit tests; awaiting Kafka run)* | `NOT RUN` | `reports/benchmark_runs/*` (`tests/test_stream_protocol_v2.py`) | "Enforced cryptographic frame hashes and commit digests over Kafka, ensuring zero corrupted states across network disconnects" |
+| **SDE-4 (speed)** | Batched qualitative evaluation speedup | $\ge 85\%$ time cut | *Not Recorded (Awaiting Colab T4 run)* | `NOT RUN` | `reports/benchmark_runs/*` (`benchmarks/eval_speed.py`) | "…cutting **3,340-generation** evaluation from **A min to B min (C%)** on a T4" |
+| **SDE-4 (audit)** | Offline auditing service latency | $\le 30\text{ s}$ trigger | *Not Recorded (Daemon verified in unit tests; awaiting live run)* | `NOT RUN` | `reports/benchmark_runs/*` (`tests/test_eval_watch.py`) | "Implemented background checkpoint evaluation service auditing newly saved adapters via `evaluate.py --watch`" |
+| **SDE-5** | Fault injection & pipeline resilience | $0$ failures, $0$ corruptions | *Not Recorded (F01–F16 verified in unit tests; awaiting Kafka run)* | `NOT RUN` | `reports/benchmark_runs/*` (`benchmarks/fault_injection.py`) | "Stress-tested serving runtime against 16 fault scenarios, achieving 0 request failures and 0 corrupted weight states" |
+| **SDE-6** | Multi-stage fail-closed data quality gate | $\ge 99\%$ spam recall | *Not Recorded (Filter verified in unit tests; awaiting 2k benchmark run)* | `NOT RUN` | `reports/benchmark_runs/*` (`benchmarks/filter_benchmark.py`) | "Constructed fail-closed data filter achieving >=99% recall on synthetic spam with zero pipeline stalls" |
 | **DS-1** | Streaming single-pass accuracy on IMDb | $\ge 82.0\%$ | **82.65% (82.7%)** | **PASS** | `output/imdb/outputs/run10/offline_metrics.csv` | "…reaching **82.7% single-pass streaming accuracy** (95% CI: [81.5%, 83.8%]) on 4,000 held-out IMDb reviews" |
 | **DS-2 (coverage)** | E2E structured slot coverage | $\ge 85.0\%$ | **89.88%** | **PASS** | `output/e2e/checkpoints/gpt2-medium__parquet/...` | "…raising input-attribute coverage from 19.6% baseline to **89.9%** on 1,484 fixed validation meaning representations" |
 | **DS-2 (inversion)** | Family-friendly contradiction reduction | $\le 2.5\%$ | **1.20%** | **PASS** | `output/e2e/checkpoints/gpt2-medium__parquet/...` | "…cutting family-friendliness inversions from a **15.7% mid-training peak to 1.2%** using prompt masking and left truncation" |
 | **DS-3 (mcc)** | Matthews Correlation Coefficient | $\ge 0.68$ | **0.6894** | **PASS** | `output/imdb/outputs/run10/offline_metrics.csv` | "Achieved **0.69 MCC** on 4,000 fixed evaluation examples, mapping off-format outputs strictly to error classes" |
 | **DS-3 (aauc)** | Area Under Accuracy Curve | $\ge 0.78$ | **0.7902** | **PASS** | `output/imdb/outputs/run10/offline_metrics.csv` | "Recorded **0.79 AAUC** across 33 evaluation steps, demonstrating sustained progressive learning without catastrophic forgetting" |
 | **DS-4** | Macro-F1 dilution resolution | $\ge 30.0\%$ dilution | **33.33%** dilution | **PASS** | `output/imdb/outputs/run10/offline_metrics.csv` | "Fixed a macro-F1 defect where off-format outputs created a phantom class understating F1 by 33.3%, reporting true target-class F1 (0.8637) alongside Wilson and bootstrap CIs" |
-| **DS-5** | Continual learning & ADWIN drift detection | $\le 100$ detection delay | Real ADWIN on `train_token_acc` | `PASS` (local) | `tests/test_continual_learning.py` | "…evaluated replay vs no replay and ADWIN drift detection on response-token accuracy with Hoeffding bounds" |
+| **DS-5** | Continual learning & ADWIN drift detection | $\le 100$ detection delay | *Not Recorded (ADWIN verified in unit tests; awaiting 3-phase run)* | `NOT RUN` | `reports/benchmark_runs/*` (`tests/test_continual_learning.py`) | "…evaluated replay vs no replay and ADWIN drift detection on response-token accuracy with Hoeffding bounds" |
 | **DS-6** | Multi-task evaluation harness integrity | $\ge 50,000$ records | **582,319** records | **PASS** | `reports/dataset_census.json` | "Architected reproducible evaluation harness across 4 tasks (IMDb, GSM8K, Alpaca, E2E NLG), establishing hash-based holdouts on 52,000+ records" |
 
