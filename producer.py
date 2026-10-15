@@ -3,6 +3,7 @@ import argparse
 from kafka import KafkaProducer
 from datasets import load_dataset
 import json
+import os
 import time
 import yaml
 
@@ -247,3 +248,26 @@ if __name__ == "__main__":
     producer.flush()
     _log("Flush complete. Closing producer.")
     producer.close()
+
+    # Save filter stats
+    if stream_filter.stats:
+        output_dir = config.get("project", {}).get("output_dir", "./output")
+        stats_dir = os.path.join(output_dir, "filter_stats")
+        os.makedirs(stats_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        stats_file = os.path.join(stats_dir, f"{ts}.json")
+        stats_dict = stream_filter.stats.to_dict()
+        try:
+            with open(stats_file, "w", encoding="utf-8") as f:
+                json.dump(stats_dict, f, indent=2)
+            latest_file = os.path.join(stats_dir, "filter_stats.json")
+            with open(latest_file, "w", encoding="utf-8") as f:
+                json.dump(stats_dict, f, indent=2)
+            _log(
+                f"Filter stats saved to '{stats_file}': "
+                f"seen={stream_filter.stats.seen}, passed={stream_filter.stats.passed}, "
+                f"dropped_by_stage={stream_filter.stats.dropped_by_stage}"
+            )
+        except Exception as e:
+            _log(f"WARNING: Failed to save filter stats: {e}")
+
