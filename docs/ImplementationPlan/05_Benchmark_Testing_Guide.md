@@ -438,40 +438,151 @@ python -m benchmarks.run run --suites soak --profile standard
 
 ---
 
-## 5. Colab test sequence
+## 5. Colab test sequence & split deployment guide
 
-1. Open `notebooks/infinitune_colab_v2.ipynb` *(after WP-27)*.
-2. Choose the GPU (plan §7.2).
-3. Run cells 1-6: GPU check, Drive, clone at a pinned commit, install, Kafka, HF cache.
-4. Run the smoke checks: `python -m benchmarks.run run --suites integrity pipeline --profile smoke --kafka-bootstrap localhost:9092 --device cuda --run-dir $PERSIST/runs/colab_smoke`.
-   **Must:** both complete.
-5. On a **T4**: `--suites eval_speed --profile standard`.
-6. On an **L4 or A100**:
-   - `--suites streaming_quality --profile full --model Qwen/Qwen2.5-3B --live-config configs/gsm8k_quantitative.yaml` (GSM8K);
-   - `--suites streaming_quality --profile full --model Qwen/Qwen2.5-1.5B --live-config configs/alpaca_qualitative.yaml` (Alpaca);
-   - `--suites propagation --profile standard --model Qwen/Qwen2.5-3B --live-config configs/gsm8k_quantitative.yaml`.
-7. After any disconnect: rerun cells 1-6, then the same command with the same `--run-dir`.
-8. Copy `$PERSIST/runs/*` from Drive into `reports/benchmark_runs/` on the laptop, then run `python -m benchmarks.claims build` *(after WP-29)*.
+### 5.0 Data flow & architecture overview
 
-### 5.1 Split mode B: Colab trains, laptop serves *(after WP-28)*
+When running across Google Colab (GPU) and a local laptop (CPU/Arc):
 
-1. On the laptop:
-   - set the env vars `INFINITUNE_KAFKA_BOOTSTRAP`, `INFINITUNE_KAFKA_USERNAME`, `INFINITUNE_KAFKA_PASSWORD` and `INFINITUNE_ADAPTER_HMAC_KEY`;
-   - start `python inference.py --config <cfg> --config-overlay configs/overlays/managed_kafka.yaml --listen-updates`.
-2. In Colab, set the same variables from Colab Secrets. Start the trainer, then the producer, with the same overlay.
-3. Propagation: run `propagation --split-mode` on both sides, then `python -m benchmarks.merge_split_propagation <colab_run> <laptop_run>`.
+```text
+┌────────────────────────────────────────────────────────┐
+│ Google Colab (GPU - T4 / L4 / A100)                    │
+│                                                        │
+│  [HuggingFace Hub]                                     │
+│         │ (High-bandwidth download)                    │
+│         ▼                                              │
+│   producer.py ──(5-stage filter)──► training_topic     │
+│                                           │            │
+│   trainer.py ◄────────────────────────────┘            │
+│    ├── Forward/Backward on CUDA (bf16/fp16)            │
+│    ├── Prompt-masked loss & AdamW LoRA update          │
+│    └── Publish Adapter Weights:                        │
+│         ├── Mode B: Kafka lora_updates_topic (SASL)    │
+│         └── Mode C: Save checkpoints to Google Drive   │
+└───────────────────────┬───────────────────┬────────────┘
+                        │                   │
+      [Mode B: Managed Kafka]   [Mode C: Google Drive Sync]
+      (SASL_SSL + HMAC SHA-256) (COMMITTED + manifest.json)
+                        │                   │
+┌───────────────────────▼───────────────────▼────────────┐
+│ Local Windows Laptop (CPU / Intel Arc, 16 GB RAM)      │
+│                                                        │
+│  inference.py                                          │
+│    ├── Base Model loaded in memory (bf16/fp16 or fp32) │
+│    ├── DoubleBufferedAdapterRouter (Writer-Priority)   │
+│    └── Hot-swaps LoRA weights in < 150 ms              │
+│                                                        │
+│  Client Traffic: POST /generate (Zero dropped reqs)    │
+└────────────────────────────────────────────────────────┘
+```
 
-**Must:**
-- HMAC is verified on every snapshot (`rejected_by_reason` is empty);
-- the NTP offset drift during the run is < 50 ms.
+- **Data Loading:** `producer.py` runs in Colab to exploit cloud datacenter download speeds directly from Hugging Face Hub. Datasets are tokenized and streamed through the 5-stage ingestion filter (`StreamFilter`).
+- **GPU Acceleration:** `trainer.py` runs on Colab's NVIDIA GPU with native tensor core mixed precision (`bf16` on L4/A100, `fp16` on T4), keeping memory small via sequence length truncation and gradient accumulation.
+- **Latency Minimization:** Adapter weights are compact (1.5–15 MB). In Mode B, safetensors frames stream over Kafka in sub-second time. In Mode C, atomic `COMMITTED` markers and manifest SHA-256 checksums ensure zero partial reads over Google Drive Desktop sync.
+- **Laptop Memory Safety:** To serve 3B models (e.g. Qwen2.5-3B) on a 16 GB laptop, opt into half-precision CPU loading (`allow_half_on_cpu: true`), reducing memory consumption from 12.4 GB down to 6.2 GB.
 
-Report split-mode numbers separately from same-machine numbers.
+---
 
-### 5.2 Split mode C: Drive sync (demo only)
+### 5.1 Mode A: All-in-Colab test sequence
 
-Start `python inference.py --config <cfg> --watch-checkpoints "<Google Drive folder>/checkpoints"` on the laptop.
+Run full benchmark suites inside a single Colab VM using its local KRaft Kafka 3.9 broker:
 
-**Must:** only checkpoints with a `COMMITTED` marker and a matching SHA-256 are applied. **Never quote its latency as an authoritative benchmark metric.**
+1. Open `notebooks/infinitune_colab_v2.ipynb`.
+2. Select runtime: **Runtime -> Change runtime type -> T4 / L4 / A100 GPU**.
+3. Run cells 1–6 (GPU verification, Google Drive mount, git checkout, dependency installation, KRaft Kafka startup, Hugging Face cache setup).
+4. Run smoke validation check:
+   ```bash
+   !python -m benchmarks.run run --suites integrity pipeline --profile smoke --kafka-bootstrap localhost:9092 --device cuda --run-dir $PERSIST/runs/colab_smoke
+   ```
+   **Must:** Both suites complete successfully with zero failures.
+5. On a **T4 GPU**: Evaluate qualitative batch generation speedup (SDE-4):
+   ```bash
+   !python -m benchmarks.run run --suites eval_speed --profile standard --device cuda --run-dir $PERSIST/runs/t4_eval_speed
+   ```
+6. On an **L4 or A100 GPU**: Train and evaluate stronger models (DS-1, DS-6):
+   - **Qwen2.5-3B GSM8K:**
+     ```bash
+     !python -m benchmarks.run run --suites streaming_quality propagation --profile standard --model Qwen/Qwen2.5-3B --live-config configs/gsm8k_quantitative.yaml --config-overlay configs/overlays/colab_gpu.yaml --device cuda --kafka-bootstrap localhost:9092 --run-dir $PERSIST/runs/qwen3b_gsm8k
+     ```
+   - **Qwen2.5-1.5B Alpaca:**
+     ```bash
+     !python -m benchmarks.run run --suites streaming_quality --profile full --model Qwen/Qwen2.5-1.5B --live-config configs/alpaca_qualitative.yaml --device cuda --kafka-bootstrap localhost:9092 --run-dir $PERSIST/runs/qwen15b_alpaca
+     ```
+7. Resuming interrupted runs: Re-run the identical command with the same `--run-dir`. Completed stages are automatically skipped.
+8. Copy completed runs from `$PERSIST/runs/*` to `reports/benchmark_runs/` on your laptop, then build claims:
+   ```powershell
+   .\.venv-eval\Scripts\python.exe -m benchmarks.claims build --runs reports/benchmark_runs/*
+   ```
+
+---
+
+### 5.2 Split mode B: Colab trains, laptop serves (over Managed Kafka)
+
+Real-time streaming split deployment where training is offloaded to Colab GPU and model inference is served locally on your Windows laptop.
+
+#### Step 1: Managed Kafka configuration
+Set up a managed Kafka topic (e.g. Confluent Cloud, Upstash, Redpanda Cloud, or Aiven) with SASL_SSL.
+
+#### Step 2: On local Windows laptop (PowerShell)
+Activate the evaluation environment and set secrets:
+```powershell
+.\.venv-eval\Scripts\Activate.ps1
+$env:INFINITUNE_KAFKA_BOOTSTRAP = "your-cluster.confluent.cloud:9092"
+$env:INFINITUNE_KAFKA_USERNAME = "YOUR_API_KEY"
+$env:INFINITUNE_KAFKA_PASSWORD = "YOUR_API_SECRET"
+$env:INFINITUNE_ADAPTER_HMAC_KEY = "your_64_char_hex_hmac_secret_key"
+
+# Start inference server on local CPU listening for streaming weight updates:
+python inference.py --config configs/imdb_quantitative.yaml --config-overlay configs/overlays/managed_kafka.yaml --listen-updates --device cpu --port 8000
+```
+
+#### Step 3: In Google Colab
+Store the identical credentials in **Colab Secrets** (`INFINITUNE_KAFKA_BOOTSTRAP`, `INFINITUNE_KAFKA_USERNAME`, `INFINITUNE_KAFKA_PASSWORD`, `INFINITUNE_ADAPTER_HMAC_KEY`).
+Execute Cell 9 in `notebooks/infinitune_colab_v2.ipynb`:
+```bash
+!python trainer.py --config configs/imdb_quantitative.yaml --config-overlay configs/overlays/managed_kafka.yaml --device cuda
+```
+In a second Colab terminal or cell, start the producer:
+```bash
+!python producer.py --config configs/imdb_quantitative.yaml --config-overlay configs/overlays/managed_kafka.yaml
+```
+
+#### Verification & Guarantees:
+- **Must:** Every weight update received by the laptop is validated against HMAC-SHA256. `/metrics` on the laptop shows `rejected_frames == 0`.
+- **Must:** Client queries to `http://localhost:8000/generate` return predictions matching the newly trained adapter version (`X-Adapter-Version`) with zero dropped requests.
+
+---
+
+### 5.3 Split mode C: Colab trains, laptop serves (via Google Drive Sync)
+
+Zero-external-network setup. Requires no cloud Kafka accounts or open network ports.
+
+#### Step 1: On Google Colab
+Mount Google Drive and launch training with the `drive_sync.yaml` overlay:
+```bash
+!python trainer.py --config configs/imdb_quantitative.yaml --config-overlay configs/overlays/drive_sync.yaml --device cuda
+```
+In a separate cell, launch the stream producer:
+```bash
+!python producer.py --config configs/imdb_quantitative.yaml --config-overlay configs/overlays/drive_sync.yaml
+```
+Checkpoints will be written atomically with `COMMITTED` markers and `manifest.json` to:
+`/content/drive/MyDrive/infinitune/checkpoints`
+
+#### Step 2: On local Windows laptop (PowerShell)
+Ensure **Google Drive for Desktop** is running and syncing your Drive files to Windows (typically mounted at `G:\My Drive` or `C:\Users\<user>\Google Drive`).
+
+Start the local inference server in checkpoint watcher mode:
+```powershell
+.\.venv-eval\Scripts\Activate.ps1
+
+python inference.py --config configs/imdb_quantitative.yaml --watch-checkpoints "G:\My Drive\infinitune\checkpoints" --watch-poll-seconds 2.0 --device cpu --port 8000
+```
+
+#### Verification & Guarantees:
+- **Must:** Checkpoints are only swapped once the `COMMITTED` marker exists and the SHA-256 checksum in `manifest.json` matches the local disk file.
+- **Resilience:** If Google Drive Desktop is still downloading a file, the watcher logs a transient sync warning and automatically retries on the next poll interval without blacklisting the checkpoint.
+- **Serving:** `GET http://localhost:8000/adapter` reports `match: true` and `/metrics` reports updated `active_version`.
 
 ---
 

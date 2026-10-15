@@ -100,6 +100,51 @@ def test_watcher_applies_new_committed_checkpoint_once(tmp_path, mock_tiny_model
     assert router.swap_count == 1, "Must not re-apply already applied directory"
 
 
+def test_watcher_retries_transient_checksum_mismatch(tmp_path, mock_tiny_model):
+    router = DoubleBufferedAdapterRouter(mock_tiny_model, None, "cpu")
+    initial_version = router.active_version
+
+    weights = get_peft_model_state_dict(mock_tiny_model)
+    sub = tmp_path / "step_000400"
+
+    # Save artifact with correct manifest and COMMITTED
+    manifest, _ = create_and_save_adapter_artifact(
+        state_dict=weights,
+        output_dir=str(sub),
+        adapter_version="step_000400",
+        base_model="gpt2",
+        step=400,
+        use_safetensors=True,
+    )
+
+    # Now intentionally corrupt the weights file to simulate partial cloud sync download
+    weights_file = sub / "adapter_model.safetensors"
+    valid_bytes = weights_file.read_bytes()
+    weights_file.write_bytes(b"partial_sync_bytes")
+
+    import threading
+    stop_event = threading.Event()
+
+    # Run watcher in background thread
+    t = threading.Thread(target=checkpoint_watcher_thread, args=(str(tmp_path), router, 0.05, stop_event))
+    t.start()
+
+    time.sleep(0.1)
+    # Check that watcher did NOT apply corrupted file
+    assert router.active_version == initial_version
+
+    # Now restore the valid bytes (simulating Google Drive sync completing download)
+    weights_file.write_bytes(valid_bytes)
+    time.sleep(0.2)
+
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    # The watcher should have retried and successfully applied the valid weights!
+    assert router.active_version == "step_000400"
+    assert router.swap_count == 1
+
+
 def test_merge_split_propagation_offset_correction():
     trainer_recs = [
         {"run_id": "split_run", "seq": 1, "t_publish_start": 100.0},

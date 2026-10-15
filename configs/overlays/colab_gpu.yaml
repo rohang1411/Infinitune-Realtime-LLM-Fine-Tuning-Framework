@@ -1,0 +1,11 @@
+# InfiniTune Colab GPU Optimization Overlay
+# Configures optimal device, precision, and batch settings for NVIDIA GPUs on Google Colab.
+model:
+  device: "cuda"
+  precision: "bf16"
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  bf16: true
+  fp16: false

@@ -51,6 +51,7 @@ class PrecisionManager:
         compile_mode: str = "max-autotune",
         dynamic_shapes: bool = True,
         allow_half_on_mps: bool = False,
+        allow_half_on_cpu: bool = False,
     ):
         self.device = device.lower()
         self.requested_precision = str(precision).lower().strip()
@@ -58,6 +59,7 @@ class PrecisionManager:
         self.compile_mode = compile_mode
         self.dynamic_shapes = dynamic_shapes
         self.allow_half_on_mps = bool(allow_half_on_mps)
+        self.allow_half_on_cpu = bool(allow_half_on_cpu)
 
         self.active_precision = self._resolve_active_precision()
         self.scaler: Optional[torch.cuda.amp.GradScaler] = None
@@ -74,6 +76,17 @@ class PrecisionManager:
             return "fp32"
 
         if self.device == "cpu":
+            if not self.allow_half_on_cpu:
+                return "fp32"
+            if self.requested_precision in ("bf16", "fp16"):
+                if self.requested_precision == "bf16":
+                    try:
+                        a = torch.ones((2, 2), dtype=torch.bfloat16, device="cpu")
+                        _ = a @ a
+                        return "bf16"
+                    except Exception:
+                        return "fp16"
+                return "fp16"
             return "fp32"
 
         if self.device == "mps":
