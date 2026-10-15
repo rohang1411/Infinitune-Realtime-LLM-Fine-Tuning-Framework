@@ -126,3 +126,72 @@ def test_legacy_flat_layout_compatibility(mock_ckpt_mgr: CheckpointManager):
     assert latest is not None
     assert latest["run_name"] == "run_20260411-100000_2222"
     assert latest["step"] == 20
+
+
+def test_load_respects_precision_and_revision(tmp_path: Path, monkeypatch):
+    import torch
+    from unittest.mock import MagicMock
+
+    config = {
+        "project": {"output_dir": str(tmp_path)},
+        "model": {"name": "distilgpt2", "precision": "bf16", "revision": "test_sha_123"},
+        "dataset": {"name": "imdb"},
+        "lora": {"r": 8},
+    }
+    ckpt_mgr = CheckpointManager(config=config)
+    ckpt_dir = _create_fake_checkpoint(tmp_path, "step_000100")
+
+    captured_kwargs = {}
+
+    mock_base = MagicMock()
+    mock_base.to.return_value = mock_base
+    mock_peft = MagicMock()
+
+    def fake_from_pretrained(model_name, **kwargs):
+        captured_kwargs.update(kwargs)
+        return mock_base
+
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("peft.PeftModel.from_pretrained", lambda b, c: mock_peft)
+
+    model, tokenizer = ckpt_mgr.load(str(ckpt_dir), device="cpu")
+
+    assert captured_kwargs.get("torch_dtype") == torch.bfloat16
+    assert captured_kwargs.get("revision") == "test_sha_123"
+    mock_base.to.assert_called_with("cpu")
+    assert model == mock_peft
+
+
+def test_load_defaults_fp32(tmp_path: Path, monkeypatch):
+    import torch
+    from unittest.mock import MagicMock
+
+    config = {
+        "project": {"output_dir": str(tmp_path)},
+        "model": {"name": "distilgpt2"},
+        "dataset": {"name": "imdb"},
+        "lora": {"r": 8},
+    }
+    ckpt_mgr = CheckpointManager(config=config)
+    ckpt_dir = _create_fake_checkpoint(tmp_path, "step_000100")
+
+    captured_kwargs = {}
+
+    mock_base = MagicMock()
+    mock_base.to.return_value = mock_base
+    mock_peft = MagicMock()
+
+    def fake_from_pretrained(model_name, **kwargs):
+        captured_kwargs.update(kwargs)
+        return mock_base
+
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("peft.PeftModel.from_pretrained", lambda b, c: mock_peft)
+
+    ckpt_mgr.load(str(ckpt_dir), device="cpu")
+
+    assert captured_kwargs.get("torch_dtype") == torch.float32
+    assert "revision" not in captured_kwargs
+

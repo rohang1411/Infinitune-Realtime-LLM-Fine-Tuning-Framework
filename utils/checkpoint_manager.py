@@ -536,13 +536,38 @@ class CheckpointManager:
                 device = "cpu"
         _log(f"Loading base model '{model_name}' on device '{device}'...")
 
+        # --- Resolve precision & revision ---
+        model_cfg = self._config.get("model", {})
+        prec = model_cfg.get("precision", "fp32")
+        dtype_map = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        target_dtype = dtype_map.get(prec, torch.float32)
+        model_revision = model_cfg.get("revision")
+
+        load_kwargs = {
+            "torch_dtype": target_dtype,
+        }
+        if model_revision:
+            load_kwargs["revision"] = model_revision
+        if device == "cuda":
+            load_kwargs["device_map"] = "auto"
+
         # --- Load base model ---
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
+            **load_kwargs,
+
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if device != "cuda":
+            base_model = base_model.to(device)
+
+        tok_kwargs = {}
+        if model_revision:
+            tok_kwargs["revision"] = model_revision
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
         tokenizer.pad_token = tokenizer.eos_token
 
         # --- Attach LoRA adapter ---
