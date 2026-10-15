@@ -1391,6 +1391,12 @@ def suite_fault_injection(run, args):
     run.stage("fault_injection/execute", lambda: run_fault_injection_suite(run, args))
 
 
+def suite_eval_speed(run, args, data_dir):
+    """Sequential vs batched evaluation throughput comparison."""
+    from benchmarks.eval_speed import run_eval_speed_suite
+    run.stage("eval_speed/execute", lambda: run_eval_speed_suite(run, args, data_dir))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1798,6 +1804,7 @@ def main():
         "propagation": lambda: suite_propagation(run, args),
         "cold_start": lambda: suite_cold_start(run, args),
         "fault_injection": lambda: suite_fault_injection(run, args),
+        "eval_speed": lambda: suite_eval_speed(run, args, args.data_dir),
     }
     for suite in suites:
         try:
