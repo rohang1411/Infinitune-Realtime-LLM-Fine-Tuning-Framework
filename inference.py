@@ -101,6 +101,101 @@ def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional
         return None
 
 
+def checkpoint_watcher_thread(watch_dir: str, router, poll_interval: float = 2.0, stop_event=None, applied_set=None):
+    """
+    Mode C checkpoint watcher for split deployment (e.g. Colab Drive sync).
+    Watches watch_dir for subdirectories containing a COMMITTED marker file.
+    Validates manifest, loads weights, and swaps adapter through router.
+    Persists applied checkpoint directory names in applied_checkpoints.json.
+    """
+    from pathlib import Path
+    watch_path = Path(watch_dir)
+    state_file = watch_path / "applied_checkpoints.json"
+    applied_dirs = applied_set if applied_set is not None else set()
+    if state_file.is_file():
+        try:
+            stored = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(stored, list):
+                applied_dirs.update(stored)
+        except Exception:
+            pass
+
+    def _persist_state():
+        try:
+            state_file.write_text(json.dumps(sorted(applied_dirs), indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    _log(f"Checkpoint watcher started on directory: {watch_path}")
+    while True:
+        try:
+            if watch_path.is_dir():
+                for sub in sorted(watch_path.iterdir()):
+                    if not sub.is_dir() or sub.name in applied_dirs:
+                        continue
+                    marker = sub / "COMMITTED"
+                    if not marker.exists():
+                        continue
+                    manifest_file = sub / "manifest.json"
+                    weights_file = sub / "adapter_model.safetensors"
+                    if not weights_file.exists():
+                        weights_file = sub / "adapter_model.bin"
+                    if not weights_file.exists():
+                        continue
+
+                    # Verify manifest if present
+                    if manifest_file.exists():
+                        try:
+                            from utils.adapter_manifest import AdapterManifest
+                            manifest = AdapterManifest.from_file(str(manifest_file))
+                            if not manifest.verify_artifact():
+                                _log(f"REJECTED committed checkpoint '{sub.name}': checksum mismatch")
+                                applied_dirs.add(sub.name)
+                                _persist_state()
+                                continue
+                            swap_ms = router.swap_from_manifest(manifest)
+                            _log(f"Applied committed checkpoint '{sub.name}' from manifest in {swap_ms:.2f} ms")
+                            applied_dirs.add(sub.name)
+                            _persist_state()
+                            continue
+                        except Exception as m_exc:
+                            _log(f"REJECTED committed checkpoint '{sub.name}': {m_exc}")
+                            applied_dirs.add(sub.name)
+                            _persist_state()
+                            continue
+
+                    # Fallback for standard checkpoints without manifest.json
+                    try:
+                        from safetensors.torch import load_file
+                        state_dict = load_file(str(weights_file)) if str(weights_file).endswith(".safetensors") else torch.load(str(weights_file), map_location="cpu", weights_only=True)
+                        meta_file = sub / "checkpoint_meta.json"
+                        c_run = "drive_sync"
+                        c_seq = 0
+                        if meta_file.exists():
+                            with meta_file.open("r", encoding="utf-8") as mf:
+                                meta = json.load(mf)
+                            c_run = meta.get("run_id", c_run)
+                            c_seq = meta.get("seq", meta.get("step", 0))
+                        swap_ms = router.swap_weights(state_dict, version_tag=sub.name, run_id=c_run, seq=c_seq)
+                        _log(f"Applied committed checkpoint '{sub.name}' in {swap_ms:.2f} ms")
+                        applied_dirs.add(sub.name)
+                        _persist_state()
+                    except Exception as s_exc:
+                        _log(f"REJECTED committed checkpoint '{sub.name}': {s_exc}")
+                        applied_dirs.add(sub.name)
+                        _persist_state()
+        except Exception as exc:
+            _log(f"Error in checkpoint watcher: {exc}")
+        if stop_event is not None:
+            if stop_event.is_set():
+                break
+            stop_event.wait(poll_interval)
+            if stop_event.is_set():
+                break
+        else:
+            time.sleep(poll_interval)
+
+
 def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
     Listens to the Kafka topic for LoRA weight updates and puts them in a queue.
@@ -505,6 +600,10 @@ if __name__ == "__main__":
                         help="Port to bind the Flask HTTP server to (default: 8000)")
     parser.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda", "mps", "xpu"],
                         help="Device to serve on (auto/cpu/cuda/mps/xpu)")
+    parser.add_argument("--watch-checkpoints", type=str, default=None,
+                        help="Directory to watch for committed adapter checkpoints (Mode C Drive sync)")
+    parser.add_argument("--watch-poll-seconds", type=float, default=2.0,
+                        help="Polling interval in seconds for --watch-checkpoints (default: 2.0)")
     args = parser.parse_args()
     if args.listen_updates and args.no_listen_updates:
         parser.error("Cannot specify both --listen-updates and --no-listen-updates.")
@@ -685,6 +784,15 @@ if __name__ == "__main__":
         )
         consumer_thread.start()
         applier_thread.start()
+
+    if args.watch_checkpoints:
+        _log(f"Starting checkpoint watcher thread on: '{args.watch_checkpoints}' (poll: {args.watch_poll_seconds}s)")
+        watcher_thread = threading.Thread(
+            target=checkpoint_watcher_thread,
+            args=(args.watch_checkpoints, router_global, args.watch_poll_seconds),
+            daemon=True
+        )
+        watcher_thread.start()
 
     FLASK_HOST = inference_cfg.get('host', '0.0.0.0')
     FLASK_PORT = args.port or inference_cfg.get('port', 8000)

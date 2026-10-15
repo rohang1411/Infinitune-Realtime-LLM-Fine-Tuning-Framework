@@ -392,3 +392,26 @@ class DoubleBufferedAdapterRouter:
                 "p99_latency_ms": round(p99, 2),
                 "avg_latency_ms": round(avg_lat, 2),
             }
+
+    def swap_from_manifest(self, manifest_or_dir: Any) -> float:
+        """
+        Verify artifact checksum and apply adapter weights from an AdapterManifest or directory.
+        Raises ChecksumMismatchError if the SHA-256 digest fails verification.
+        """
+        from pathlib import Path
+        from utils.adapter_manifest import AdapterManifest, ChecksumMismatchError
+        if isinstance(manifest_or_dir, (str, Path)):
+            p = Path(manifest_or_dir)
+            manifest_file = p / "manifest.json" if p.is_dir() else p
+            manifest = AdapterManifest.from_file(str(manifest_file))
+        else:
+            manifest = manifest_or_dir
+        if not manifest.verify_artifact():
+            raise ChecksumMismatchError(f"Checksum mismatch for adapter artifact: {manifest.artifact_path}")
+        state_dict = manifest.load_weights(device=self.device)
+        return self.swap_weights(
+            state_dict,
+            version_tag=manifest.adapter_version,
+            run_id=f"manifest_step_{manifest.step}",
+            seq=manifest.step,
+        )

@@ -309,4 +309,14 @@ def create_and_save_adapter_artifact(
     manifest_path = os.path.join(output_dir, "manifest.json")
     manifest.save_json(manifest_path)
 
+    # Write COMMITTED marker last to signal atomic readiness to external watchers
+    committed_path = os.path.join(output_dir, "COMMITTED")
+    with open(committed_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "version": adapter_version,
+            "step": step,
+            "committed_at": time.time(),
+            "checksum": checksum,
+        }) + "\n")
+
     return manifest, manifest_path

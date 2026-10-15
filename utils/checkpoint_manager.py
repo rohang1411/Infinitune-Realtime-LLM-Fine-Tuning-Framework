@@ -349,6 +349,18 @@ class CheckpointManager:
             except Exception as exc:
                 _log(f"Warning: Could not write config_snapshot.yaml: {exc}")
 
+        # Write COMMITTED marker last to signal atomic completion to external watchers
+        committed_marker_path = os.path.join(save_path, "COMMITTED")
+        try:
+            with open(committed_marker_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": step,
+                    "run_id": self._run_dir,
+                    "committed_at": time.time(),
+                }) + "\n")
+        except Exception as exc:
+            _log(f"Warning: Could not write COMMITTED marker: {exc}")
+
         step_label = f"step {step}" if step != "final" else "final"
         _log(f"Checkpoint saved [{step_label}] -> {save_path} (run: {self._run_dir})")
         return save_path
