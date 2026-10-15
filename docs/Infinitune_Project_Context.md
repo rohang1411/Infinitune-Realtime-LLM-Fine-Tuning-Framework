@@ -3211,8 +3211,8 @@ During the comprehensive audit, 12 critical defects were isolated and remediated
 | **WP-28** | Split Deployment Distributed Harness | **COMPLETED** | `f043384` | `inference.py` (--watch-checkpoints), `benchmarks/merge_split_propagation.py`, `tests/test_split_deployment.py` |
 | **WP-20** | Streaming Quality Kafka Parity Run | **COMPLETED** | `db2e466` | `benchmarks/streaming_quality.py`, `benchmarks/run.py`, `tests/test_streaming_quality.py` |
 | **WP-29** | Master Evidence Ledger Compilation | **COMPLETED** | `f0bb1f1` | `benchmarks/claims.py`, `reports/claims/CLAIMS.md`, `tests/test_claims.py` |
-| **WP-30** | Context Documentation Realignment | **COMPLETED** | Current | `docs/Infinitune_Project_Context.md`, Protocol v2, config keys, evidence map |
-| **WP-31** | Final End-to-End Cross-Suite Pass | **QUEUED** | — | Final verification pass, testing guide update (`05_Resume_Claims_Testing_Guide.md`), release review |
+| **WP-30** | Context Documentation Realignment | **COMPLETED** | `c0d6101` | `docs/Infinitune_Project_Context.md`, Protocol v2, config keys, evidence map |
+| **WP-31** | Final End-to-End Cross-Suite Pass | **COMPLETED** | `232a8cb` | Final verification pass, testing guide update (`05_Resume_Claims_Testing_Guide.md`), release review |
 
 ---
 
