@@ -49,6 +49,32 @@ def _apply_label_map_if_configured(target_value, label_map):
     return target_value
 
 
+def decode_training_record(raw: bytes):
+    """Return (record_dict, None) or (None, reason). Never raises."""
+    try:
+        if raw is None:
+            return None, "empty"
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, (bytes, bytearray)):
+            return None, "not_utf8"
+        if not raw.strip():
+            return None, "empty"
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            return None, "not_utf8"
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None, "not_json"
+        if not isinstance(data, dict):
+            return None, "not_object"
+        return data, None
+    except Exception:
+        return None, "not_utf8"
+
+
 class MetricsLogger:
     """
     CSV logger for training/eval metrics + optional plotting.
@@ -131,8 +157,16 @@ class MetricsLogger:
         self._header_written = False
 
     def write_params(self, params: dict):
+        current = {}
+        if os.path.exists(self.params_path):
+            try:
+                with open(self.params_path, "r", encoding="utf-8") as f:
+                    current = json.load(f)
+            except Exception:
+                current = {}
+        current.update(params)
         with open(self.params_path, "w", encoding="utf-8") as f:
-            json.dump(params, f, indent=2, sort_keys=True)
+            json.dump(current, f, indent=2, sort_keys=True)
 
     def log(self, row: dict):
         # Dynamic columns: anything in row not in COLUMNS is appended.
@@ -613,7 +647,6 @@ def train_model(config, config_path: str = "(unknown)"):
     consumer = KafkaConsumer(
         kafka_cfg['training_topic'],
         bootstrap_servers=kafka_cfg['bootstrap_servers'],
-        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
         group_id=consumer_group,
         auto_offset_reset="earliest",
         # max_poll_interval_ms: how long poll() can be absent before the broker
@@ -668,6 +701,24 @@ def train_model(config, config_path: str = "(unknown)"):
     
     # Instantiate our Kafka producer for LoRA updates.
     lora_producer = LoRAProducer(config) if kafka_cfg.get('enable_lora_streaming', True) else None
+
+    # Dead-letter producer if dead_letter_topic is configured
+    dead_letter_topic = kafka_cfg.get("dead_letter_topic")
+    dead_letter_producer = None
+    if dead_letter_topic:
+        dead_letter_producer = KafkaProducer(
+            bootstrap_servers=kafka_cfg['bootstrap_servers'],
+        )
+        _log(f"Dead-letter queue enabled: forwarding malformed records to '{dead_letter_topic}'")
+
+    malformed_records = {
+        "empty": 0,
+        "not_utf8": 0,
+        "not_json": 0,
+        "not_object": 0,
+    }
+    malformed_records_logged = 0
+    max_malformed_to_log = 20
 
     # Compile Jinja2 templates for text formatting
     prompt_template = Template(preproc_cfg['prompt_template'])
@@ -861,9 +912,25 @@ def train_model(config, config_path: str = "(unknown)"):
 
                 for tp, records in messages.items():
                     for message in records:
-                        if message is None or message.value is None:
+                        if message is None:
                             continue
-                        sample_data = message.value
+                        raw_val = message.value
+                        sample_data, decode_reason = decode_training_record(raw_val)
+                        if decode_reason is not None:
+                            malformed_records[decode_reason] = malformed_records.get(decode_reason, 0) + 1
+                            if malformed_records_logged < max_malformed_to_log:
+                                _log(f"Malformed record dropped: reason='{decode_reason}' (occurrence {malformed_records_logged + 1})")
+                                malformed_records_logged += 1
+                            if dead_letter_producer and dead_letter_topic:
+                                try:
+                                    dead_letter_producer.send(
+                                        dead_letter_topic,
+                                        value=raw_val if raw_val is not None else b"",
+                                        headers=[("reason", decode_reason.encode("utf-8"))],
+                                    )
+                                except Exception as d_exc:
+                                    _log(f"Warning: dead letter send failed: {d_exc}")
+                            continue
 
                         # Skip internal control messages from the producer
                         if isinstance(sample_data, dict) and ("_eof" in sample_data or "_verify" in sample_data):
@@ -1078,6 +1145,18 @@ def train_model(config, config_path: str = "(unknown)"):
             _log(f"Warning: Final qualitative evaluation failed: {e}")
 
     # 4. Always print the CSV location and generate plots.
+    try:
+        metrics_logger.write_params({"malformed_records": malformed_records})
+    except Exception as e:
+        _log(f"Warning: Failed to write malformed_records to run_params.json: {e}")
+
+    if dead_letter_producer:
+        try:
+            dead_letter_producer.flush()
+            dead_letter_producer.close()
+        except Exception:
+            pass
+
     _log(f"Metrics CSV saved to: {metrics_logger.metrics_path}")
     try:
         metrics_logger.finalize_csv()
