@@ -318,6 +318,9 @@ class CheckpointManager:
         # --- Write checkpoint_meta.json ---
         meta = {
             "step": step,
+            "seq": step if isinstance(step, int) else (self._config.get("training", {}).get("max_steps", 0) if step == "final" else 0),
+            "run_id": self._run_dir,
+            "created_at": time.time(),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "model_name": self._model_name,
             "dataset_name": self._dataset_name,

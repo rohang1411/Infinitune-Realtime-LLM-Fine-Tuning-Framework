@@ -51,7 +51,7 @@ def test_process_adapter_record_pickle_blob():
 
 
 def test_process_adapter_record_valid_sequence():
-    assembler = SnapshotAssembler()
+    assembler = SnapshotAssembler(integrity="none_v1_compat")
     counters = {"rejected_frames": 0, "rejected_by_reason": {}}
     step_id = "42"
     tensor_name = "model.layers.0.self_attn.q_proj.weight"

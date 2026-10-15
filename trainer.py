@@ -24,6 +24,8 @@ from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
 from utils.checkpoint_manager import CheckpointManager
 from utils.precision_manager import PrecisionManager
+import hashlib
+from utils.stream_protocol import canonical_json, manifest_digest, compute_manifest_hmac
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -292,13 +294,20 @@ class MetricsLogger:
 # LoRAProducer: sends adapter weights via Kafka
 # --------------------------------------------------
 class LoRAProducer:
-    def __init__(self, config):
+    def __init__(self, config, run_id=None):
         kafka_cfg = config['kafka']
         self.topic = kafka_cfg['lora_updates_topic']
+        self.integrity = kafka_cfg.get('integrity', 'sha256')
+        self.max_request_size = int(kafka_cfg.get('max_request_size', 1048576))
+        self.run_id = run_id or "run_" + time.strftime("%Y%m%d-%H%M%S")
+        self.hmac_key = os.environ.get("INFINITUNE_ADAPTER_HMAC_KEY")
+        if self.integrity == "hmac" and not self.hmac_key:
+            raise ValueError("HMAC integrity mode requested but INFINITUNE_ADAPTER_HMAC_KEY is missing")
         self.producer = KafkaProducer(
             bootstrap_servers=kafka_cfg['bootstrap_servers'],
             value_serializer=lambda v: self.serialize_payload(v),
-            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None)
+            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None),
+            max_request_size=self.max_request_size
         )
 
     def serialize_payload(self, value):
@@ -315,48 +324,124 @@ class LoRAProducer:
     def serialize_tensor(self, tensor):
         return self.serialize_payload(tensor)
 
-    def send_weights(self, adapter_weights, step_id=None):
+    def send_weights(self, adapter_weights, step_id=None, run_id=None, seq=None):
         """
         Sends adapter weights with versioning, step_id, and commit markers to prevent torn updates.
+        Supports Protocol v2 (per-tensor SHA-256, manifest digest, HMAC, size guard).
         """
         num_tensors = len(adapter_weights)
         step_tag = str(step_id) if step_id is not None else str(int(time.time()))
-        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}'")
+        active_run_id = run_id or self.run_id
+        active_seq = seq if seq is not None else (int(step_id) if isinstance(step_id, int) or (isinstance(step_id, str) and step_id.isdigit()) else 0)
 
-        # 1. Send manifest / header marker
+        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}', run_id='{active_run_id}', seq={active_seq}")
+
+        if self.integrity == "none_v1_compat":
+            manifest_meta = {
+                "step_id": step_tag,
+                "num_tensors": num_tensors,
+                "tensor_names": list(adapter_weights.keys()),
+                "timestamp": time.time(),
+            }
+            self.producer.send(
+                topic=self.topic,
+                partition=0,
+                key=f"__manifest__:{step_tag}".encode("utf-8"),
+                value=manifest_meta
+            )
+            for name, param in adapter_weights.items():
+                self.producer.send(
+                    topic=self.topic,
+                    partition=0,
+                    key=f"{step_tag}:{name}".encode("utf-8"),
+                    value=param
+                )
+            commit_meta = {
+                "step_id": step_tag,
+                "status": "committed",
+                "timestamp": time.time(),
+            }
+            self.producer.send(
+                topic=self.topic,
+                partition=0,
+                key=f"__commit__:{step_tag}".encode("utf-8"),
+                value=commit_meta
+            )
+            self.producer.flush()
+            return
+
+        # Protocol v2:
+        # Pre-serialize each tensor and check size guard before sending ANY frame
+        sorted_names = sorted(adapter_weights.keys())
+        serialized_frames = {}
+        tensors_meta = {}
+        for name in sorted_names:
+            param = adapter_weights[name]
+            frame_bytes = self.serialize_payload(param)
+            if len(frame_bytes) > self.max_request_size:
+                raise ValueError(
+                    f"Adapter tensor {name} is {len(frame_bytes)} bytes; "
+                    f"raise kafka.max_request_size and broker/topic max.message.bytes"
+                )
+            sha256_hex = hashlib.sha256(frame_bytes).hexdigest()
+            tensors_meta[name] = {
+                "sha256": sha256_hex,
+                "nbytes": len(frame_bytes),
+                "dtype": str(param.dtype).replace("torch.", ""),
+                "shape": list(param.shape),
+            }
+            serialized_frames[name] = frame_bytes
+
+        created_at = time.time()
         manifest_meta = {
+            "protocol_version": 2,
+            "run_id": active_run_id,
             "step_id": step_tag,
-            "num_tensors": num_tensors,
-            "tensor_names": list(adapter_weights.keys()),
+            "seq": active_seq,
+            "created_at": created_at,
+            "num_tensors": len(sorted_names),
+            "tensor_names": sorted_names,
+            "tensors": tensors_meta,
+            "integrity": self.integrity if self.integrity in ("sha256", "hmac") else "sha256",
+            "hmac_sha256": None,
+        }
+        if self.integrity == "hmac":
+            manifest_meta["hmac_sha256"] = compute_manifest_hmac(manifest_meta, self.hmac_key)
+
+        m_digest = manifest_digest(manifest_meta)
+        manifest_bytes = canonical_json(manifest_meta)
+
+        commit_meta = {
+            "step_id": step_tag,
+            "status": "committed",
+            "manifest_sha256": m_digest,
             "timestamp": time.time(),
         }
+        commit_bytes = canonical_json(commit_meta)
+
+        # 1. Send manifest
         self.producer.send(
             topic=self.topic,
-            partition=0,  # all frames share one ordered Kafka partition
+            partition=0,
             key=f"__manifest__:{step_tag}".encode("utf-8"),
-            value=manifest_meta
+            value=manifest_bytes,
         )
 
-        # 2. Send each tensor with step-prefixed key
-        for name, param in adapter_weights.items():
+        # 2. Send each pre-serialized tensor frame
+        for name in sorted_names:
             self.producer.send(
                 topic=self.topic,
                 partition=0,
                 key=f"{step_tag}:{name}".encode("utf-8"),
-                value=param
+                value=serialized_frames[name],
             )
 
         # 3. Send commit marker
-        commit_meta = {
-            "step_id": step_tag,
-            "status": "committed",
-            "timestamp": time.time(),
-        }
         self.producer.send(
             topic=self.topic,
             partition=0,
             key=f"__commit__:{step_tag}".encode("utf-8"),
-            value=commit_meta
+            value=commit_bytes,
         )
         self.producer.flush()
 
@@ -755,6 +840,8 @@ def train_model(config, config_path: str = "(unknown)"):
             f"Checkpoint saving enabled: every {save_every_steps} steps, "
             f"save_final={save_final_ckpt}, root={ckpt_manager.checkpoint_root}"
         )
+        if lora_producer is not None:
+            lora_producer.run_id = ckpt_manager.run_dir
     else:
         _log("Checkpoint saving disabled (save_checkpoints.enabled: false).")
     
@@ -1073,7 +1160,12 @@ def train_model(config, config_path: str = "(unknown)"):
             if time.time() - last_send_time >= weight_push_interval:
                 if kafka_cfg.get('enable_lora_streaming', True):
                     _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
-                    lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
+                    lora_producer.send_weights(
+                        get_peft_model_state_dict(model),
+                        step_id=optimization_step,
+                        run_id=getattr(lora_producer, "run_id", None),
+                        seq=optimization_step,
+                    )
                 last_send_time = time.time()
 
     except KeyboardInterrupt:
@@ -1118,7 +1210,12 @@ def train_model(config, config_path: str = "(unknown)"):
     try:
         if kafka_cfg.get('enable_lora_streaming', True) and loop_error is None:
             _log("Training complete. Sending final adapter weights.")
-            lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
+            lora_producer.send_weights(
+                get_peft_model_state_dict(model),
+                step_id=optimization_step,
+                run_id=getattr(lora_producer, "run_id", None),
+                seq=optimization_step,
+            )
             lora_producer.send_done_signal()
         else:
             _log("Training complete. LoRA streaming disabled, skipping final Kafka push.")

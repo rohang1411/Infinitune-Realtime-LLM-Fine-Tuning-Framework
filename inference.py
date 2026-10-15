@@ -11,7 +11,7 @@ import yaml
 from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
 from utils.serving_router import DoubleBufferedAdapterRouter
-from utils.stream_protocol import SnapshotAssembler
+from utils.stream_protocol import SnapshotAssembler, deserialize_tensor
 from utils.serving_policy import should_listen_for_updates
 from transformers import (
     AutoModelForCausalLM,
@@ -73,6 +73,7 @@ stream_state_global = {
         "rejected_by_reason": {},
     },
 }
+initial_active_global = None
 
 
 def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional[tuple]:
@@ -80,8 +81,7 @@ def process_adapter_record(assembler, key, raw_value, counters=None) -> Optional
     try:
         if not key or raw_value is None:
             raise ValueError(f"Missing key or raw_value (key={key!r}, value_is_none={raw_value is None})")
-        val = deserialize_tensor(raw_value)
-        return assembler.add(key, val)
+        return assembler.add(key, raw_value)
     except Exception as exc:
         if counters is not None:
             counters["rejected_frames"] = counters.get("rejected_frames", 0) + 1
@@ -129,7 +129,10 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
         received_count = 0
         last_heartbeat_time = time.time()
         heartbeat_every_s = 5.0
-        assembler = SnapshotAssembler()
+        assembler = SnapshotAssembler(
+            integrity=kafka_cfg.get("integrity", "sha256"),
+            initial_active=initial_active_global,
+        )
 
         while True:
             messages = consumer.poll(timeout_ms=poll_timeout_ms)
@@ -524,6 +527,21 @@ if __name__ == "__main__":
     router_global = DoubleBufferedAdapterRouter(model, tokenizer, device=device_global)
     if resolved_checkpoint_path:
         router_global.active_version = os.path.basename(resolved_checkpoint_path)
+        meta_file = os.path.join(resolved_checkpoint_path, "checkpoint_meta.json")
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, encoding="utf-8") as f:
+                    c_meta = json.load(f)
+                c_run = c_meta.get("run_id") or os.path.basename(os.path.dirname(resolved_checkpoint_path))
+                c_seq = c_meta.get("seq")
+                if c_seq is None:
+                    c_seq = c_meta.get("step")
+                c_created = c_meta.get("created_at") or os.path.getmtime(meta_file)
+                if c_run and c_seq is not None:
+                    initial_active_global = (str(c_run), c_seq, float(c_created))
+                    _log(f"Initialized active version from cold start: {initial_active_global}")
+            except Exception as e:
+                _log(f"Cold-start active metadata read skipped: {e}")
     _log("Adapter router initialized with single-model read/write locking.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
