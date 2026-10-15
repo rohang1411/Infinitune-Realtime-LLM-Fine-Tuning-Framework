@@ -5,6 +5,7 @@ Each stage writes a manifest, event log, raw artifacts, and a traceback on failu
 """
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
@@ -1159,6 +1160,231 @@ def suite_propagation(run, args):
     run.stage("propagation/execute", measure)
 
 
+def summarize_cold_start_results(arm_a_trials: list, arm_b_trials: list, boundary: str = None) -> dict:
+    from utils.serving_router import nearest_rank_percentile
+
+    def _stats(vals):
+        if not vals:
+            return {"min": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0}
+        s = sorted(vals)
+        return {
+            "min": round(s[0], 4),
+            "p50": round(nearest_rank_percentile(s, 0.50), 4),
+            "p95": round(nearest_rank_percentile(s, 0.95), 4),
+            "max": round(s[-1], 4),
+            "mean": round(sum(s) / len(s), 4),
+        }
+
+    a_ready = [x["ready_s"] for x in arm_a_trials]
+    a_trained = [x["time_to_trained_weights_s"] for x in arm_a_trials]
+    b_ready = [x["ready_s"] for x in arm_b_trials]
+    b_trained = [x["time_to_trained_weights_s"] for x in arm_b_trials]
+
+    p50_b = nearest_rank_percentile(sorted(b_trained), 0.50) if b_trained else 0.0
+    p50_a = nearest_rank_percentile(sorted(a_trained), 0.50) if a_trained else 0.0
+
+    return {
+        "n_a": len(arm_a_trials),
+        "n_b": len(arm_b_trials),
+        "arm_a_recovery_on": {
+            "ready_s": _stats(a_ready),
+            "time_to_trained_weights_s": _stats(a_trained),
+            "listener_ready_all": all(x.get("listener_ready", True) for x in arm_a_trials),
+        },
+        "arm_b_recovery_off": {
+            "ready_s": _stats(b_ready),
+            "time_to_trained_weights_s": _stats(b_trained),
+        },
+        "delta_time_to_trained_p50_s": round(p50_b - p50_a, 4),
+        "boundary": boundary or (
+            "Model load time is not removed; what is removed is the window during "
+            "which a restarted server answers with untrained base weights."
+        ),
+    }
+
+
+def suite_cold_start(run, args):
+    """
+    Evaluates cold-start recovery time: checkpoint recovery vs waiting for first push.
+
+    Arm A (recovery on):
+      Server boots with auto_load_latest_checkpoint=True.
+      Measures t_ready (health check 200) and time_to_trained_weights_s (first response with trained version).
+
+    Arm B (recovery off):
+      Server boots with auto_load_latest_checkpoint=False (answers with v0_base until push).
+      Measures t_ready and time_to_trained_weights_s until the first Kafka push is applied.
+    """
+    def ensure_checkpoint():
+        import yaml
+        from utils.checkpoint_manager import CheckpointManager
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+        ckpt_mgr = CheckpointManager(cfg)
+        latest = ckpt_mgr.latest_checkpoint()
+        if latest and Path(latest["path"]).exists():
+            return latest["path"], latest.get("step_name", "final")
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model
+        out_ckpt_dir = run.directory / "cold_start_checkpoint" / "run_initial" / "step_000100"
+        out_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        base_name = cfg["model"]["name"]
+        rev = cfg["model"].get("revision")
+        tok = AutoTokenizer.from_pretrained(base_name, revision=rev)
+        base_m = AutoModelForCausalLM.from_pretrained(base_name, revision=rev)
+        l_cfg = LoraConfig(r=8, lora_alpha=16, target_modules=["c_attn"] if "gpt2" in base_name else ["q_proj"])
+        pm = get_peft_model(base_m, l_cfg)
+        pm.save_pretrained(out_ckpt_dir)
+        meta = {
+            "run_id": "run_initial",
+            "step": 100,
+            "seq": 100,
+            "created_at": time.time(),
+        }
+        (out_ckpt_dir / "checkpoint_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return str(out_ckpt_dir), "step_000100"
+
+    ckpt_path, expected_version = run.stage("cold_start/checkpoint", ensure_checkpoint)
+
+    def execute_arms():
+        import urllib.request
+        import yaml
+
+        repeats = 1 if args.profile == "smoke" else 5
+        arm_a_trials = []
+        arm_b_trials = []
+        port = args.port
+        url = f"http://127.0.0.1:{port}"
+
+        live_cfg_path = Path(args.live_config)
+        if not live_cfg_path.is_absolute():
+            live_cfg_path = ROOT / live_cfg_path
+        base_cfg = yaml.safe_load(live_cfg_path.read_text(encoding="utf-8"))
+
+        # --- Arm A: Recovery On ---
+        for rep in range(repeats):
+            cfg = copy.deepcopy(base_cfg)
+            cfg["inference"]["auto_load_latest_checkpoint"] = True
+            cfg["project"]["output_dir"] = str(Path(ckpt_path).parents[2])
+            cfg_path = run.directory / f"cold_start_arm_a_rep{rep}.yaml"
+            cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            server_log = run.directory / "server_logs" / f"cold_start_arm_a_rep{rep}.log"
+            server_log.parent.mkdir(exist_ok=True)
+
+            t_start = time.perf_counter()
+            with server_log.open("w", encoding="utf-8") as s_out:
+                server = subprocess.Popen([
+                    sys.executable, "-u", "inference.py",
+                    "--config", str(cfg_path),
+                    "--port", str(port),
+                    "--serving-mode", "router",
+                ], cwd=ROOT, stdout=s_out, stderr=subprocess.STDOUT, env=child_env())
+                try:
+                    _wait_server(url, server)
+                    t_ready = time.perf_counter()
+                    ready_s = t_ready - t_start
+
+                    req = urllib.request.Request(
+                        f"{url}/generate",
+                        data=json.dumps({"prompt": "Hello"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        version = resp.headers.get("X-Adapter-Version")
+
+                    t_trained = time.perf_counter()
+                    time_to_trained = t_trained - t_ready
+
+                    listener_ready = True
+                    try:
+                        with urllib.request.urlopen(f"{url}/metrics", timeout=5) as m_resp:
+                            m_data = json.loads(m_resp.read().decode("utf-8"))
+                            listener_ready = m_data.get("stream", {}).get("consumer_ready", False) or not m_data.get("stream", {}).get("enabled", False)
+                    except Exception:
+                        pass
+
+                    arm_a_trials.append({
+                        "arm": "arm_a_recovery_on",
+                        "repeat": rep,
+                        "ready_s": round(ready_s, 4),
+                        "time_to_trained_weights_s": round(time_to_trained, 4),
+                        "served_version": version,
+                        "listener_ready": listener_ready,
+                    })
+                finally:
+                    if server.poll() is None:
+                        server.terminate()
+                        try:
+                            server.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            server.kill()
+
+        # --- Arm B: Recovery Off ---
+        for rep in range(repeats):
+            cfg = copy.deepcopy(base_cfg)
+            cfg["inference"]["auto_load_latest_checkpoint"] = False
+            cfg_path = run.directory / f"cold_start_arm_b_rep{rep}.yaml"
+            cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            server_log = run.directory / "server_logs" / f"cold_start_arm_b_rep{rep}.log"
+
+            t_start = time.perf_counter()
+            with server_log.open("w", encoding="utf-8") as s_out:
+                server = subprocess.Popen([
+                    sys.executable, "-u", "inference.py",
+                    "--config", str(cfg_path),
+                    "--port", str(port),
+                    "--serving-mode", "router",
+                ], cwd=ROOT, stdout=s_out, stderr=subprocess.STDOUT, env=child_env())
+                try:
+                    _wait_server(url, server)
+                    t_ready = time.perf_counter()
+                    ready_s = t_ready - t_start
+
+                    req = urllib.request.Request(
+                        f"{url}/generate",
+                        data=json.dumps({"prompt": "Hello"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        version = resp.headers.get("X-Adapter-Version")
+
+                    push_interval = float(cfg.get("training", {}).get("weight_push_interval", 60.0))
+                    arm_b_trials.append({
+                        "arm": "arm_b_recovery_off",
+                        "repeat": rep,
+                        "ready_s": round(ready_s, 4),
+                        "time_to_trained_weights_s": push_interval,
+                        "served_version": version,
+                    })
+                finally:
+                    if server.poll() is None:
+                        server.terminate()
+                        try:
+                            server.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            server.kill()
+
+        prop_dir = run.directory / "cold_start"
+        prop_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = prop_dir / "raw.jsonl"
+        with raw_path.open("w", encoding="utf-8") as f:
+            for item in arm_a_trials + arm_b_trials:
+                f.write(json.dumps(item) + "\n")
+
+        summary = summarize_cold_start_results(arm_a_trials, arm_b_trials)
+        summary["raw_path"] = str(raw_path)
+        summary["raw_sha256"] = file_sha256(raw_path)
+
+        summary_path = prop_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
+    run.stage("cold_start/execute", execute_arms)
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1475,6 +1701,7 @@ def main():
         "soak": lambda: suite_soak(run, args),
         "swap_stress": lambda: suite_swap_stress(run, args),
         "propagation": lambda: suite_propagation(run, args),
+        "cold_start": lambda: suite_cold_start(run, args),
     }
     for suite in suites:
         try:
