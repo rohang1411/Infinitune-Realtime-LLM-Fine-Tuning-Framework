@@ -1397,6 +1397,12 @@ def suite_eval_speed(run, args, data_dir):
     run.stage("eval_speed/execute", lambda: run_eval_speed_suite(run, args, data_dir))
 
 
+def suite_filter_benchmark(run, args):
+    """5-stage stream filter throughput on Alpaca and malformed-frame no-stall proof."""
+    from benchmarks.filter_benchmark import run_filter_benchmark_suite
+    run.stage("filter_benchmark/execute", lambda: run_filter_benchmark_suite(run, args))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1805,6 +1811,7 @@ def main():
         "cold_start": lambda: suite_cold_start(run, args),
         "fault_injection": lambda: suite_fault_injection(run, args),
         "eval_speed": lambda: suite_eval_speed(run, args, args.data_dir),
+        "filter_benchmark": lambda: suite_filter_benchmark(run, args),
     }
     for suite in suites:
         try:
