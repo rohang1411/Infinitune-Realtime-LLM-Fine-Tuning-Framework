@@ -1,0 +1,63 @@
+{
+  "generated_at_utc": "2026-10-15T05:44:52Z",
+  "imdb": {
+    "dataset_name": "imdb",
+    "resolved_repo_id": "imdb",
+    "commit_sha": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+    "canonical_stanfordnlp_sha": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+    "train_rows": 25000,
+    "train_label_balance": {
+      "0": 12500,
+      "1": 12500
+    },
+    "test_rows": 25000,
+    "test_label_balance": {
+      "0": 12500,
+      "1": 12500
+    }
+  },
+  "continual_polarity": {
+    "yelp_polarity": {
+      "commit_sha": "bbf1c97a1f0cf005e5aded43839fd814654a1557",
+      "test_rows": 38000,
+      "test_label_balance": {
+        "1": 19000,
+        "0": 19000
+      }
+    },
+    "amazon_polarity": {
+      "commit_sha": "9d9c45c18f8c3cf1b23a3c27917b60cbf28f3289",
+      "test_rows": 400000,
+      "test_label_balance": {
+        "1": 200000,
+        "0": 200000
+      }
+    }
+  },
+  "e2e_nlg": {
+    "repo_id": "GEM/e2e_nlg",
+    "commit_sha": "0e089c2ba61c3a0d183815c87c2c95e98fb446a6",
+    "urls": {
+      "train": "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet",
+      "validation": "https://huggingface.co/datasets/GEM/e2e_nlg/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet"
+    },
+    "train_rows": 33525,
+    "train_unique_meaning_representations": 12568,
+    "validation_rows": 1484,
+    "validation_unique_meaning_representations": 1484
+  },
+  "alpaca": {
+    "repo_id": "tatsu-lab/alpaca",
+    "commit_sha": "dce01c9b08f87459cf36a430d809084718273017",
+    "train_rows": 52002,
+    "non_empty_input_rows": 20679,
+    "non_empty_input_percentage": 39.77
+  },
+  "gsm8k": {
+    "repo_id": "gsm8k",
+    "config_name": "main",
+    "commit_sha": "740312add88f781978c0658806c59bc2815b9866",
+    "train_rows": 7473,
+    "test_rows": 1319
+  }
+}
