@@ -8,7 +8,7 @@
 
 ## 0. Executive Verdict
 
-The project is worth continuing, but not as "real-time fine-tuning to keep an LLM up to date." That framing is still the weakest part of the project. RAG wins for fresh factual knowledge, provenance, document QA, and per-query grounding. The defensible and resume-valuable version of InfiniTune is:
+The project is worth continuing, but not as "real-time fine-tuning to keep an LLM up to date." That framing is still the weakest part of the project. RAG wins for fresh factual knowledge, provenance, document QA, and per-query grounding. The defensible and high-value version of InfiniTune is:
 
 > A streaming continual-adaptation and adapter-serving testbed for LLM behavior: ingest feedback/data streams, train lightweight adapters safely, measure forgetting and drift, validate precision/compiler tradeoffs, and hot-swap adapter versions into inference without downtime.
 
@@ -164,7 +164,7 @@ The best candidates are:
 - O-LoRA / OPLoRA-style orthogonal constraints as the "research" method.
 - Drift-triggered training and rollback as the production-safety method.
 
-### 4.3 Compiler/precision work is high-value for resume impact
+### 4.3 Compiler/precision work is high-value for systems credibility
 
 The plan is directionally right that `torch.compile`, BF16/FP16 AMP, NF4 QLoRA, Liger/Triton, and profiling are higher-signal than another static fine-tune. Frontier AI infrastructure roles increasingly care about performance, profiling, distributed systems, GPU utilization, CUDA/Triton, and compiler awareness. OpenAI, Anthropic, and NVIDIA role descriptions explicitly call out optimization, GPU utilization, custom kernels, mixed precision, distributed systems, and compiler/framework experience.
 
@@ -655,7 +655,7 @@ What to demo:
 - Distill behavior from a stronger model into a smaller model.
 - Compare latency/cost/quality against RAG-prompted larger model.
 
-This is resume-friendly because it connects modeling to business value.
+This is highly credible because it connects modeling to real business value.
 
 ---
 
@@ -682,7 +682,7 @@ This sounds senior and disarms the critique.
 
 ---
 
-## 10. What Recruiters and Senior Engineers Will Actually Care About
+## 10. What Reviewers and Senior Systems Engineers Will Actually Care About
 
 For ML infrastructure and AI systems roles, the strongest signals are:
 
@@ -695,13 +695,13 @@ For ML infrastructure and AI systems roles, the strongest signals are:
 
 Current frontier/performance roles support this direction. OpenAI's Training Performance Engineer role emphasizes optimizing performance, debugging distributed systems, measuring efficiency, and understanding how layers interact. Anthropic's GPU Performance Engineer role calls out GPU utilization, custom kernels, mixed precision, kernel fusion, and end-to-end training/inference optimization. NVIDIA compiler roles call out deep learning frameworks, CUDA, XLA, Triton, and compiler work.
 
-This means InfiniTune can be very strong on a resume if the final artifact includes real measurements.
+This means InfiniTune can be very strong as a technical artifact if it includes real measurements.
 
-Bad resume line:
+Weak summary line:
 
 > Built a real-time LLM fine-tuning framework using Kafka and LoRA.
 
-Better resume lines after the revised V3:
+Production-grade specification summaries after the revised V3:
 
 - Built a streaming continual-adaptation framework for LLM adapters: Kafka data stream -> online LoRA/QLoRA training -> guarded adapter promotion -> zero-downtime serving.
 - Implemented replay and orthogonal-LoRA baselines for continual fine-tuning, reducing forgetting by X% versus naive online SFT on a reproducible task stream.
@@ -860,7 +860,7 @@ The current flat script layout is acceptable for V2, but V3 will become hard to 
 
 The V3 plan is directionally correct but overly ambitious and insufficiently benchmark-driven. It should be converted from a feature implementation plan into a research-and-systems validation plan.
 
-The project can absolutely be made useful and resume-impactful. The winning version is not:
+The project can absolutely be made useful and impactful. The winning version is not:
 
 > "I continuously fine-tune an LLM so it knows new stuff."
 

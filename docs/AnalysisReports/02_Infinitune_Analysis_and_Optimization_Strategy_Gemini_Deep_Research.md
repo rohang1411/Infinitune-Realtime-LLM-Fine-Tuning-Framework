@@ -144,8 +144,8 @@ For practical implementation within the "Infinitune" project, vLLM offers robust
 ## **Strategic Project Evolution: Articulating Value to the Industry**
 
 The core question posed regarding whether a systems-level project is "worth it" compared to simply fine-tuning a model on a static dataset to achieve a high benchmark score is highly relevant. In the modern AI engineering landscape, the answer is unequivocally yes.  
-While static fine-tuning proves empirical competency in applied modeling, designing an asynchronous, compiler-optimized, streaming ML system proves architectural mastery. To sell this project effectively to recruiters, engineering managers, or Senior Data Scientists, the narrative must actively pivot from "I fine-tuned a model" to "I engineered a high-throughput, hardware-aware, continuous alignment system."  
-To position this project as top-notch on a resume, the following architectural achievements must be explicitly highlighted:
+While static fine-tuning proves empirical competency in applied modeling, designing an asynchronous, compiler-optimized, streaming ML system proves architectural mastery. In technical evaluations and engineering reviews, the narrative must actively pivot from "I fine-tuned a model" to "I engineered a high-throughput, hardware-aware, continuous alignment system."  
+To highlight this project as a production-grade ML engineering system, the following architectural achievements must be explicitly emphasized:
 
 1. **Distributed Data Engineering and Streaming:** Highlight the architectural decision to use Apache Kafka for asynchronous data ingestion. Emphasize the handling of concept drift and schema resilience in a streaming context, proving an understanding of enterprise-scale data pipelines and continuous online learning.  
 2. **Advanced Algorithmic Implementation:** Detail the specific methods integrated to combat catastrophic forgetting, such as Memory-Inspired Sampler and Scheduler Replay (MSSR) or orthogonal gradient projections. This demonstrates a deep, theoretical grasp of neural network retention dynamics and statistical learning theory.  

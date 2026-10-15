@@ -1,11 +1,11 @@
-# InfiniTune: Resume Claims Implementation and Verification Plan
+# InfiniTune: Benchmark Implementation and Verification Plan
 
-> **Document:** `docs/ImplementationPlan/04_Resume_Claims_Implementation_Plan.md`
-> **Companion:** `docs/ImplementationPlan/05_Resume_Claims_Testing_Guide.md` (how to run every test and what results to expect)
+> **Document:** `docs/ImplementationPlan/04_Benchmark_Implementation_and_Verification_Plan.md`
+> **Companion:** `docs/ImplementationPlan/05_Benchmark_Testing_Guide.md` (how to run every test and what results to expect)
 > **Written:** 2026-10-15, against GitHub `main` at commit `0dfb728` (the local Windows folder matched it apart from CRLF line endings).
 > **Revision 2 (2026-10-15):** updated after reviewing the CSCI-566 final report and the run logs in `output/`. Section 2A lists what those logs verify, and the claim table, WP-20, WP-24, §8 and §14 were changed to match. Where the logs already prove a number, the plan now re-scores the saved checkpoints instead of retraining.
 > **Audience:** coding agents (including smaller models such as Gemini Flash) and Rohan.
-> **Goal:** for each of the 12 resume bullets (SDE-1 to SDE-6, DS-1 to DS-6), build any missing functionality, build the test harness that measures the bullet's numbers, run it on the available hardware, and then either keep the bullet's numbers, change them to what was measured, or reword the bullet.
+> **Goal:** for each of the 12 system benchmark specifications (SDE-1 to SDE-6, DS-1 to DS-6), build any missing functionality, build the test harness that measures the target metrics, run it on the available hardware, and then either keep the target numbers, update them to what was measured, or reword the benchmark.
 
 ---
 
@@ -337,7 +337,7 @@ Parameter counts in this table are approximate public figures. WP-00 records the
 - Close browsers, IDE indexers and sync clients (OneDrive, Google Drive) during timing runs.
 - Run one warm-up trial that is not counted.
 - Report p50, p95, max and the number of trials. **Never report a single run as a latency claim.**
-- Record each timing claim per machine. The resume can quote the machine that ran it ("on an Apple M4 laptop").
+- Record each timing measurement per machine, noting the specific target hardware environment ("on an Apple M4 laptop").
 
 ---
 
@@ -727,7 +727,7 @@ Each summary records `n`, p50, p95, max, the machine fields from WP-00, and a `"
   - `t_flushed`: `producer.flush()` returned.
   - `t_assembled`: the inference consumer validated the commit.
   - `t_applied`: `swap_weights` released the write lock.
-  - **propagation_s = t_applied − t_publish_start.** This is the resume number.
+  - **propagation_s = t_applied − t_publish_start.** This is the primary verified propagation latency metric.
   - The suite also reports `publish_s`, `transport_assemble_s` and `apply_s`, which sum to the total.
 - **Mechanism:**
   1. `t_publish_start` and `t_flushed` go into the v2 manifest (`created_at`) and into the trainer log.
@@ -783,7 +783,7 @@ Each summary records `n`, p50, p95, max, the machine fields from WP-00, and a `"
     - `swap_lock_held_ms` p50/p95/max;
     - `swap_lock_wait_ms` p50/p95/max;
     - request latency p50/p95/p99 during swaps versus a no-swap control window of equal length.
-- **Acceptance:** `request_failures == 0`, `dropped == 0` and `match == true` in every run. The resume's "140 ms" must be restated as whichever of lock-held or total is meant (section 8).
+- **Acceptance:** `request_failures == 0`, `dropped == 0` and `match == true` in every run. The 140 ms target specification must be reported as whichever of lock-held or total is meant (section 8).
 
 #### WP-16: `fault_injection` suite (L)
 
@@ -1054,7 +1054,7 @@ Each summary records `n`, p50, p95, max, the machine fields from WP-00, and a `"
      - `contradiction_any = any slot contradicted`;
      - `fully_correct = all slots correct`.
   4. Aggregate: mean recall, contradiction rate (fraction of descriptions with ≥ 1 contradiction), fully-correct rate, and per-slot contradiction rates, each with a bootstrap CI. **Report the familyFriendly inversion rate separately**, because it is what the old 15.8%/1.2% numbers measured.
-  5. **Human validation:** export 100 seeded random (MR, output, scorer labels) rows from the final checkpoint and 100 from the base model to `e2e_facts/human_validation.csv`, with empty columns for Rohan's labels. A helper `benchmarks/e2e_facts.py agreement <csv>` computes per-slot Cohen's kappa between the scorer and the human labels. **DS-2 numbers may go on the resume only if kappa ≥ 0.8 for every slot used** (section 8).
+  5. **Human validation:** export 100 seeded random (MR, output, scorer labels) rows from the final checkpoint and 100 from the base model to `e2e_facts/human_validation.csv`, with empty columns for Rohan's labels. A helper `benchmarks/e2e_facts.py agreement <csv>` computes per-slot Cohen's kappa between the scorer and the human labels. **DS-2 numbers are considered production-ready only if kappa ≥ 0.8 for every slot used** (section 8).
   6. Before/after: base gpt2-medium versus the **existing** final checkpoint (and the full curve over the saved checkpoints). Score both on the **same fixed set**: all unique validation MRs (1,484 per §13; confirm in WP-01). Use greedy decoding, the same `max_new_tokens`, and the same prompt template as `configs/e2e_qualitative.yaml`.
 - **Suite:** register `e2e_facts` in `benchmarks/run.py`. It calls `benchmarks/e2e_facts.py` for generation and scoring, and `--e2e-checkpoint` selects the adapted model.
 - **Tests:** about 25 hand-written cases covering each slot's correct, omitted and contradicted outcomes, including "not family-friendly" with an MR of `yes` → contradicted, and no mention → omitted.
@@ -1088,7 +1088,7 @@ Each summary records `n`, p50, p95, max, the machine fields from WP-00, and a `"
   2. In `precision_manager`, keep forcing fp32 on CPU. On MPS, if `model.allow_half_on_mps` is true, permit `bf16`, falling back to `fp16` if a one-time bf16 matmul probe raises. Log the decision.
   3. Replace each ad-hoc device choice in the listed files with `resolve_device`. Search for `torch.cuda.is_available()` and `mps` to find them, and list every changed line in the report.
   4. Add `--device` to `trainer.py`, `inference.py` and `evaluate.py` (and to `benchmarks/run.py` as `--device`, passed to child processes through `INFINITUNE_DEVICE`).
-  5. XPU (Windows, experimental): document in `docs/` that it needs a **separate venv** with the Intel XPU build of PyTorch, installed from PyTorch's XPU wheel index. Confirm the current command on pytorch.org; do not change `requirements-eval.txt` for it. Results from XPU are never used for resume claims unless Rohan decides otherwise (Q4).
+  5. XPU (Windows, experimental): document in `docs/` that it needs a **separate venv** with the Intel XPU build of PyTorch, installed from PyTorch's XPU wheel index. Confirm the current command on pytorch.org; do not change `requirements-eval.txt` for it. Results from XPU are never used for primary performance benchmarks unless explicitly configured (Q4).
 - **Tests:** precedence order with env and CLI; XPU requested but unavailable raises; MPS half precision is refused without the flag. Monkeypatch the `torch.backends.mps.is_available` and `torch.cuda.is_available` functions.
 - **Acceptance:** `python -m benchmarks.run run --suites precision --profile standard --device mps` on the MacBook Pro reports finite losses for fp32 and bf16 (or fp16). Record its summary.
 
@@ -1179,12 +1179,12 @@ Do this **after** the runs, and edit the context doc only through these changes:
    - pin Kafka 3.9.x on all OSes (WP-00 policy);
    - add a short "Colab" subsection pointing to section 7 of this plan;
    - document the env vars `INFINITUNE_DEVICE`, `INFINITUNE_KAFKA_BOOTSTRAP`, `INFINITUNE_KAFKA_USERNAME/PASSWORD` and `INFINITUNE_ADAPTER_HMAC_KEY`.
-7. **New §19, "Resume claim evidence map":** a table of the 12 bullet IDs → current wording → status (PASS/FAIL/NOT RUN) → the `reports/claims/CLAIMS.md` row. It should state that `CLAIMS.md` is the source of truth.
+7. **New §19, "Master evidence map and ledger":** a table of the 12 target benchmark IDs → current wording → status (PASS/FAIL/NOT RUN) → the `reports/claims/CLAIMS.md` row. It should state that `CLAIMS.md` is the source of truth.
 8. Update the table of contents (lines 7-92) for §19.
 
 #### WP-31: keep the testing guide current (S)
 
-`docs/ImplementationPlan/05_Resume_Claims_Testing_Guide.md` lists every command. Whenever a WP changes a command, flag or expected output, update that guide in the same commit.
+`docs/ImplementationPlan/05_Benchmark_Testing_Guide.md` lists every command. Whenever a WP changes a command, flag or expected output, update that guide in the same commit.
 
 ---
 
@@ -1284,7 +1284,7 @@ The trainer's clock (Colab) and the server's clock (laptop) differ. To correct f
 1. On both sides, at the start and end of the run, record the offset to a public NTP server: `ntplib.NTPClient().request("time.google.com").offset`. `ntplib` is a new, small, pure-Python dependency, added to `requirements-colab.txt` and `requirements-eval.txt` by WP-28 under rule R5.
 2. Corrected `t_applied_on_colab_clock = t_applied_laptop − offset_laptop + offset_colab` (offsets as returned by ntplib are server − local).
 3. Report propagation and both offsets. If the offset changes by more than 50 ms between the start and end of the run, flag the run.
-4. Report the split-mode numbers separately from same-machine numbers. A resume claim must name which one it uses.
+4. Report the split-mode numbers separately from same-machine numbers, explicitly stating the deployment topology used.
 
 ### 7.6 Mode C: Drive sync fallback
 
@@ -1395,7 +1395,7 @@ Each rule says when the current wording can stay. Otherwise use the template, fi
 
 Each finding names the WP it was folded into.
 
-1. **"<8 s" needs a precise boundary.** Two different numbers existed: record-to-version (7.593 s) and snapshot-to-visible (0.844 s). Both are kept, but the resume number is defined as publish-start to lock-released, measured server-side (WP-13).
+1. **"<8 s" needs a precise boundary.** Two different numbers existed: record-to-version (7.593 s) and snapshot-to-visible (0.844 s). Both are kept, but the primary latency specification is defined as publish-start to lock-released, measured server-side (WP-13).
 2. **Polling-based timing adds error.** The freshness suite polls `/metrics` every 100 ms. Server-side timestamps replace polling (WP-13).
 3. **Swap timing mixed queueing with work.** Fixed in WP-09; the claim must say which number it is (§8).
 4. **Restart regressions.** The fixed inference group id plus committed offsets can re-apply old snapshots after a cold start. The monotonic `(run_id, seq)` guard was added (WP-10).
@@ -1453,7 +1453,7 @@ I checked the plan against itself and the code. These are the gaps I found and c
 | Plan numbers that are inferred rather than verified are marked | kafka-python compatibility, Qwen adapter size, model memory: all marked INFERRED with a WP that measures them |
 | Rohan's hardware is respected | No Qwen on Windows; no timing claims from the MacBook Air; Qwen-3B on the Mac only after WP-26 |
 | Docs | Context doc changes (WP-30), testing guide (05 doc, WP-31), evidence ledger (WP-29) |
-| Resume integrity | Every number must come from `CLAIMS.md`; rounding rules and rewording templates are fixed in §8 |
+| Benchmark integrity | Every number must come from `CLAIMS.md`; rounding rules and specification templates are fixed in §8 |
 
 Revision 2 check: every number in section 2A was read from the cited CSV row, and the SHA-256s were computed on the copies read. The run10 `metrics_clean.csv` hash matches the one context doc §13 cites.
 
@@ -1472,7 +1472,7 @@ Copy this for each WP and replace the `<…>` parts.
 ```
 You are implementing ONE work package in the InfiniTune repository.
 
-Work package: WP-<NN> from docs/ImplementationPlan/04_Resume_Claims_Implementation_Plan.md.
+Work package: WP-<NN> from docs/ImplementationPlan/04_Benchmark_Implementation_and_Verification_Plan.md.
 Read section 0 (rules) and the whole WP-<NN> section first. Follow them exactly.
 
 Steps:
@@ -1494,9 +1494,9 @@ If you are unsure, stop and ask instead of guessing.
 Each question has a default the plan uses until you answer.
 
 1. **DS-2 wording.** The logs confirm 15.73% (rounds to 15.7%), but it is the step-400 peak, not the starting value, which was 0%. It also covers only family-friendliness. OK to say "from a 15.7% mid-training peak to 1.2%"? **Default: yes.**
-2. **QAFactEval.** The scorer is a simplified QA-overlap proxy. Rename it to "QAFactEval-style" on the resume and in code, or integrate the real QAFactEval package (heavy, with several large models)? **Default: rename.**
+2. **QAFactEval.** The scorer is a simplified QA-overlap proxy. Rename it to "QAFactEval-style" in documentation and in code, or integrate the real QAFactEval package (heavy, with several large models)? **Default: rename.**
 3. **"GPT-2" in SDE-1/DS-1.** Live runs so far used DistilGPT-2. Run gpt2-medium live as well, or write "DistilGPT-2"? **Default: run gpt2-medium as well.**
-4. **Intel Arc XPU.** Do you want the experimental XPU path tried on the Windows laptop? **Default: try it, but never use it for resume numbers.**
+4. **Intel Arc XPU.** Do you want the experimental XPU path tried on the Windows laptop? **Default: try it, but never use it for authoritative benchmark metrics.**
 5. **ADWIN action.** Should drift detection only report, or also trigger an action (for example raising the replay fraction)? **Default: report only.**
 6. **Human labels.** Can you hand-label 200 E2E outputs (8 slots each) and review 50 filtered Alpaca rows? Without this, DS-2's numbers cannot be validated. **Default: yes, the plan schedules it.**
 7. **Line endings.** Add a `.gitattributes` (`* text=auto`) so Windows and Mac commits stay consistent? **Default: no change until you say so.**

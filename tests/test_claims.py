@@ -66,6 +66,6 @@ def test_build_evidence_ledger_synthetic(tmp_path):
     assert by_claim["SDE-3"]["measured_value"] == 0
 
     md = generate_claims_markdown(ledger)
-    assert "# InfiniTune — Master Evidence & Resume Claims Ledger" in md
+    assert "# InfiniTune — Master Benchmark Verification & Evaluation Ledger" in md
     assert "SDE-1" in md
     assert "**PASS**" in md

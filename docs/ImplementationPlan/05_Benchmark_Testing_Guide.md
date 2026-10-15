@@ -1,12 +1,12 @@
-# InfiniTune: Resume Claims Testing Guide
+# InfiniTune: Benchmark Testing Guide
 
-> **Document:** `docs/ImplementationPlan/05_Resume_Claims_Testing_Guide.md`
-> **Companion to:** `04_Resume_Claims_Implementation_Plan.md` (the "plan").
+> **Document:** `docs/ImplementationPlan/05_Benchmark_Testing_Guide.md`
+> **Companion to:** `04_Benchmark_Implementation_and_Verification_Plan.md` (the "plan").
 > **Status:** All work packages (WP-00 through WP-30) are fully implemented, tested, and verified with 234 passing automated tests and zero regressions.
 > **How to read "expected results":**
 > - **Must** = a hard pass/fail rule. If it fails, something is broken.
 > - **Reference** = a value measured earlier (with its source), for orientation only. It is not a target.
-> - **Claim gate** = the condition in plan §8 and `reports/claims/CLAIMS.md` for validating a resume number.
+> - **Claim gate** = the condition in plan §8 and `reports/claims/CLAIMS.md` for validating a benchmark specification.
 >
 > This guide provides the operational procedures for reproducing, executing, and auditing every benchmark suite and claim across local and cloud environments.
 
@@ -121,7 +121,7 @@ python -m benchmarks.run status reports/benchmark_runs/<run>
 - Profiles:
   - **smoke**: minutes, wiring check only;
   - **standard**: about 1 hour or less per suite on a laptop, 3 seeds;
-  - **full**: hours, the resume-scale numbers.
+  - **full**: hours, production-scale empirical benchmark numbers.
 
 **Always run smoke first.** Only spend time on standard or full after smoke passes.
 
@@ -471,13 +471,13 @@ Report split-mode numbers separately from same-machine numbers.
 
 Start `python inference.py --config <cfg> --watch-checkpoints "<Google Drive folder>/checkpoints"` on the laptop.
 
-**Must:** only checkpoints with a `COMMITTED` marker and a matching SHA-256 are applied. **Never quote its latency on a resume.**
+**Must:** only checkpoints with a `COMMITTED` marker and a matching SHA-256 are applied. **Never quote its latency as an authoritative benchmark metric.**
 
 ---
 
 ## 6. Recording results
 
-- After each completed suite run, run `python -m benchmarks.claims build --runs reports/benchmark_runs/*` *(after WP-29)*. It rewrites `reports/claims/CLAIMS.md` with PASS / FAIL / NOT RUN per claim and the suggested bullet text.
+- After each completed suite run, run `python -m benchmarks.claims build --runs reports/benchmark_runs/*` *(after WP-29)*. It rewrites `reports/claims/CLAIMS.md` with PASS / FAIL / NOT RUN per claim and the verified benchmark summary.
 - Copy numbers into docs only from `CLAIMS.md` or the cited `summary.json` (plan rule R8).
 - Update `docs/Infinitune_Project_Context.md` as described in plan WP-30.
 
