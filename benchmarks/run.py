@@ -1465,6 +1465,12 @@ def suite_e2e_facts(run, args):
     run.stage("e2e_facts/execute", lambda: run_e2e_facts_suite(run, args))
 
 
+def suite_streaming_quality(run, args):
+    """Streaming continual learning quality and convergence parity run."""
+    from benchmarks.streaming_quality import run_streaming_quality_suite
+    run.stage("streaming_quality/execute", lambda: run_streaming_quality_suite(run, args))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1879,6 +1885,7 @@ def main():
         "rescore": lambda: suite_rescore(run, args),
         "ablation": lambda: suite_ablation(run, args),
         "e2e_facts": lambda: suite_e2e_facts(run, args),
+        "streaming_quality": lambda: suite_streaming_quality(run, args),
     }
     for suite in suites:
         try:
