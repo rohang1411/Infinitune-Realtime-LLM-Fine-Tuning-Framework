@@ -3,7 +3,7 @@ InfiniTune — Master Evidence Ledger Generator (WP-29)
 
 Compiles verified benchmark artifacts, JSON manifests, and empirical run outputs
 into a single authoritative ledger (reports/claims/CLAIMS.md) that maps every
-resume claim (SDE-1..6, DS-1..6) to cryptographic digests, commit SHAs, and test assertions.
+performance specification (SDE-1..6, DS-1..6) to cryptographic digests, commit SHAs, and test assertions.
 """
 
 import argparse
@@ -347,14 +347,14 @@ def build_evidence_ledger(run_dirs: Optional[List[Path]] = None) -> List[Dict[st
 def generate_claims_markdown(ledger_entries: List[Dict[str, Any]]) -> str:
     """Render ledger entries into formatted GitHub Flavored Markdown."""
     lines = [
-        "# InfiniTune — Master Evidence & Resume Claims Ledger",
+        "# InfiniTune — Master Benchmark Verification & Evaluation Ledger",
         "",
-        "> **Authority:** This document is the definitive, ground-truth record connecting every resume bullet",
-        "> and technical claim (SDE-1..6, DS-1..6) to empirical benchmark artifacts, commit SHAs, and test suites.",
+        "> **Authority:** This document is the definitive, ground-truth record connecting every performance target",
+        "> and benchmark specification (SDE-1..6, DS-1..6) to empirical artifacts, commit SHAs, and test suites.",
         "",
         "## 1. Executive Summary Table",
         "",
-        "| Claim ID | Metric Title | Target Threshold | Measured Value | Verification Status |",
+        "| Metric ID | Specification Title | Target Threshold | Measured Value | Verification Status |",
         "|---|---|---|---|---|",
     ]
 
@@ -367,17 +367,17 @@ def generate_claims_markdown(ledger_entries: List[Dict[str, Any]]) -> str:
         "",
         "---",
         "",
-        "## 2. Detailed Claim Audit & Resume Text Alignment",
+        "## 2. Detailed Benchmark Audit & Metric Alignment",
         "",
     ])
 
     for e in ledger_entries:
-        lines.append(f"### Claim {e['claim_id']}: {e['title']}")
+        lines.append(f"### Specification {e['claim_id']}: {e['title']}")
         lines.append(f"- **Verification Status:** `{e['status']}`")
         lines.append(f"- **Target Threshold:** `{e['threshold']}`")
         lines.append(f"- **Empirical Value:** `{e['measured_value']}`")
         lines.append(f"- **Artifact Source:** `{e['artifact_path'] or 'N/A'}`")
-        lines.append(f"- **Suggested Resume Bullet:**")
+        lines.append(f"- **Verified Benchmark Summary:**")
         lines.append(f"  > \"{e['suggested_bullet']}\"")
         lines.append("")
 

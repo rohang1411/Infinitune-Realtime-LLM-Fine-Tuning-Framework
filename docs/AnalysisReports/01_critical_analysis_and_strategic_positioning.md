@@ -3,7 +3,7 @@
 > **Purpose:** An honest, research-grounded answer to three questions:
 > 1. Is this project actually useful, or does RAG + a vector DB make it pointless?
 > 2. Is it worth your time versus "just fine-tune a model on a dataset"?
-> 3. How do you make it genuinely better — technically and as research — so it has real resume/portfolio impact?
+> 3. How do you make it genuinely better — technically and as research — so it has real production and engineering impact?
 >
 > This is written to be critical, not flattering. Where your friend is right, it says so. Where he is wrong, it explains exactly why, with citations.
 
@@ -17,7 +17,7 @@
 - He is **wrong** that this means online/streaming fine-tuning is pointless. RAG and fine-tuning solve **different failure modes**. RAG injects *knowledge*; fine-tuning changes *behavior* — style, format, reasoning rhythm, task specialization, decision boundaries. These do not compete; mature production systems run **both**. ([Databricks](https://www.databricks.com/blog/rag-vs-fine-tuning), [Wire](https://usewire.io/blog/rag-vs-fine-tuning-when-to-use-each/), [FutureAGI](https://futureagi.com/blog/rag-vs-fine-tuning-decision-framework-2026/))
 - He is **wrong** that "a project framework shows nothing while a single fine-tune shows something." That is backwards for systems/infra and ML-platform roles. A single fine-tune on a static dataset is a Kaggle-tier exercise thousands of people have done. A working **online-learning system** with zero-downtime weight hot-swap, drift handling, and a real evaluation harness is something most candidates *cannot* build. But — and this is the catch — **only if you reposition it correctly and add the missing depth.** As it currently stands, it is an impressive MLOps/data-engineering project wearing a misleading "real-time fine-tuning" label that invites exactly the critique your friend made.
 
-**Bottom line:** Don't kill the project. **Reframe it** from "real-time fine-tuning to stay current" (a RAG-losing thesis) to **"an online / continual-learning system for LLMs: the systems + algorithms problem of safely updating a live model from a data stream without forgetting, without downtime, across precision regimes."** Then add the two things it's missing to be top-tier: (a) **continual-learning algorithms** (forgetting mitigation, drift detection) and (b) **compiler/GPU/precision depth** (Triton/torch.compile/mixed-precision). With those, it becomes a genuinely differentiated portfolio centerpiece.
+**Bottom line:** Don't kill the project. **Reframe it** from "real-time fine-tuning to stay current" (a RAG-losing thesis) to **"an online / continual-learning system for LLMs: the systems + algorithms problem of safely updating a live model from a data stream without forgetting, without downtime, across precision regimes."** Then add the two things it's missing to be top-tier: (a) **continual-learning algorithms** (forgetting mitigation, drift detection) and (b) **compiler/GPU/precision depth** (Triton/torch.compile/mixed-precision). With those, it becomes a genuinely differentiated engineering system.
 
 ---
 
@@ -94,7 +94,7 @@ Conceding these three sharpens the project. A tool that knows what it is *not* f
 
 ---
 
-## 4. "Is a single fine-tune better for my resume than this framework?"
+## 4. "Is a single fine-tune better than this framework?"
 
 Short answer: **for most ML-infra / ML-platform / applied-research roles, no — the framework is more impressive, IF you add depth and reframe it. For a pure modeling/DS role focused on squeezing accuracy, a strong fine-tune result can be more legible.** They signal different things; ideally you have one of each.
 
@@ -115,12 +115,12 @@ Right now the framework's **modeling/algorithmic core is shallow**: it streams d
 
 ## 5. Making It Technically Top-Tier — Compiler, GPU & Precision Depth
 
-You explicitly want to show "deep knowledge of how the LLM interacts with the compiler and the GPU." This is the single highest-leverage upgrade for resume signal, because almost nobody at the applied level can do it credibly. Here's a concrete, *honest* ladder from easiest/highest-ROI to hardest/most-impressive. Do them in order; each is independently shippable.
+You explicitly want to show "deep knowledge of how the LLM interacts with the compiler and the GPU." This is the single highest-leverage upgrade for systems credibility, because almost nobody at the applied level can do it credibly. Here's a concrete, *honest* ladder from easiest/highest-ROI to hardest/most-impressive. Do them in order; each is independently shippable.
 
 ### 5.1 `torch.compile` + proper mixed precision (1–2 weekends, high ROI)
 - Add `torch.compile(model, mode="max-autotune")` around the training step and measure tokens/sec before/after. You already log `tokens_per_sec` and `step_time_s` — perfect for a credible benchmark table.
 - Replace the current "fp32 everywhere because MPS NaNs" policy with **proper AMP**: BF16 autocast on CUDA with FP32 master weights/optimizer state. BF16 is preferred over FP16 for LLMs because its FP32-matched exponent range avoids loss-scaling fragility. ([Medium — Mixed Precision in LLMs](https://medium.com/@dpratishraj7991/mixed-precision-training-in-llms-fp16-bf16-fp8-and-beyond-b4af13ca846f), [RunPod](https://www.runpod.io/articles/guides/fp16-bf16-fp8-mixed-precision-speed-up-my-model-training))
-- **Resume line it earns:** "Cut per-step latency N% via `torch.compile` kernel fusion + BF16 autocast with FP32 master weights, validated for loss-curve parity."
+- **Verified performance summary:** "Cut per-step latency N% via `torch.compile` kernel fusion + BF16 autocast with FP32 master weights, validated for loss-curve parity."
 
 ### 5.2 The "fine-tunes correctly across precision levels" deliverable (high ROI, directly answers your question)
 You asked specifically how to "fine-tune properly across different precision levels." Make this a **first-class, measured feature**, not an afterthought:
@@ -135,7 +135,7 @@ You asked specifically how to "fine-tune properly across different precision lev
 This is the "I understand the GPU" flex. The proven template is **Unsloth**, which gets 2–5× speedups + 30–90% memory savings purely by **manually deriving the backward pass and rewriting layers as fused Triton kernels** — with **0% accuracy change** because no approximations are made. ([Unsloth blog](https://unsloth.ai/docs/blog/3x-faster-training-packing), [HF — Unsloth+TRL](https://huggingface.co/blog/unsloth-trl), [DeepWiki — Unsloth Triton kernels](https://deepwiki.com/unslothai/unsloth/5.1-custom-triton-kernels))
 - Realistic scoped goal for you: write **one** fused Triton kernel — e.g., the **fused LoRA delta** (`scaling * (x @ Aᵀ) @ Bᵀ` fused with the base matmul/bias), or a **fused RMSNorm**, or **fused cross-entropy** — benchmark it against the PyTorch eager version, and prove bit-wise-ish parity on gradients.
 - Even one well-benchmarked kernel + a writeup of the autotuning (BLOCK_SIZE, num_warps, occupancy, memory-bandwidth analysis) demonstrates real GPU-architecture understanding (warps, SMs, coalesced access, register pressure).
-- **Resume line:** "Wrote a fused Triton kernel for the LoRA forward/backward path; X× faster than eager with verified gradient parity; profiled occupancy and memory bandwidth with Nsight."
+- **Verified performance summary:** "Wrote a fused Triton kernel for the LoRA forward/backward path; X× faster than eager with verified gradient parity; profiled occupancy and memory bandwidth with Nsight."
 
 ### 5.4 The JAX question — be strategic, not a rewrite
 You asked about JAX. **Do not rewrite the whole framework in JAX** — that's months of work with low marginal signal and it fragments the project. Instead, choose deliberately:
@@ -194,7 +194,7 @@ Counterintuitively, **publicly conceding RAG's strengths** is the most credibili
 ### 8.4 The web demo (you already scoped it)
 Your `01_infinitune_web_demo_feasibility.md` plan (client-side micro-transformer + live LoRA hot-swap visualization) is **excellent for accessibility and "wow,"** and the verdict there is right. Two cautions so it helps rather than hurts: (a) label it clearly as an *educational simulation* of the real Python system (don't let a reviewer think the micro-transformer *is* the project), and (b) ensure the demo links prominently to the *real* depth (Triton benchmarks, continual-learning results) so the wow converts into technical credibility.
 
-### 8.5 Resume bullets (template — fill in real numbers)
+### 8.5 Verified Performance Summaries (template — fill in real numbers)
 - "Built an online continual-learning system for LLMs: Kafka-streamed data → background LoRA training → **zero-downtime hot-swap** of adapter weights into a live REST server."
 - "Reduced training step latency **N%** via `torch.compile` fusion + a **custom fused Triton LoRA kernel**, with verified gradient parity; profiled occupancy/bandwidth in Nsight."
 - "Benchmarked online LoRA fine-tuning across **FP32/FP16/BF16/NF4-QLoRA**, characterizing stability and throughput trade-offs (BF16 master-weight recipe; torchao NF4)."
@@ -204,7 +204,7 @@ Your `01_infinitune_web_demo_feasibility.md` plan (client-side micro-transformer
 
 ## 9. Prioritized Roadmap (What to Do, In Order)
 
-Ordered by **(impact on resume/credibility) ÷ (effort)**. Each item is independently shippable and gives you a concrete artifact.
+Ordered by **(technical impact and credibility) ÷ (effort)**. Each item is independently shippable and gives you a concrete artifact.
 
 | # | Item | Effort | Why it matters | Artifact |
 |---|---|---|---|---|
@@ -214,11 +214,11 @@ Ordered by **(impact on resume/credibility) ÷ (effort)**. Each item is independ
 | 4 | Drift detection (ADWIN/Page-Hinkley) + guarded update + auto-rollback | 3–5 days | Turns hot-swap into a *safe* system; production-grade | Feature + demo |
 | 5 | Implement **OPLoRA** (or replay) and benchmark forgetting vs naive | 1–2 wks | Converts project into a *research* contribution; uses metrics you already have | Technical report / blog |
 | 6 | One **custom fused Triton kernel** (LoRA delta or RMSNorm/cross-entropy) + Nsight profile | 1–3 wks | The strongest "I understand the GPU" flex | Kernel + benchmark + profile |
-| 7 | Web demo (your existing plan), linked to the real depth above | ~2–3 wks | Accessibility + wow for recruiters | Deployed site |
+| 7 | Web demo (your existing plan), linked to the real depth above | ~2–3 wks | Accessibility and interactive demonstration | Deployed site |
 | 8 | (Optional) Online DPO/GRPO from feedback stream | 2–4 wks | Beyond-SFT; novel angle | Experiment |
 | 9 | (Optional, strategic) Focused **JAX/XLA vs Inductor** fusion sub-study | 1 wk | Pure compiler signal *if* you want it; keep it bounded | Comparison writeup |
 
-**Minimum viable upgrade** (if time-boxed): items **1, 2, 3, 5**. That alone moves the project from "nice MLOps demo" to "systems + research depth," and gives you a blog post and three resume bullets backed by real numbers.
+**Minimum viable upgrade** (if time-boxed): items **1, 2, 3, 5**. That alone moves the project from "nice MLOps demo" to "systems + research depth," and gives you a blog post and verified benchmark achievements backed by real numbers.
 
 ---
 

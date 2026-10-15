@@ -4,7 +4,7 @@ This directory contains detailed per-config testing guides for every InfiniTune 
 
 For a version-oriented summary of the current major release, see the [Infinitune v2 Release Notes](releases/infinitune-v2.md).
 
-For measured benchmark claims, selectable suites, the local web dashboard, raw evidence, and resume steps, use [Project Context §13](Infinitune_Project_Context.md#13-reproducible-evaluation-evidence-ledger-and-external-audit). Config guides may contain historical expectations; Section 13 records what was actually measured.
+For measured benchmark claims, selectable suites, the local web dashboard, raw evidence, and execution resumption steps, use [Project Context §13](Infinitune_Project_Context.md#13-reproducible-evaluation-evidence-ledger-and-external-audit). Config guides may contain historical expectations; Section 13 records what was actually measured.
 
 ---
 

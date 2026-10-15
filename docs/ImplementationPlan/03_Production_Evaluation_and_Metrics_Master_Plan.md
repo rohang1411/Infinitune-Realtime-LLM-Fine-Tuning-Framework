@@ -1,5 +1,5 @@
 # InfiniTune — Production-Grade Evaluation & Systems Master Plan
-## The Authoritative Blueprint for Big Tech SDE & Frontier AI Lab Resume Dominance
+## The Authoritative Blueprint for Production SDE & Frontier AI Lab Systems and Empirical Rigor
 
 > **Target Roles:**  
 > 1. **Senior Software Engineer / ML Systems & Infrastructure** (Google Core ML, Meta Infra, ByteDance, OpenAI/Anthropic Systems)  
@@ -39,7 +39,7 @@
 8. [Concrete Code Implementation Plan (Zero-Breakage Contract)](#8-concrete-code-implementation-plan-zero-breakage-contract)
 9. [12-Day High-Impact Execution Roadmap](#9-12-day-high-impact-execution-roadmap)
 10. [Honest Team Attribution & Ownership Guide](#10-honest-team-attribution--ownership-guide)
-11. [Battle-Tested Resume Bullets (SDE vs Data Science)](#11-battle-tested-resume-bullets-sde-vs-data-science)
+11. [Systems vs Modeling Performance Specifications](#11-systems-vs-modeling-performance-specifications)
 
 ---
 
@@ -54,7 +54,7 @@ By synthesizing the surgical insights from Claude's code audit with our producti
 2. **True Catastrophic Forgetting & Plasticity Benchmarks:** A 3-phase domain-shift stream (IMDb $\to$ Yelp $\to$ FiQA) with reservoir replay buffer curves (1%, 5%, 10%) and official E2E generation metrics (BLEU, ROUGE-L, slot error rate).
 3. **Hardened ML Systems Infrastructure:** Eliminating torn updates via atomic signed manifests, replacing global generation locks with a lock-free double-buffered pointer router, closing pickle deserialization vulnerabilities with `safetensors`, and benchmarking p50/p95/p99 serving latencies under concurrent QPS load.
 4. **Hardware Acceleration:** Native CUDA BF16 AMP, `torch.compile` kernel fusion, and PyTorch Profiler traces.
-5. **Distinct Resume Narratives:** Segregating systems metrics (p99 latency, tokens/sec, swap time, soak memory slope) from modeling metrics (BWT, FWT, retention rate, BLEU).
+5. **Distinct Performance Narratives:** Segregating systems metrics (p99 latency, tokens/sec, swap time, soak memory slope) from modeling metrics (BWT, FWT, retention rate, BLEU).
 
 ---
 
@@ -365,7 +365,7 @@ All changes strictly follow the **Zero-Breakage Guarantee**: existing configs ru
 
 ## 9. 12-Day High-Impact Execution Roadmap
 
-Prioritized by impact-per-hour for immediate resume dominance:
+Prioritized by impact-per-hour for high-impact production engineering:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -407,8 +407,8 @@ Prioritized by impact-per-hour for immediate resume dominance:
 │ Day 11 │ Chaos Engineering & Model Scaling   │ • Run kill -9 chaos tests on trainer and broker; log MTTR.      │
 │        │                                     │ • Log adapter swap latency across 82M, 345M, and 1.5B models.   │
 ├────────┼─────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
-│ Day 12 │ Final Reports & Resume Formatting   │ • Generate final SVG/HTML dashboards and technical report.      │
-│        │                                     │ • Insert measured empirical numbers into dual resume bullets.   │
+│ Day 12 │ Final Reports & Evaluation Summary │ • Generate final SVG/HTML dashboards and technical report.      │
+│        │                                     │ • Insert measured empirical numbers into performance summaries. │
 └────────┴─────────────────────────────────────┴─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -416,7 +416,7 @@ Prioritized by impact-per-hour for immediate resume dominance:
 
 ## 10. Honest Team Attribution & Ownership Guide
 
-This framework originated as a 6-person project. When cross-questioned in interviews, **crystal-clear attribution of what you personally owned versus teammates establishes supreme credibility**:
+This framework originated as a 6-person project. In technical reviews and collaboration, **crystal-clear attribution of what you personally owned versus teammates establishes supreme credibility**:
 
 ### What Rohan Sharma Personally Owned & Built:
 1. **The Streaming LoRA Training Loop:** Led implementation of continuous batch assembly, dynamic label masking (ignoring prompt tokens in cross-entropy loss), AdamW optimization with gradient accumulation, and learning rate scheduling.
@@ -433,11 +433,11 @@ This framework originated as a 6-person project. When cross-questioned in interv
 
 ---
 
-## 11. Battle-Tested Resume Bullets (SDE vs Data Science)
+## 11. Systems vs Modeling Performance Specifications
 
 Fill the bracketed variables with your verified benchmark numbers:
 
-### SDE / ML Infrastructure / Systems Resume
+### SDE / ML Infrastructure / Systems Performance Specification
 
 > **Distributed ML Systems Engineer — InfiniTune Framework**
 > * **Zero-Downtime Serving:** *Architected an atomic double-buffered LoRA hot-swap engine in PyTorch/Python, reducing weight-swap pause time from `[180ms]` to **`[< 2.4ms]`** and achieving **`0.00%`** dropped requests across `[500+]` live swaps under `[50]` concurrent QPS with p99 TTFT **`[< 85ms]`**.*
@@ -447,7 +447,7 @@ Fill the bracketed variables with your verified benchmark numbers:
 
 ---
 
-### Data Science / AI Research / Applied Modeling Resume
+### Data Science / AI Research / Applied Modeling Performance Specification
 
 > **Continual Learning & Applied AI Researcher — InfiniTune Framework**
 > * **Streaming Adaptation & Benchmark Rigor:** *Fine-tuned `distilgpt2` and `Qwen-2.5-1.5B` on single-pass streaming text to **`82.65%`** accuracy and **`0.825`** binary Macro F1 ($n=4,000$, 95% CI $\pm 1.18\%$), performing within **`[1.2%]`** of an offline single-epoch LoRA baseline across 3 random seeds.*

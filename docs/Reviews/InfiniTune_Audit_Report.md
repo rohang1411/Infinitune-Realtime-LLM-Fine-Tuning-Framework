@@ -26,13 +26,13 @@ But in the current state the document would hurt you in an interview, for three 
 2. Several measurement methods do not measure what their label says (swap pause, TTFT, "prequential" AAUC, freshness, FWT).
 3. Several claimed measurements have no harness, no implementation description, or no raw artifact (24 h soak, ECE, BLEU/SER, ADWIN, canary gate, 500+ swaps).
 
-Fixing this is days, not weeks. The fixed version is a much stronger resume project than the current one, because the story becomes: "I found my own system's flaws, fixed them, and proved each fix with a controlled before/after measurement."
+Fixing this is days, not weeks. The fixed version is a much stronger engineering project than the current one, because the story becomes: "I found my own system's flaws, fixed them, and proved each fix with a controlled before/after measurement."
 
 ---
 
 ## 2. Findings
 
-Severity: S0 = can end an interview if unverified. S1 = methodology flaw a senior reviewer will probe. S2 = documentation hygiene.
+Severity: S0 = critical flaw if unverified. S1 = methodology flaw a reviewer will probe. S2 = documentation hygiene.
 
 ### S0 findings
 
@@ -153,7 +153,7 @@ Offline baselines (zero-shot with a proper prompt or label-logprob scoring, few-
 
 ---
 
-## 4. Claims ledger for the resume
+## 4. Systems & Modeling Verification Ledger
 
 | Claim | Status | Condition |
 |---|---|---|
@@ -268,7 +268,7 @@ Total: about 11-14 working days. Highest value per day: WO-1, WO-2, WO-7, WO-8, 
 
 ---
 
-## 7. Resume bullet skeletons (fill only from verified artifacts)
+## 7. Verified Performance Bullet Skeletons (fill only from verified artifacts)
 
 Systems
 - Built a three-service streaming LoRA fine-tuning pipeline (producer, trainer, inference) on Kafka with step-versioned, HMAC-authenticated adapter snapshots; [X] torn updates across [N] swaps (vs [Y] with the original per-layer protocol).

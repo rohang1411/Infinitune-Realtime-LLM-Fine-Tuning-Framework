@@ -1855,7 +1855,7 @@ Items 1–5 transform the project from "nice MLOps demo" to "systems + research 
 | 12 | Streaming Continual LLM benchmark package | 1 week | Phase 6 | Reproducible benchmark |
 | 13 | vLLM integration for production inference | 1 week | Phase 4 | Optional backend |
 
-### Resume Bullets (Template — Fill in Real Numbers After Implementation)
+### Verified Performance Specifications (Template — Fill in Real Numbers After Implementation)
 
 > - "Built an online continual-learning system for LLMs: Kafka-streamed data → background LoRA training → **zero-downtime hot-swap** of adapter weights into a live REST server."
 > - "Reduced training step latency **N%** via `torch.compile` kernel fusion + BF16 autocast with FP32 master weights, validated for loss-curve parity."

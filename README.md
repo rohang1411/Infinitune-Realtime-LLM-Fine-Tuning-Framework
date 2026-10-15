@@ -67,7 +67,7 @@ bash run_evaluation.sh list
 bash run_evaluation.sh run --suites integrity classification serving --profile smoke
 ```
 
-Kafka-dependent `freshness` and `pipeline` suites require a running broker. Saved adapter comparisons require a local checkpoint or `--checkpoint`; clean clones do not contain the ignored historical checkpoints. Use the [runbook](docs/Infinitune_Project_Context.md#132-evaluation-dashboard-and-command-line-runner) for data provenance, resume commands, limitations, and measured local runtime evidence. No Mac, standard-profile, or full-profile runtime has been measured here.
+Kafka-dependent `freshness` and `pipeline` suites require a running broker. Saved adapter comparisons require a local checkpoint or `--checkpoint`; clean clones do not contain the ignored historical checkpoints. Use the [runbook](docs/Infinitune_Project_Context.md#132-evaluation-dashboard-and-command-line-runner) for data provenance, run resumption commands, limitations, and measured local runtime evidence. No Mac, standard-profile, or full-profile runtime has been measured here.
 
 ---
 

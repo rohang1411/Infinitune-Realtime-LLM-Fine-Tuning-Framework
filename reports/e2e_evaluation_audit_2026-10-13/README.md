@@ -1,4 +1,4 @@
-# E2E resume metric audit — 2026-10-13
+# E2E metric audit — 2026-10-13
 
 These are real recalculations from retained generated text, not new model runs.
 `recalculated_scores.json` records the input SHA-256, package version, original
@@ -20,12 +20,12 @@ original manifest, and the prediction SHA-256 matches its saved checksum.
 | ROUGE-2 (two-word phrase overlap) | 57.96% | 54.50% | 56.12% |
 | ROUGE-L (ordered word overlap) | 67.83% | 65.75% | 66.64% |
 
-These are **four-example smoke diagnostics**, not resume-ready quality claims.
+These are **four-example smoke diagnostics**, not production-scale quality claims.
 ROUGE recall is reference-text recall, not recall of input facts. None of these
 scores is classification accuracy, factual precision, or a contradiction rate.
 Do not choose the largest score and rename it generic F1.
 
-## Audit of the proposed resume claim
+## Audit of the proposed benchmark claim
 
 Historical input: `output/e2e/outputs/run5/metrics_clean.csv`.
 
@@ -54,13 +54,13 @@ Historical input: `output/e2e/outputs/run5/metrics_clean.csv`.
 ## Recommended metric and wording
 
 Use **required-detail recall**: correctly expressed supplied facts / supplied
-facts. A recruiter-readable explanation is “percentage of requested restaurant
+facts. A clear, plain-language explanation is “percentage of requested restaurant
 details correctly included.” Pair it with factual precision (supported generated
 facts / all generated facts) or factual F1 so added unsupported facts are penalized.
 An even simpler score is **fully correct description rate**: all requested facts
 are correctly expressed, with no added unsupported facts or contradictions.
 
-Before using those scores on a resume, evaluate the base and adapted model on
+Before using those scores in project reports, evaluate the base and adapted model on
 the same fixed held-out MRs with identical decoding, retain predictions and
 expected/generated fact labels, verify synonyms/negations against human-reviewed
 examples, and report denominators and uncertainty. The runner's full E2E profile
@@ -83,7 +83,7 @@ Measured-result template, **only after the required evaluation**:
 From the repository root:
 
 ```powershell
-.\.venv-eval\Scripts\python.exe reports/e2e_resume_audit_2026-10-13/recalculate.py
+.\.venv-eval\Scripts\python.exe reports/e2e_evaluation_audit_2026-10-13/recalculate.py
 ```
 
 No model download or new generation is required. The script writes only this

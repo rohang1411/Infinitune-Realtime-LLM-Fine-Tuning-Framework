@@ -3,7 +3,7 @@ benchmarks/fault_injection.py
 ─────────────────────────────────────────────────────────────────────────────
 Comprehensive Fault Injection Suite for InfiniTune Protocol v2.
 
-Implements Fault Catalogue F01 through F16 from the resume verification plan:
+Implements Fault Catalogue F01 through F16 from the verification plan:
   F01: Truncated tensor frame (50% bytes)
   F02: Bit-flipped tensor frame
   F03: Incomplete snapshot (missing tensor frame before commit)

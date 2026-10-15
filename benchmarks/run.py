@@ -1009,7 +1009,7 @@ def suite_propagation(run, args):
       - t_flushed: producer.flush() returned.
       - t_assembled: the inference consumer validated the commit.
       - t_applied: swap_weights released the write lock.
-      - propagation_s = t_applied - t_publish_start. (Resume claim number).
+      - propagation_s = t_applied - t_publish_start. (Total propagation latency).
       Reports publish_s, transport_assemble_s, apply_s, summing to propagation_s.
     """
     def preflight():

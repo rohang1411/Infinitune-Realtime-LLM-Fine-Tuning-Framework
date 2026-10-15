@@ -71,7 +71,7 @@ def main():
         "tokenization": "rouge-score default normalization, Porter stemming enabled",
         "scores": summary, "per_example": results,
         "existing_sacrebleu": prior["bleu"],
-        "limits": ["Four-example smoke diagnostic; not resume-ready quality evidence",
+        "limits": ["Four-example smoke diagnostic; not production-scale quality evidence",
                    "ROUGE precision/recall/F1 measure reference-text overlap, not factual correctness",
                    "Mean F1 is the mean of per-example F1, not F1 reconstructed from averaged P/R",
                    "No base-vs-adapter E2E generations are retained for a matched quality-improvement claim"],
