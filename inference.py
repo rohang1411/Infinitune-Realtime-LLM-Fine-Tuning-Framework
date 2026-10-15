@@ -163,7 +163,7 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                     if complete is not None:
                         step_id, batch = complete
                         received_count += 1
-                        update_queue.put((step_id, batch))
+                        update_queue.put((step_id, batch, getattr(assembler, "active", None)))
                         _log(f"Committed complete adapter step {step_id}: tensors={len(batch)}")
                 if done:
                     break
@@ -203,7 +203,15 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log("Weight application thread received done signal. Stopping.")
                 break
 
-            step_or_layer, tensor_or_dict = item
+            active_run_id = None
+            active_seq = None
+            if len(item) == 3:
+                step_or_layer, tensor_or_dict, active_meta = item
+                if active_meta:
+                    active_run_id, active_seq = active_meta[0], active_meta[1]
+            else:
+                step_or_layer, tensor_or_dict = item
+
             if isinstance(tensor_or_dict, dict):
                 # Complete atomic snapshot delivered via commit marker (prevents torn updates)
                 updates_to_apply = tensor_or_dict
@@ -214,10 +222,16 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        n_step, n_val = next_item
+                        if len(next_item) == 3:
+                            n_step, n_val, n_meta = next_item
+                        else:
+                            n_step, n_val = next_item
+                            n_meta = None
                         if isinstance(n_val, dict):
                             updates_to_apply = n_val
                             version_tag = f"step_{n_step}"
+                            if n_meta:
+                                active_run_id, active_seq = n_meta[0], n_meta[1]
                         else:
                             updates_to_apply[n_step] = n_val
                     except queue.Empty:
@@ -232,7 +246,10 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                         if next_item == _DONE_SENTINEL:
                             item = next_item
                             break
-                        name, t = next_item
+                        if len(next_item) == 3:
+                            name, t, _ = next_item
+                        else:
+                            name, t = next_item
                         if isinstance(t, dict):
                             updates_to_apply = t
                             version_tag = f"step_{name}"
@@ -245,7 +262,12 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
                 global active_version_global
                 if serving_mode_global == "router" and router_global is not None:
-                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=version_tag)
+                    swap_ms = router_global.swap_weights(
+                        updates_to_apply,
+                        version_tag=version_tag,
+                        run_id=active_run_id,
+                        seq=active_seq,
+                    )
                     active_version_global = version_tag
                     applied_batches += 1
                     _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
@@ -387,6 +409,34 @@ def get_metrics():
         return jsonify({**router_global.get_metrics(), "stream": stream_state_global}), 200
     return jsonify({"status": "router_not_initialized", "stream": stream_state_global}), 200
 
+@app.route('/adapter', methods=['GET'])
+def get_adapter():
+    """Returns cryptographic state digest of the active adapter and verification status."""
+    if router_global is not None:
+        live_digest = router_global.adapter_state_digest()
+        expected = router_global.expected_state_sha256
+        match = bool(live_digest and expected and live_digest == expected)
+        return jsonify({
+            "active_version": router_global.active_version,
+            "run_id": router_global.active_run_id,
+            "seq": router_global.active_seq,
+            "adapter_state_sha256": live_digest,
+            "expected_state_sha256": expected,
+            "match": match,
+        }), 200
+
+    run_id = initial_active_global[0] if initial_active_global else None
+    seq = initial_active_global[1] if initial_active_global else None
+    return jsonify({
+        "active_version": active_version_global,
+        "run_id": run_id,
+        "seq": seq,
+        "adapter_state_sha256": None,
+        "expected_state_sha256": None,
+        "match": False,
+    }), 200
+
+
 # --------------------------------------------------
 # Main Execution Block
 # --------------------------------------------------
@@ -527,21 +577,39 @@ if __name__ == "__main__":
     router_global = DoubleBufferedAdapterRouter(model, tokenizer, device=device_global)
     if resolved_checkpoint_path:
         router_global.active_version = os.path.basename(resolved_checkpoint_path)
+        c_run = os.path.basename(os.path.dirname(resolved_checkpoint_path))
+        c_seq = None
+        base_name = os.path.basename(resolved_checkpoint_path)
+        if base_name.startswith("step_"):
+            try:
+                c_seq = int(base_name.split("_", 1)[1])
+            except ValueError:
+                c_seq = None
+        c_created = None
         meta_file = os.path.join(resolved_checkpoint_path, "checkpoint_meta.json")
         if os.path.exists(meta_file):
             try:
                 with open(meta_file, encoding="utf-8") as f:
                     c_meta = json.load(f)
-                c_run = c_meta.get("run_id") or os.path.basename(os.path.dirname(resolved_checkpoint_path))
-                c_seq = c_meta.get("seq")
-                if c_seq is None:
+                if c_meta.get("run_id"):
+                    c_run = c_meta.get("run_id")
+                if c_meta.get("seq") is not None:
+                    c_seq = c_meta.get("seq")
+                elif c_meta.get("step") is not None:
                     c_seq = c_meta.get("step")
-                c_created = c_meta.get("created_at") or os.path.getmtime(meta_file)
-                if c_run and c_seq is not None:
-                    initial_active_global = (str(c_run), c_seq, float(c_created))
-                    _log(f"Initialized active version from cold start: {initial_active_global}")
+                c_created = c_meta.get("created_at")
             except Exception as e:
                 _log(f"Cold-start active metadata read skipped: {e}")
+        if c_run and c_seq is not None:
+            c_created = c_created or time.time()
+            initial_active_global = (str(c_run), int(c_seq), float(c_created))
+            router_global.active_run_id = str(c_run)
+            router_global.active_seq = int(c_seq)
+            _log(f"Initialized active version from cold start: {initial_active_global}")
+        try:
+            router_global.expected_state_sha256 = router_global.adapter_state_digest()
+        except Exception as e:
+            _log(f"Cold-start adapter digest computation skipped: {e}")
     _log("Adapter router initialized with single-model read/write locking.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.

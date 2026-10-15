@@ -14,6 +14,7 @@ Key Production Architectural Improvements:
    guarantees zero dropped requests during active updates.
 """
 
+import hashlib
 import math
 import time
 import threading
@@ -36,6 +37,20 @@ def nearest_rank_percentile(sorted_values: Sequence[float], q: float) -> float:
         return 0.0
     rank = max(1, min(n, math.ceil(q * n)))
     return float(sorted_values[rank - 1])
+
+
+def compute_adapter_state_digest(state_dict: Dict[str, torch.Tensor]) -> str:
+    """Compute deterministic SHA-256 digest over sorted adapter keys and raw tensor bytes."""
+    hasher = hashlib.sha256()
+    for key in sorted(state_dict.keys()):
+        hasher.update(key.encode("utf-8"))
+        tensor = state_dict[key]
+        if hasattr(tensor, "detach"):
+            t_bytes = tensor.detach().cpu().contiguous().numpy().tobytes()
+        else:
+            t_bytes = bytes(tensor)
+        hasher.update(t_bytes)
+    return hasher.hexdigest()
 
 
 
@@ -106,6 +121,10 @@ class DoubleBufferedAdapterRouter:
         self.dropped_requests = 0
         self.requests_served = 0
         self.in_flight_requests = 0
+        self.active_run_id: Optional[str] = None
+        self.active_seq: Optional[Any] = None
+        self.expected_state_sha256: Optional[str] = None
+        self._cached_adapter_digest: Optional[str] = None
 
         # Latency tracking for p50/p95/p99
         self._latency_history_lock = threading.Lock()
@@ -116,6 +135,27 @@ class DoubleBufferedAdapterRouter:
         self._swap_prepare_history: deque = deque(maxlen=1000)
         self._swap_lock_wait_history: deque = deque(maxlen=1000)
         self._swap_lock_held_history: deque = deque(maxlen=1000)
+
+    def adapter_state_digest(self) -> str:
+        """Return SHA-256 digest of live model adapter state under read lock.
+        Result is cached by active_version and cleared on every swap.
+        """
+        if self._cached_adapter_digest is not None:
+            return self._cached_adapter_digest
+        self.rw_lock.acquire_read()
+        try:
+            if isinstance(self.model, PeftModel):
+                from peft import get_peft_model_state_dict
+                live_state = get_peft_model_state_dict(self.model)
+            elif hasattr(self.model, "state_dict"):
+                live_state = self.model.state_dict()
+            else:
+                live_state = {}
+            digest = compute_adapter_state_digest(live_state)
+            self._cached_adapter_digest = digest
+            return digest
+        finally:
+            self.rw_lock.release_read()
 
     def generate(
         self,
@@ -184,7 +224,9 @@ class DoubleBufferedAdapterRouter:
     def swap_weights(
         self,
         new_state_dict: Dict[str, torch.Tensor],
-        version_tag: str
+        version_tag: str,
+        run_id: Optional[str] = None,
+        seq: Optional[Any] = None,
     ) -> float:
         """
         Apply one complete adapter state to the live model.
@@ -228,6 +270,9 @@ class DoubleBufferedAdapterRouter:
         t_prep_end = time.perf_counter()
         prepare_ms = (t_prep_end - t_prep_start) * 1000.0
 
+        self.expected_state_sha256 = compute_adapter_state_digest(prepared_weights)
+        self._cached_adapter_digest = None
+
         t_request = time.perf_counter()
         self.rw_lock.acquire_write()
         t_acquired = time.perf_counter()
@@ -239,10 +284,21 @@ class DoubleBufferedAdapterRouter:
                     for key, tensor in prepared_weights.items():
                         destinations[key].copy_(tensor)
             self.active_version = version_tag
+            self.active_run_id = run_id
+            self.active_seq = seq
             self.swap_count += 1
         finally:
             self.rw_lock.release_write()
             t_released = time.perf_counter()
+
+        live_digest = self.adapter_state_digest()
+        if self.expected_state_sha256 is not None and live_digest != self.expected_state_sha256:
+            import logging
+            logging.error(
+                "MISMATCH: live adapter state digest (%s) != expected digest (%s)",
+                live_digest,
+                self.expected_state_sha256,
+            )
 
         lock_wait_ms = (t_acquired - t_request) * 1000.0
         lock_held_ms = (t_released - t_acquired) * 1000.0
@@ -266,7 +322,12 @@ class DoubleBufferedAdapterRouter:
         Safely load weights from a verified manifest off-path, then swap atomically.
         """
         weights = manifest.load_weights(device="cpu")
-        return self.swap_weights(weights, version_tag=manifest.adapter_version)
+        return self.swap_weights(
+            weights,
+            version_tag=manifest.adapter_version,
+            run_id=getattr(manifest, "run_id", None),
+            seq=getattr(manifest, "seq", None),
+        )
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return real-time serving telemetry and latency SLAs."""

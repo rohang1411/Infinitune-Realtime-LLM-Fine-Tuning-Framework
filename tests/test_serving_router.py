@@ -14,6 +14,7 @@ from utils.serving_router import (
     ReadWriteLock,
     DoubleBufferedAdapterRouter,
     nearest_rank_percentile,
+    compute_adapter_state_digest,
 )
 
 
@@ -209,4 +210,131 @@ def test_lock_wait_includes_reader_drain():
     assert metrics["swap_lock_wait_ms_max"] >= 150.0
     assert metrics["swap_lock_held_ms_max"] < metrics["swap_lock_wait_ms_max"]
     assert "swap_prepare_ms_p50" in metrics
+
+
+def test_compute_adapter_state_digest_order_invariance():
+    t_a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    t_b = torch.tensor([5.0, 6.0, 7.0])
+    t_c = torch.tensor([[8.0]])
+
+    d1 = {"layer_b": t_b, "layer_a": t_a, "layer_c": t_c}
+    d2 = {"layer_a": t_a, "layer_c": t_c, "layer_b": t_b}
+    d3 = {"layer_c": t_c, "layer_b": t_b, "layer_a": t_a}
+
+    digest1 = compute_adapter_state_digest(d1)
+    digest2 = compute_adapter_state_digest(d2)
+    digest3 = compute_adapter_state_digest(d3)
+
+    assert digest1 == digest2 == digest3
+    assert len(digest1) == 64
+
+    d_modified = {"layer_a": t_a + 0.01, "layer_b": t_b, "layer_c": t_c}
+    assert compute_adapter_state_digest(d_modified) != digest1
+
+
+def test_adapter_state_digest_peft_match_and_mutation():
+    from transformers import GPT2Config, GPT2LMHeadModel
+    from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+
+    config = GPT2Config(
+        vocab_size=100,
+        n_positions=64,
+        n_embd=32,
+        n_layer=2,
+        n_head=2,
+    )
+    base_model = GPT2LMHeadModel(config)
+    lora_config = LoraConfig(
+        r=4,
+        lora_alpha=16,
+        target_modules=["c_attn"],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    peft_model = get_peft_model(base_model, lora_config)
+    mock_tokenizer = MagicMock()
+
+    router = DoubleBufferedAdapterRouter(peft_model, mock_tokenizer, device="cpu")
+
+    # Snapshot with initial state
+    initial_weights = {k: v.clone() for k, v in get_peft_model_state_dict(peft_model).items()}
+    router.swap_weights(initial_weights, version_tag="step_000010", run_id="run_test", seq=10)
+
+    # Digests should match
+    live_sha = router.adapter_state_digest()
+    assert live_sha == router.expected_state_sha256
+    assert router.active_version == "step_000010"
+    assert router.active_run_id == "run_test"
+    assert router.active_seq == 10
+
+    # Invalidate cache and mutate one live tensor in-place
+    router._cached_adapter_digest = None
+    mutated = False
+    for name, param in peft_model.named_parameters():
+        if "lora" in name:
+            with torch.no_grad():
+                param.data.add_(1.0)
+            mutated = True
+            break
+    assert mutated, "Should have mutated at least one LoRA parameter"
+
+    mutated_sha = router.adapter_state_digest()
+    assert mutated_sha != router.expected_state_sha256
+
+
+def test_adapter_endpoint_schema_and_match(monkeypatch):
+    import inference
+    from transformers import GPT2Config, GPT2LMHeadModel
+    from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+
+    config = GPT2Config(
+        vocab_size=100,
+        n_positions=64,
+        n_embd=32,
+        n_layer=2,
+        n_head=2,
+    )
+    base_model = GPT2LMHeadModel(config)
+    lora_config = LoraConfig(
+        r=4,
+        lora_alpha=16,
+        target_modules=["c_attn"],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    peft_model = get_peft_model(base_model, lora_config)
+    mock_tokenizer = MagicMock()
+
+    router = DoubleBufferedAdapterRouter(peft_model, mock_tokenizer, device="cpu")
+    weights = {k: v.clone() for k, v in get_peft_model_state_dict(peft_model).items()}
+    router.swap_weights(weights, version_tag="step_000020", run_id="run_endpoint", seq=20)
+
+    monkeypatch.setattr(inference, "router_global", router)
+
+    client = inference.app.test_client()
+    resp = client.get("/adapter")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["active_version"] == "step_000020"
+    assert data["run_id"] == "run_endpoint"
+    assert data["seq"] == 20
+    assert data["match"] is True
+    assert data["adapter_state_sha256"] == data["expected_state_sha256"]
+
+    # Mutate in place
+    router._cached_adapter_digest = None
+    for name, param in peft_model.named_parameters():
+        if "lora" in name:
+            with torch.no_grad():
+                param.data.add_(2.0)
+            break
+
+    resp_mutated = client.get("/adapter")
+    assert resp_mutated.status_code == 200
+    data_mutated = resp_mutated.get_json()
+    assert data_mutated["match"] is False
+    assert data_mutated["adapter_state_sha256"] != data_mutated["expected_state_sha256"]
+
 
