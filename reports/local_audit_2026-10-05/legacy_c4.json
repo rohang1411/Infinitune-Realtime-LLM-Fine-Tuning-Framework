@@ -1,0 +1,51 @@
+{
+  "timestamp_utc": "2026-10-06T02:12:26.683191+00:00",
+  "git_commit": "06e3e17147c8bcb3ef6ebd5a70a5e501b322dcd4",
+  "git_branch": "evaluation-changes-rs",
+  "environment": {
+    "platform": "Windows-10-10.0.26300-SP0",
+    "python_version": "3.10.16",
+    "cpu_count": 18
+  },
+  "endpoint_url": "http://localhost:8011/generate",
+  "serving_modes_detected": [
+    "legacy_lock"
+  ],
+  "unique_adapter_versions": [
+    "v0_base"
+  ],
+  "total_requests": 20,
+  "successful_requests": 20,
+  "failed_requests": 0,
+  "failure_rate_percent": 0.0,
+  "concurrency": 4,
+  "total_duration_s": 11.74,
+  "achieved_qps": 1.7,
+  "client_latency_ms": {
+    "p50": 2248.83,
+    "p95": 2729.51,
+    "p99": 2729.51,
+    "avg": 2300.83,
+    "min": 2100.78,
+    "max": 2729.51
+  },
+  "server_latency_ms": {
+    "p50": 192.64,
+    "p95": 656.86,
+    "p99": 656.86,
+    "avg": 240.16
+  },
+  "server_telemetry": {
+    "active_version": "final",
+    "avg_latency_ms": 0.0,
+    "avg_swap_duration_ms": 0.0,
+    "dropped_requests": 0,
+    "in_flight_requests": 0,
+    "last_swap_duration_ms": 0.0,
+    "p50_latency_ms": 0.0,
+    "p95_latency_ms": 0.0,
+    "p99_latency_ms": 0.0,
+    "requests_served": 0,
+    "swap_count": 0
+  }
+}

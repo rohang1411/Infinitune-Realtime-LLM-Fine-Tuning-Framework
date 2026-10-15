@@ -92,6 +92,40 @@ class _QAFactEvalScorer:
                 f1_scores.append(0.0)
         return sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
 
+def compute_expected_calibration_error(confidences, predictions, ground_truth, num_bins=10):
+    """Compute Expected Calibration Error (ECE).
+    
+    Partitions prediction confidence in [0, 1] into num_bins equal-width bins and
+    computes weighted absolute difference between accuracy and mean confidence.
+    """
+    if not confidences or not predictions or not ground_truth:
+        return 0.0
+    total = len(predictions)
+    if total == 0:
+        return 0.0
+
+    accuracies = [1.0 if str(p).strip().lower() == str(g).strip().lower() else 0.0 for p, g in zip(predictions, ground_truth)]
+    bin_boundaries = [i / float(num_bins) for i in range(num_bins + 1)]
+    ece = 0.0
+
+    for i in range(num_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+
+        if i == num_bins - 1:
+            in_bin = [j for j, c in enumerate(confidences) if bin_lower <= c <= bin_upper]
+        else:
+            in_bin = [j for j, c in enumerate(confidences) if bin_lower <= c < bin_upper]
+
+        bin_size = len(in_bin)
+        if bin_size > 0:
+            bin_acc = sum(accuracies[j] for j in in_bin) / bin_size
+            bin_conf = sum(confidences[j] for j in in_bin) / bin_size
+            ece += (bin_size / float(total)) * abs(bin_acc - bin_conf)
+
+    return float(ece)
+
+
 def _normalized_aauc_from_history(history):
     """Trapezoidal area under accuracy vs training step, divided by step span.
     history is a list of (step, accuracy) in chronological order.
@@ -771,9 +805,10 @@ class Evaluator:
                     metrics["accuracy"] = correct / total
                     _log(f"  Correct: {correct} / {total}")
                     if self.strategy == "class_match":
+                        metrics["other_rate"] = other_predictions / max(total, 1)
                         _log(
                             f"  Normalized class predictions: "
-                            f"{total - other_predictions} known-label, {other_predictions} other"
+                            f"{total - other_predictions} known-label, {other_predictions} other (other_rate={metrics['other_rate']:.4f})"
                         )
 
                     if mf.get("compute_backward_transfer", False):
@@ -841,7 +876,29 @@ class Evaluator:
                                     f1_scores.append(
                                         2 * prec * rec / max(prec + rec, 1e-9)
                                     )
-                                metrics["f1"] = sum(f1_scores) / max(len(f1_scores), 1)
+                                legacy_f1 = sum(f1_scores) / max(len(f1_scores), 1)
+                                metrics["f1_with_other"] = legacy_f1
+
+                                # Target-class macro F1: calculate strictly over genuine target classes
+                                # so off-label fallback ('other') does not dilute the class denominator.
+                                if self.strategy == "class_match":
+                                    target_classes = sorted(set(g for g in gold_labels if g != self.class_match_other_label))
+                                    if not target_classes:
+                                        target_classes = sorted(set(gold_labels))
+                                    target_f1s = []
+                                    for tc in target_classes:
+                                        tp_t = sum(1 for g, p in zip(gold_labels, pred_labels) if g == tc and p == tc)
+                                        fp_t = sum(1 for g, p in zip(gold_labels, pred_labels) if g != tc and p == tc)
+                                        fn_t = sum(1 for g, p in zip(gold_labels, pred_labels) if g == tc and p != tc)
+                                        prec_t = tp_t / max(tp_t + fp_t, 1)
+                                        rec_t = tp_t / max(tp_t + fn_t, 1)
+                                        target_f1s.append(2 * prec_t * rec_t / max(prec_t + rec_t, 1e-9))
+                                    clean_macro_f1 = sum(target_f1s) / max(len(target_f1s), 1)
+                                    metrics["f1"] = clean_macro_f1
+                                    metrics["f1_macro"] = clean_macro_f1
+                                else:
+                                    metrics["f1"] = legacy_f1
+                                    metrics["f1_macro"] = legacy_f1
 
                             if mf.get("compute_mcc", False):
                                 t = sum(cm[i][i] for i in range(n))

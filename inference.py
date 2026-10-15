@@ -1,14 +1,17 @@
+from typing import Optional
 import time
-import io
 import json
 import argparse
 import torch
 import threading
 import queue
 import os
+import traceback
 import yaml
 from kafka import KafkaConsumer
 from utils.checkpoint_manager import CheckpointManager
+from utils.serving_router import DoubleBufferedAdapterRouter
+from utils.stream_protocol import SnapshotAssembler
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -32,15 +35,35 @@ def load_config(config_path):
 # Helper Functions
 # --------------------------------------------------
 def deserialize_tensor(value_bytes):
-    """Deserializes bytes back into a PyTorch tensor."""
-    buffer = io.BytesIO(value_bytes)
-    tensor = torch.load(buffer, map_location='cpu') 
-    return tensor
+    """Decode safetensors or JSON metadata; never unpickle broker bytes."""
+    if not value_bytes:
+        return None
+
+    # 1. Safetensors format (fast, zero-copy, safe)
+    try:
+        from safetensors.torch import load
+        loaded = load(value_bytes)
+        if isinstance(loaded, dict) and "weight" in loaded:
+            return loaded["weight"]
+        return loaded
+    except Exception:
+        pass
+
+    # 2. JSON control / manifest packet
+    try:
+        if value_bytes.startswith(b"{") and value_bytes.endswith(b"}"):
+            return json.loads(value_bytes.decode("utf-8"))
+    except Exception:
+        pass
+
+    raise ValueError("Kafka value is neither a safetensors tensor nor JSON metadata")
 
 # --------------------------------------------------
 # Kafka Consumer Thread
 # --------------------------------------------------
 _DONE_SENTINEL = ("__done__", None)
+stream_state_global = {"enabled": False, "consumer_ready": False,
+                       "consumer_error": None, "applier_error": None}
 
 def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
     """
@@ -64,10 +87,20 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
             auto_offset_reset="latest",
             consumer_timeout_ms=consumer_timeout_ms
         )
+        # A producer can publish only after this marker: `latest` offset is
+        # established once the consumer has joined and received assignment.
+        ready_deadline = time.monotonic() + 30
+        while not consumer.assignment() and time.monotonic() < ready_deadline:
+            consumer.poll(timeout_ms=250)
+        if not consumer.assignment():
+            raise TimeoutError("Kafka listener did not receive a partition assignment")
+        stream_state_global["consumer_ready"] = True
+        _log(f"Kafka listener ready: assignment={consumer.assignment()}")
         
         received_count = 0
         last_heartbeat_time = time.time()
         heartbeat_every_s = 5.0
+        assembler = SnapshotAssembler()
 
         while True:
             messages = consumer.poll(timeout_ms=poll_timeout_ms)
@@ -82,17 +115,26 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
             done = False
             for tp, records in messages.items():
                 for message in records:
-                    # Trainer sends '__done__' after final weight push to signal
-                    # that training is over and no more updates will arrive.
-                    if message.key == "__done__":
+                    key = message.key
+                    val = message.value
+                    if key == "__done__":
                         _log("Received training-done signal from trainer. Stopping LoRA listener.")
                         done = True
                         break
-                    if message.key and message.value is not None:
+
+                    if not key or val is None:
+                        continue
+
+                    try:
+                        complete = assembler.add(key, val)
+                    except (ValueError, TypeError) as exc:
+                        _log(f"REJECTED adapter message key={key!r}: {exc}")
+                        continue
+                    if complete is not None:
+                        step_id, batch = complete
                         received_count += 1
-                        update_queue.put((message.key, message.value))
-                    else:
-                        _log("Warning: Received message with missing key or value.")
+                        update_queue.put((step_id, batch))
+                        _log(f"Committed complete adapter step {step_id}: tensors={len(batch)}")
                 if done:
                     break
             if done:
@@ -101,8 +143,10 @@ def kafka_consumer_thread(update_queue: queue.Queue, config: dict):
                 break
 
     except Exception as e:
-        _log(f"Error in Kafka consumer thread: {e}")
+        stream_state_global["consumer_error"] = f"{type(e).__name__}: {e}"
+        _log(f"FATAL Kafka consumer thread: {stream_state_global['consumer_error']}\n{traceback.format_exc()}")
     finally:
+        stream_state_global["consumer_ready"] = False
         if consumer:
             consumer.close()
         _log("Consumer thread finished.")
@@ -129,31 +173,63 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
                 _log("Weight application thread received done signal. Stopping.")
                 break
 
-            layer_name, tensor = item
-            updates_to_apply = {layer_name: tensor}
-            
-            # Drain any other updates currently in the queue non-blockingly
-            while True:
-                try:
-                    item = update_queue.get(block=False)
-                    if item == _DONE_SENTINEL:
-                        _log("Weight application thread received done signal. Applying remaining batch, then stopping.")
-                        # Apply what we have, then break both loops
+            step_or_layer, tensor_or_dict = item
+            if isinstance(tensor_or_dict, dict):
+                # Complete atomic snapshot delivered via commit marker (prevents torn updates)
+                updates_to_apply = tensor_or_dict
+                version_tag = f"step_{step_or_layer}"
+                while True:
+                    try:
+                        next_item = update_queue.get(block=False)
+                        if next_item == _DONE_SENTINEL:
+                            item = next_item
+                            break
+                        n_step, n_val = next_item
+                        if isinstance(n_val, dict):
+                            updates_to_apply = n_val
+                            version_tag = f"step_{n_step}"
+                        else:
+                            updates_to_apply[n_step] = n_val
+                    except queue.Empty:
                         break
-                    name, t = item
-                    updates_to_apply[name] = t
-                except queue.Empty:
-                    break
-            
+            else:
+                layer_name = step_or_layer
+                updates_to_apply = {layer_name: tensor_or_dict}
+                version_tag = f"batch_{applied_batches + 1}"
+                while True:
+                    try:
+                        next_item = update_queue.get(block=False)
+                        if next_item == _DONE_SENTINEL:
+                            item = next_item
+                            break
+                        name, t = next_item
+                        if isinstance(t, dict):
+                            updates_to_apply = t
+                            version_tag = f"step_{name}"
+                        else:
+                            updates_to_apply[name] = t
+                    except queue.Empty:
+                        break
+
             if updates_to_apply:
                 _log(f"Applying weight updates: tensors={len(updates_to_apply)}, queue_size_before_apply={update_queue.qsize()}")
-                with model_lock:
-                    updates_to_apply_on_device = {
-                        k: v.to(device) for k, v in updates_to_apply.items()
-                    }
-                    model.load_state_dict(updates_to_apply_on_device, strict=False)
-                applied_batches += 1
-                _log(f"Weight updates applied successfully. applied_batches={applied_batches}")
+                global active_version_global
+                if serving_mode_global == "router" and router_global is not None:
+                    swap_ms = router_global.swap_weights(updates_to_apply, version_tag=version_tag)
+                    active_version_global = version_tag
+                    applied_batches += 1
+                    _log(f"Weight updates applied via DoubleBufferedAdapterRouter in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
+                else:
+                    swap_start = time.perf_counter()
+                    with model_lock:
+                        updates_to_apply_on_device = {
+                            k: v.to(device) for k, v in updates_to_apply.items()
+                        }
+                        model.load_state_dict(updates_to_apply_on_device, strict=False)
+                        active_version_global = version_tag
+                    swap_ms = (time.perf_counter() - swap_start) * 1000.0
+                    applied_batches += 1
+                    _log(f"Weight updates applied via legacy model_lock in {swap_ms:.2f}ms. version='{version_tag}', applied_batches={applied_batches}")
 
             # If we hit the sentinel inside the drain loop, stop after this apply
             if item == _DONE_SENTINEL:
@@ -162,8 +238,9 @@ def weight_application_thread(model: PeftModel, update_queue: queue.Queue,
         except queue.Empty:
              continue
         except Exception as e:
-            _log(f"Error applying weights: {e}")
-            time.sleep(1)
+            stream_state_global["applier_error"] = f"{type(e).__name__}: {e}"
+            _log(f"FATAL adapter apply: {stream_state_global['applier_error']}\n{traceback.format_exc()}")
+            break
 
 # --------------------------------------------------
 # Inference Function
@@ -210,6 +287,9 @@ tokenizer_global = None
 model_lock_global = None
 device_global = None
 config_global = None
+router_global: Optional[DoubleBufferedAdapterRouter] = None
+serving_mode_global: str = "router"
+active_version_global: str = "v0_base" 
 
 @app.route('/generate', methods=['POST'])
 def handle_generate():
@@ -229,25 +309,53 @@ def handle_generate():
          print("Error: Model not initialized when request received.")
          return jsonify({"error": "Model not initialized yet. Please wait."}), 503 # Service Unavailable
 
-    print(f"Received generation request for prompt: '{prompt[:80]}...'")
+    print(f"Received generation request for prompt: '{prompt[:80]}...' [mode={serving_mode_global}]")
     try:
-        # Call the existing generation function using global objects
-        generated_text = generate_text(
-            prompt, model_global, tokenizer_global, model_lock_global,
-            device_global, config_global['inference']
-        )
-        end_time = time.time()
-        print(f"Generation finished in {end_time - start_time:.2f} seconds.")
-        return jsonify({"generated_text": generated_text})
+        if serving_mode_global == "router" and router_global is not None:
+            res = router_global.generate(prompt, config_global['inference'])
+            end_time = time.time()
+            resp = jsonify({
+                "generated_text": res["response"],
+                "adapter_version": res["version"],
+                "latency_ms": res["latency_ms"],
+                "serving_mode": "router",
+            })
+            resp.headers["X-Adapter-Version"] = res["version"]
+            return resp, 200
+        else:
+            generated_text = generate_text(
+                prompt, model_global, tokenizer_global, model_lock_global,
+                device_global, config_global['inference']
+            )
+            end_time = time.time()
+            print(f"Generation finished in {end_time - start_time:.2f} seconds.")
+            v = active_version_global
+            resp = jsonify({
+                "generated_text": generated_text,
+                "adapter_version": v,
+                "latency_ms": round((end_time - start_time) * 1000.0, 2),
+                "serving_mode": "legacy_lock",
+            })
+            resp.headers["X-Adapter-Version"] = v
+            return resp, 200
     except Exception as e:
         print(f"Error during generation endpoint: {e}")
         return jsonify({"error": "Internal server error during generation"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint."""
-    # Could add more checks here (e.g., Kafka connection)
+    """Flag background-stream failures instead of reporting false health."""
+    if stream_state_global["enabled"]:
+        if stream_state_global["consumer_error"] or stream_state_global["applier_error"]:
+            return jsonify({"status": "degraded", "stream": stream_state_global}), 503
     return jsonify({"status": "ok"}), 200
+
+@app.route('/metrics', methods=['GET'])
+def get_metrics():
+    """Returns real-time serving SLAs, latency percentiles, and hot-swap telemetry."""
+    if router_global is not None:
+        return jsonify({**router_global.get_metrics(), "stream": stream_state_global}), 200
+    return jsonify({"status": "router_not_initialized"}), 200
 
 # --------------------------------------------------
 # Main Execution Block
@@ -258,19 +366,27 @@ if __name__ == "__main__":
                         help="Path to configuration YAML file")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a saved LoRA adapter checkpoint, a specific step (e.g., '600' or 'step_000600'), or 'latest' to automatically find and load the newest checkpoint. (Bypasses Kafka inference)")
+    parser.add_argument("--listen-updates", action="store_true",
+                        help="Continue consuming Kafka adapter snapshots after loading a checkpoint")
+    parser.add_argument("--serving-mode", type=str, choices=["router", "legacy_lock"], default="router",
+                        help="Serving mode: 'router' uses DoubleBufferedAdapterRouter with ReadWriteLock; 'legacy_lock' uses global mutex")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Port to bind the Flask HTTP server to (default: 8000)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config_global = config
+    serving_mode_global = args.serving_mode
     _log(f"Loaded config: {args.config}")
+    _log(f"Serving mode configured: '{serving_mode_global}'")
 
     # Resolve checkpoint path if provided
     resolved_checkpoint_path = None
+    ckpt_mgr = CheckpointManager(config)
     if args.checkpoint:
         if os.path.isdir(args.checkpoint):
             resolved_checkpoint_path = args.checkpoint
         else:
-            ckpt_mgr = CheckpointManager(config)
             if args.checkpoint.lower() == "latest":
                 ckpts = ckpt_mgr.list_checkpoints()
                 if not ckpts:
@@ -287,6 +403,15 @@ if __name__ == "__main__":
                 else:
                     _log(f"FATAL: Checkpoint '{args.checkpoint}' not found locally at '{candidate_path}' and is not a valid directory.")
                     exit(1)
+    elif config.get('inference', {}).get('auto_load_latest_checkpoint', True):
+        # Cold-start resilience: Auto-load latest saved checkpoint to avoid serving stale base weights
+        try:
+            ckpts = ckpt_mgr.list_checkpoints()
+            if ckpts:
+                resolved_checkpoint_path = ckpts[-1]["path"]
+                _log(f"Cold-start recovery: Discovered existing latest checkpoint on disk: {resolved_checkpoint_path}")
+        except Exception as e:
+            _log(f"Cold-start checkpoint check skipped: {e}")
 
     model_cfg = config['model']
     lora_cfg = config['lora']
@@ -320,15 +445,19 @@ if __name__ == "__main__":
     prec = model_cfg.get('precision', 'fp32')
     dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
     
-    _log(f"Loading base model: {BASE_MODEL_NAME} with dtype {dtype}")
+    model_revision = model_cfg.get('revision') or (
+        os.environ.get('INFINITUNE_MODEL_REVISION')
+        if os.environ.get('INFINITUNE_MODEL_NAME') == BASE_MODEL_NAME else None)
+    _log(f"Loading base model: {BASE_MODEL_NAME} revision={model_revision or 'default'} with dtype {dtype}")
     # Use a try-except block for robustness during model loading
     try:
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME,
             torch_dtype=dtype,
-            device_map={"": device_global} # Simpler contiguous mapping (prevents arbitrary offload faults)
+            device_map={"": device_global}, # Simpler contiguous mapping (prevents arbitrary offload faults)
+            revision=model_revision,
         )
-        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, revision=model_revision)
         tokenizer.pad_token = tokenizer.eos_token 
     except Exception as e:
         _log(f"FATAL: Failed to load base model or tokenizer: {e}")
@@ -357,12 +486,17 @@ if __name__ == "__main__":
     update_queue = queue.Queue()
     model_lock = threading.Lock()
     model_lock_global = model_lock
+    router_global = DoubleBufferedAdapterRouter(model, tokenizer, device=device_global)
+    if resolved_checkpoint_path:
+        router_global.active_version = os.path.basename(resolved_checkpoint_path)
+    _log("Adapter router initialized with single-model read/write locking.")
 
     # 4. Start background Kafka threads for receiving LoRA weight updates.
     #    We skip this entirely if a standalone checkpoint was provided and resolved.
-    if resolved_checkpoint_path:
+    if resolved_checkpoint_path and not args.listen_updates:
         _log("Standalone mode (checkpoint provided). Skipping Kafka consumer threads.")
     else:
+        stream_state_global["enabled"] = True
         consumer_thread = threading.Thread(
             target=kafka_consumer_thread,
             args=(update_queue, config),
@@ -376,8 +510,8 @@ if __name__ == "__main__":
         consumer_thread.start()
         applier_thread.start()
 
-    FLASK_HOST = inference_cfg.get('host', 'localhost')
-    FLASK_PORT = inference_cfg.get('port', 5000)
+    FLASK_HOST = inference_cfg.get('host', '0.0.0.0')
+    FLASK_PORT = args.port or inference_cfg.get('port', 8000)
 
     _log(f"Starting Flask server on http://{FLASK_HOST}:{FLASK_PORT}")
     _log("Send POST requests to /generate with JSON body: {'prompt': 'your prompt here'}")

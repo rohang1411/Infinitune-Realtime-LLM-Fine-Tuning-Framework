@@ -1,5 +1,4 @@
 import time
-import io
 import re
 import json
 import sys
@@ -24,6 +23,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from utils.eval_metrics_train import Evaluator
 from utils.eval_qualitative import QualitativeEvaluator
 from utils.checkpoint_manager import CheckpointManager
+from utils.precision_manager import PrecisionManager
 
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -108,6 +108,11 @@ class MetricsLogger:
         "qual_pinned_slot_coverage_mean",
         "qual_pinned_perfect_coverage_rate",
         "qual_pinned_consistency_score",
+        # ── Extended Classification & Calibration metrics ─────────────────────
+        "other_rate",
+        "f1_macro",
+        "f1_with_other",
+        "ece",
     ]
 
     def __init__(self, output_dir: str, run_name: str):
@@ -258,23 +263,67 @@ class LoRAProducer:
         self.topic = kafka_cfg['lora_updates_topic']
         self.producer = KafkaProducer(
             bootstrap_servers=kafka_cfg['bootstrap_servers'],
-            value_serializer=lambda v: self.serialize_tensor(v),
-            key_serializer=lambda k: k  # identity — key is pre-encoded to bytes in send_weights
+            value_serializer=lambda v: self.serialize_payload(v),
+            key_serializer=lambda k: k if isinstance(k, bytes) else (k.encode("utf-8") if k is not None else None)
         )
 
+    def serialize_payload(self, value):
+        """Serializes tensor, dictionary metadata, or bytes safely using safetensors / JSON."""
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, dict):
+            return json.dumps(value).encode("utf-8")
+        if isinstance(value, torch.Tensor):
+            from safetensors.torch import save
+            return save({"weight": value.contiguous().cpu()})
+        raise TypeError(f"Unsupported Kafka adapter payload type: {type(value).__name__}")
+
     def serialize_tensor(self, tensor):
-        buffer = io.BytesIO()
-        torch.save(tensor, buffer)
-        return buffer.getvalue()
-    
-    def send_weights(self, adapter_weights):
-        _log(f"Sending weights update... tensors={len(adapter_weights)} topic='{self.topic}'")
+        return self.serialize_payload(tensor)
+
+    def send_weights(self, adapter_weights, step_id=None):
+        """
+        Sends adapter weights with versioning, step_id, and commit markers to prevent torn updates.
+        """
+        num_tensors = len(adapter_weights)
+        step_tag = str(step_id) if step_id is not None else str(int(time.time()))
+        _log(f"Sending weights update... step={step_tag}, tensors={num_tensors}, topic='{self.topic}'")
+
+        # 1. Send manifest / header marker
+        manifest_meta = {
+            "step_id": step_tag,
+            "num_tensors": num_tensors,
+            "tensor_names": list(adapter_weights.keys()),
+            "timestamp": time.time(),
+        }
+        self.producer.send(
+            topic=self.topic,
+            partition=0,  # all frames share one ordered Kafka partition
+            key=f"__manifest__:{step_tag}".encode("utf-8"),
+            value=manifest_meta
+        )
+
+        # 2. Send each tensor with step-prefixed key
         for name, param in adapter_weights.items():
             self.producer.send(
                 topic=self.topic,
-                key=name.encode("utf-8") if isinstance(name, str) else name,
+                partition=0,
+                key=f"{step_tag}:{name}".encode("utf-8"),
                 value=param
             )
+
+        # 3. Send commit marker
+        commit_meta = {
+            "step_id": step_tag,
+            "status": "committed",
+            "timestamp": time.time(),
+        }
+        self.producer.send(
+            topic=self.topic,
+            partition=0,
+            key=f"__commit__:{step_tag}".encode("utf-8"),
+            value=commit_meta
+        )
         self.producer.flush()
 
     def send_done_signal(self):
@@ -283,8 +332,9 @@ class LoRAProducer:
         _log(f"Sending training-done signal to inference on topic '{self.topic}'...")
         self.producer.send(
             topic=self.topic,
+            partition=0,
             key="__done__".encode("utf-8"),
-            value=torch.tensor([0.0]),
+            value={"status": "done"},
         )
         self.producer.flush()
 
@@ -363,6 +413,34 @@ def pad_batch(samples, pad_token_id, device):
         'attention_mask': torch.tensor(padded_attention_mask, dtype=torch.long).to(device),
         'labels': torch.tensor(padded_labels, dtype=torch.long).to(device),
     }
+
+
+def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_rescale=1.0):
+    """Apply accumulated gradients with correct AMP unscale/overflow semantics.
+
+    Returns (did_step, pre_clip_norm). A skipped FP16 update must not advance
+    the learning-rate scheduler or the reported optimizer-step counter.
+    """
+    scaler = precision_mgr.scaler
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        scale_before = scaler.get_scale()
+    if gradient_rescale != 1.0:
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.mul_(gradient_rescale)
+    norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+        did_step = scaler.get_scale() >= scale_before
+    else:
+        optimizer.step()
+        did_step = True
+    if did_step:
+        scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    return did_step, norm
 
 
 
@@ -479,16 +557,27 @@ def train_model(config, config_path: str = "(unknown)"):
     prec = model_cfg.get('precision', 'fp32')
     dtype = torch.float16 if prec == 'fp16' else (torch.bfloat16 if prec == 'bf16' else torch.float32)
     
-    _log(f"Loading base model: {model_name} with dtype {dtype}")
+    model_revision = model_cfg.get('revision') or (
+        os.environ.get('INFINITUNE_MODEL_REVISION')
+        if os.environ.get('INFINITUNE_MODEL_NAME') == model_name else None)
+    _log(f"Loading base model: {model_name} revision={model_revision or 'default'} with dtype {dtype}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto",
+        revision=model_revision,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)
     # Ensure there is a pad token
     tokenizer.pad_token = tokenizer.eos_token
     
+    precision_mgr = PrecisionManager(
+        precision=model_cfg.get('precision', 'fp32'),
+        device=str(device),
+        enable_compile=training_cfg.get('enable_compile', False),
+        compile_mode=training_cfg.get('compile_mode', 'max-autotune'),
+    )
+    _log(f"PrecisionManager active: precision={precision_mgr.active_precision}, compile={precision_mgr.enable_compile}")
     _log("Loaded model; applying PEFT and LoRA adapter configuration...")
 
     model = get_peft_model(model, lora_config)
@@ -505,6 +594,7 @@ def train_model(config, config_path: str = "(unknown)"):
     else:
         _log("Gradient checkpointing disabled.")
 
+    model = precision_mgr.compile_model_if_enabled(model)
     # Set the model to training mode.
     model.train()
     
@@ -577,7 +667,7 @@ def train_model(config, config_path: str = "(unknown)"):
     scheduler = build_lr_scheduler(optimizer, config)
     
     # Instantiate our Kafka producer for LoRA updates.
-    lora_producer = LoRAProducer(config)
+    lora_producer = LoRAProducer(config) if kafka_cfg.get('enable_lora_streaming', True) else None
 
     # Compile Jinja2 templates for text formatting
     prompt_template = Template(preproc_cfg['prompt_template'])
@@ -639,7 +729,11 @@ def train_model(config, config_path: str = "(unknown)"):
     eof_received = False
     stop_requested = False
     consecutive_empty_polls_after_eof = 0
-    max_consecutive_empty_polls = 100  # 100 x 1s = ~100s of true silence after offsets caught up
+    # Keep the conservative production default, but allow a closed benchmark
+    # stream to stop promptly once its EOF offset is fully consumed.
+    max_consecutive_empty_polls = int(training_cfg.get('eof_empty_polls', 100))
+    if max_consecutive_empty_polls < 1:
+        raise ValueError("training.eof_empty_polls must be positive")
 
     # In test_mode we train on the ENTIRE dataset (stop on EOF, not max_steps).
     # max_steps still serves as a safety cap in normal mode.
@@ -706,13 +800,21 @@ def train_model(config, config_path: str = "(unknown)"):
     _log(f"  (To regenerate plots later: python utils/plot_metrics.py \"{metrics_logger.metrics_path}\")")
 
     interrupted = False
+    loop_error = None
 
     try:
         while optimization_step < effective_max_steps and not stop_requested:
             batch_samples = []
             # Assemble a mini-batch of raw examples.
             while len(batch_samples) < training_args.per_device_train_batch_size:
-                messages = consumer.poll(timeout_ms=poll_timeout_ms)
+                # Kafka's poll can return far more records than one micro-batch.
+                # Breaking the loop at batch_size after an unrestricted poll
+                # advances offsets past discarded records. Bound each poll to
+                # exactly the remaining batch capacity so no records are lost.
+                messages = consumer.poll(
+                    timeout_ms=poll_timeout_ms,
+                    max_records=training_args.per_device_train_batch_size - len(batch_samples),
+                )
                 if not messages:
                     # After EOF is received, use Kafka offset metadata to verify
                     # the topic is truly drained before starting the countdown.
@@ -807,13 +909,17 @@ def train_model(config, config_path: str = "(unknown)"):
                 for s in batch_samples
             )
 
-            # Forward pass
-            outputs = model(**batch)
-            loss = outputs.loss
+            # Forward pass with precision autocasting
+            with precision_mgr.autocast_context():
+                outputs = model(**batch)
+                loss = outputs.loss
             accumulated_loss += loss.item()
             # Scale loss for gradient accumulation before backward
             scaled_loss = loss / training_args.gradient_accumulation_steps
-            scaled_loss.backward()
+            if precision_mgr.scaler is not None:
+                precision_mgr.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             grad_accum_counter += 1
 
             # CRITICAL MEMORY OPTIMIZATION:
@@ -826,28 +932,20 @@ def train_model(config, config_path: str = "(unknown)"):
             del batch
             del batch_samples
 
-            # Compute gradient norm BEFORE the optimizer clips / steps so we
-            # capture the raw pre-clip magnitude for diagnostic purposes.
-            step_grad_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    step_grad_norm += p.grad.detach().norm(2).item() ** 2
-            step_grad_norm = step_grad_norm ** 0.5
-            accumulated_grad_norm = getattr(train_model, '_acc_grad_norm', 0.0) + step_grad_norm
-            train_model._acc_grad_norm = accumulated_grad_norm
-
             # Accumulate response‑token count across micro-batches
             accumulated_response_tokens = getattr(train_model, '_acc_tokens', 0) + batch_response_tokens
             train_model._acc_tokens = accumulated_response_tokens
 
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
-                # Crucial step: Clip gradients to prevent fp16 explosions causing NaN loss
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                did_step, avg_grad_norm = finish_optimizer_step(
+                    model, optimizer, scheduler, precision_mgr)
+                if not did_step:
+                    _log("FP16 gradient overflow: optimizer update skipped; loss scale reduced.")
+                    train_model._acc_tokens = 0
+                    accumulated_loss = 0.0
+                    step_start = time.time()
+                    continue
                 optimization_step += 1
 
                 # Periodic checkpoint save
@@ -858,7 +956,6 @@ def train_model(config, config_path: str = "(unknown)"):
                     )
 
                 avg_step_loss = accumulated_loss / training_args.gradient_accumulation_steps
-                avg_grad_norm = train_model._acc_grad_norm / training_args.gradient_accumulation_steps
                 current_lr = scheduler.get_last_lr()[0]
 
                 if optimization_step % training_args.logging_steps == 0:
@@ -882,7 +979,6 @@ def train_model(config, config_path: str = "(unknown)"):
                     )
 
                 # Reset per-step accumulators
-                train_model._acc_grad_norm = 0.0
                 train_model._acc_tokens = 0
 
                 # Reset accumulators for the next optimization step
@@ -910,7 +1006,7 @@ def train_model(config, config_path: str = "(unknown)"):
             if time.time() - last_send_time >= weight_push_interval:
                 if kafka_cfg.get('enable_lora_streaming', True):
                     _log(f"{weight_push_interval}s elapsed at optimization step {optimization_step}. Sending adapter weights...")
-                    lora_producer.send_weights(get_peft_model_state_dict(model))
+                    lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
                 last_send_time = time.time()
 
     except KeyboardInterrupt:
@@ -918,6 +1014,9 @@ def train_model(config, config_path: str = "(unknown)"):
         _log("KeyboardInterrupt received — skipping final eval, proceeding to save metrics and plots.")
     except Exception as e:
         _log(f"Training loop error: {e}")
+        import traceback
+        traceback.print_exc()
+        loop_error = e
 
     # =====================================================================
     #  CLEANUP — guaranteed to run via finally-like structure.
@@ -928,14 +1027,16 @@ def train_model(config, config_path: str = "(unknown)"):
 
     # 0. Flush any pending partial gradient accumulation so the last few
     #    micro-batches at EOF don't silently lose their gradient signal.
-    if not interrupted and grad_accum_counter % training_args.gradient_accumulation_steps != 0:
+    if not interrupted and loop_error is None and grad_accum_counter % training_args.gradient_accumulation_steps != 0:
         try:
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            optimization_step += 1
-            _log(f"Flushed partial gradient accumulation at step {optimization_step} "
-                 f"({grad_accum_counter % training_args.gradient_accumulation_steps} pending micro-batches).")
+            pending = grad_accum_counter % training_args.gradient_accumulation_steps
+            did_step, _ = finish_optimizer_step(
+                model, optimizer, scheduler, precision_mgr,
+                gradient_rescale=training_args.gradient_accumulation_steps / pending)
+            if did_step:
+                optimization_step += 1
+                _log(f"Flushed partial gradient accumulation at step {optimization_step} "
+                     f"({pending} pending micro-batches).")
         except Exception as e:
             _log(f"Warning: Partial gradient flush failed: {e}")
 
@@ -948,9 +1049,9 @@ def train_model(config, config_path: str = "(unknown)"):
 
     # 2. Send final LoRA weights + done signal to inference server via Kafka (if enabled).
     try:
-        if kafka_cfg.get('enable_lora_streaming', True):
+        if kafka_cfg.get('enable_lora_streaming', True) and loop_error is None:
             _log("Training complete. Sending final adapter weights.")
-            lora_producer.send_weights(get_peft_model_state_dict(model))
+            lora_producer.send_weights(get_peft_model_state_dict(model), step_id=optimization_step)
             lora_producer.send_done_signal()
         else:
             _log("Training complete. LoRA streaming disabled, skipping final Kafka push.")
@@ -990,6 +1091,8 @@ def train_model(config, config_path: str = "(unknown)"):
     if ckpt_manager:
         _log(f"Checkpoints saved to: {ckpt_manager.checkpoint_root} (run: {ckpt_manager._run_dir})")
         _log("To run decoupled evaluation: python evaluate.py --config <config> [--step N | --all-checkpoints]")
+    if loop_error is not None:
+        raise RuntimeError("Training failed; see original traceback above") from loop_error
 
 # --------------------------------------------------
 # Main entry point
