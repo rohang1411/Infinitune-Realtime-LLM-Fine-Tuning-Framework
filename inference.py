@@ -388,12 +388,12 @@ if __name__ == "__main__":
             resolved_checkpoint_path = args.checkpoint
         else:
             if args.checkpoint.lower() == "latest":
-                ckpts = ckpt_mgr.list_checkpoints()
-                if not ckpts:
+                latest_ckpt = ckpt_mgr.latest_checkpoint()
+                if not latest_ckpt:
                     _log("Warning: '--checkpoint latest' requested but no checkpoints found. Falling back to base model with empty LoRA adapter.")
                     resolved_checkpoint_path = None
                 else:
-                    resolved_checkpoint_path = ckpts[-1]["path"]
+                    resolved_checkpoint_path = latest_ckpt["path"]
                     _log(f"Auto-discovered latest checkpoint: {resolved_checkpoint_path}")
             else:
                 candidate_path = ckpt_mgr.resolve_checkpoint_path(args.checkpoint)
@@ -406,9 +406,9 @@ if __name__ == "__main__":
     elif config.get('inference', {}).get('auto_load_latest_checkpoint', True):
         # Cold-start resilience: Auto-load latest saved checkpoint to avoid serving stale base weights
         try:
-            ckpts = ckpt_mgr.list_checkpoints()
-            if ckpts:
-                resolved_checkpoint_path = ckpts[-1]["path"]
+            latest_ckpt = ckpt_mgr.latest_checkpoint()
+            if latest_ckpt:
+                resolved_checkpoint_path = latest_ckpt["path"]
                 _log(f"Cold-start recovery: Discovered existing latest checkpoint on disk: {resolved_checkpoint_path}")
         except Exception as e:
             _log(f"Cold-start checkpoint check skipped: {e}")

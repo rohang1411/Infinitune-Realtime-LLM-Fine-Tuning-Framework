@@ -410,6 +410,7 @@ class CheckpointManager:
                 "step":      step_val,
                 "path":      path,
                 "run":       run_name,
+                "run_name":  run_name,
                 "timestamp": timestamp,
             })
 
@@ -427,13 +428,40 @@ class CheckpointManager:
                 # Legacy flat layout: step dirs directly under checkpoint_root
                 _load_step_dir(entry.path, name, run_name=None)
 
-        # Sort: numbered steps ascending, then "final" last
+        # Sort: by run first, then by step within the run.
+        # Run directory names are formatted as run_YYYYmmdd-HHMMSS_<uid4>,
+        # so lexicographical sorting of run strings sorts by time. Legacy flat layout has run=None ("") sorting first.
         def sort_key(c):
+            run = c.get("run_name") or ""          # legacy flat layout sorts first
             s = c["step"]
-            return (1, 0) if s == "final" else (0, s)
+            return (run, 1, 0) if s == "final" else (run, 0, s)
 
         checkpoints.sort(key=sort_key)
         return checkpoints
+
+    def list_runs(self) -> list[str]:
+        """Return the sorted list of run directory names found under checkpoint_root."""
+        runs = set()
+        if os.path.exists(self.checkpoint_root):
+            for entry in os.scandir(self.checkpoint_root):
+                if entry.is_dir() and entry.name.startswith("run_"):
+                    runs.add(entry.name)
+        return sorted(runs)
+
+    def latest_checkpoint(self) -> Optional[dict]:
+        """Return the final of the newest run if that exists,
+        otherwise the highest step of the newest run that has any checkpoint,
+        otherwise None.
+        """
+        ckpts = self.list_checkpoints()
+        if not ckpts:
+            return None
+        newest_run = ckpts[-1].get("run_name")
+        newest_run_ckpts = [c for c in ckpts if c.get("run_name") == newest_run]
+        finals = [c for c in newest_run_ckpts if c["step"] == "final"]
+        if finals:
+            return finals[-1]
+        return newest_run_ckpts[-1]
 
     # -----------------------------------------------------------------------
 
@@ -454,7 +482,7 @@ class CheckpointManager:
         """
         normalized_step = _normalize_step_value(step)
         target = _step_dir_name(normalized_step)
-        # list_checkpoints() is already sorted ascending by step then by run;
+        # list_checkpoints() is sorted ascending by run then by step within the run;
         # we want the latest run, so collect all matches and return the last.
         matches = [
             c["path"]
