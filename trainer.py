@@ -9,6 +9,7 @@ import math
 import yaml
 import os
 import csv
+from typing import Optional, Dict, Any, List, Tuple
 from jinja2 import Template
 from kafka import KafkaProducer, KafkaConsumer
 from datasets import load_dataset
@@ -470,57 +471,87 @@ class LoRAProducer:
 # --------------------------------------------------
 # Tokenization helper: prompt/response aware
 # --------------------------------------------------
-def tokenize_with_label_masking(tokenizer, prompt_text, response_text, max_seq_length):
+def tokenize_with_label_masking(
+    tokenizer,
+    prompt_text,
+    response_text,
+    max_seq_length,
+    label_masking: bool = True,
+    truncation_side: str = "left_prompt",
+):
     """
-    Tokenize prompt and response separately.  Truncate the PROMPT
-    (not the response) so the label always fits within max_seq_length.
-    Return input_ids, attention_mask, labels with -100 on prompt tokens.
+    Tokenize prompt and response separately.
+    When truncation_side == "left_prompt" (default):
+      Truncate the PROMPT (not the response) from the left so the label always fits within max_seq_length.
+    When truncation_side == "right":
+      Concatenate prompt + response first, then truncate from the right to max_seq_length.
+
+    When label_masking is True (default):
+      Labels have -100 on prompt tokens, and actual token IDs for response tokens.
+    When label_masking is False:
+      Labels match input_ids exactly (prompt tokens are also trained on).
 
     An EOS token is appended to the response so the model learns to stop
     generating after the answer.  If the response must be truncated, the
     last token is always replaced with EOS to preserve the stopping signal.
     """
     eos_id = tokenizer.eos_token_id
+    bos_id = tokenizer.bos_token_id
 
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
     response_ids = tokenizer.encode(response_text, add_special_tokens=False)
 
-    bos_id = tokenizer.bos_token_id
-
-    # Compute effective target length cleanly guaranteeing targets get full priority bounds mapping
-    effective_response_len = len(response_ids)
-    if eos_id is not None:
-        effective_response_len += 1
-
-    # Overly massive responses (rare corner case mapping limit bounds)
-    if effective_response_len > max_seq_length:
-        prompt_ids = []
+    if truncation_side == "right":
         if eos_id is not None:
-            response_ids = response_ids[:max_seq_length - 1] + [eos_id]
+            full_ids = prompt_ids + response_ids + [eos_id]
         else:
-            response_ids = response_ids[:max_seq_length]
+            full_ids = prompt_ids + response_ids
+        
+        full_ids = full_ids[:max_seq_length]
+        p_len = min(len(prompt_ids), len(full_ids))
+        input_ids = full_ids
+        if label_masking:
+            labels = [-100] * p_len + input_ids[p_len:]
+        else:
+            labels = list(input_ids)
+        prompt_len = p_len
     else:
-        # Prompt must be cleanly truncated from the LEFT to make room for targets safely natively
-        max_prompt_len = max_seq_length - effective_response_len
-        if len(prompt_ids) > max_prompt_len:
-            if bos_id is not None and prompt_ids[0] == bos_id and max_prompt_len > 0:
-                prompt_ids = [bos_id] + prompt_ids[-(max_prompt_len - 1):]
-            else:
-                prompt_ids = prompt_ids[-max_prompt_len:]
-                
+        # Default: left_prompt truncation prioritizing response tokens
+        effective_response_len = len(response_ids)
         if eos_id is not None:
-            response_ids = response_ids + [eos_id]
+            effective_response_len += 1
 
-    input_ids = prompt_ids + response_ids
+        if effective_response_len > max_seq_length:
+            prompt_ids = []
+            if eos_id is not None:
+                response_ids = response_ids[:max_seq_length - 1] + [eos_id]
+            else:
+                response_ids = response_ids[:max_seq_length]
+        else:
+            max_prompt_len = max_seq_length - effective_response_len
+            if len(prompt_ids) > max_prompt_len:
+                if bos_id is not None and len(prompt_ids) > 0 and prompt_ids[0] == bos_id and max_prompt_len > 0:
+                    prompt_ids = [bos_id] + prompt_ids[-(max_prompt_len - 1):]
+                else:
+                    prompt_ids = prompt_ids[-max_prompt_len:]
+                    
+            if eos_id is not None:
+                response_ids = response_ids + [eos_id]
+
+        input_ids = prompt_ids + response_ids
+        if label_masking:
+            labels = [-100] * len(prompt_ids) + response_ids
+        else:
+            labels = list(input_ids)
+        prompt_len = len(prompt_ids)
+
     attention_mask = [1] * len(input_ids)
-    # Labels: -100 for prompt tokens (ignored in loss), actual ids for response tokens
-    labels = [-100] * len(prompt_ids) + response_ids
 
     return {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'labels': labels,
-        'prompt_len': len(prompt_ids),
+        'prompt_len': prompt_len,
     }
 
 
@@ -544,13 +575,31 @@ def pad_batch(samples, pad_token_id, device):
     }
 
 
-def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_rescale=1.0):
+class OptimizerStepResult(tuple):
+    """Result of finish_optimizer_step maintaining backwards compatibility as a 2-tuple (did_step, pre_clip_norm)."""
+    def __new__(cls, did_step: bool, pre_clip_norm: float, post_clip_norm: Optional[float] = None):
+        return super().__new__(cls, (did_step, pre_clip_norm))
+
+    def __init__(self, did_step: bool, pre_clip_norm: float, post_clip_norm: Optional[float] = None):
+        self.did_step = did_step
+        self.pre_clip_norm = pre_clip_norm
+        self.post_clip_norm = post_clip_norm
+
+
+def finish_optimizer_step(
+    model,
+    optimizer,
+    scheduler,
+    precision_mgr=None,
+    gradient_rescale: float = 1.0,
+    max_grad_norm: Optional[float] = 1.0,
+):
     """Apply accumulated gradients with correct AMP unscale/overflow semantics.
 
-    Returns (did_step, pre_clip_norm). A skipped FP16 update must not advance
+    Returns OptimizerStepResult(did_step, pre_clip_norm, post_clip_norm). A skipped FP16 update must not advance
     the learning-rate scheduler or the reported optimizer-step counter.
     """
-    scaler = precision_mgr.scaler
+    scaler = precision_mgr.scaler if precision_mgr is not None else None
     if scaler is not None:
         scaler.unscale_(optimizer)
         scale_before = scaler.get_scale()
@@ -558,7 +607,19 @@ def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_r
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(gradient_rescale)
-    norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
+
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    if not params_with_grad:
+        pre_norm = 0.0
+        post_norm = 0.0
+    else:
+        if max_grad_norm is not None and float(max_grad_norm) > 0:
+            pre_norm = float(torch.nn.utils.clip_grad_norm_(params_with_grad, float(max_grad_norm)))
+            post_norm = float(torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 2))
+        else:
+            pre_norm = float(torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 2))
+            post_norm = pre_norm
+
     if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
@@ -566,10 +627,10 @@ def finish_optimizer_step(model, optimizer, scheduler, precision_mgr, gradient_r
     else:
         optimizer.step()
         did_step = True
-    if did_step:
+    if did_step and scheduler is not None:
         scheduler.step()
     optimizer.zero_grad(set_to_none=True)
-    return did_step, norm
+    return OptimizerStepResult(did_step, pre_norm, post_norm)
 
 
 
@@ -867,13 +928,16 @@ def train_model(config, config_path: str = "(unknown)"):
     step_start = time.time()
 
     max_seq_length = model_cfg.get('max_seq_length', 512)
+    label_masking = training_cfg.get('label_masking', True)
+    truncation_side = training_cfg.get('truncation_side', 'left_prompt')
+    max_grad_norm = training_cfg.get('max_grad_norm', 1.0)
     
     total_messages_seen = 0
     last_data_time = time.time()
     last_heartbeat_time = time.time()
     heartbeat_every_s = 5.0
     _log("Starting manual training loop...")
-    _log("Label masking enabled: loss computed on response tokens only (prompt tokens masked with -100).")
+    _log(f"Training settings: label_masking={label_masking}, truncation_side='{truncation_side}', max_grad_norm={max_grad_norm}")
 
     eof_received = False
     stop_requested = False
@@ -1050,8 +1114,15 @@ def train_model(config, config_path: str = "(unknown)"):
                         # Tokenize with prompt/response separation, truncate prompt (not response),
                         # and mask prompt tokens in labels.
                         tok = tokenize_with_label_masking(
-                            tokenizer, prompt_text, response_text, max_seq_length
+                            tokenizer,
+                            prompt_text,
+                            response_text,
+                            max_seq_length,
+                            label_masking=label_masking,
+                            truncation_side=truncation_side,
                         )
+                        if all(lbl == -100 for lbl in tok['labels']):
+                            continue
                         batch_samples.append(tok)
                         total_messages_seen += 1
                         last_data_time = time.time()
@@ -1104,7 +1175,8 @@ def train_model(config, config_path: str = "(unknown)"):
             # Once enough mini-batches are accumulated, update the optimizer.
             if grad_accum_counter % training_args.gradient_accumulation_steps == 0:
                 did_step, avg_grad_norm = finish_optimizer_step(
-                    model, optimizer, scheduler, precision_mgr)
+                    model, optimizer, scheduler, precision_mgr,
+                    max_grad_norm=max_grad_norm)
                 if not did_step:
                     _log("FP16 gradient overflow: optimizer update skipped; loss scale reduced.")
                     train_model._acc_tokens = 0
@@ -1202,7 +1274,8 @@ def train_model(config, config_path: str = "(unknown)"):
             pending = grad_accum_counter % training_args.gradient_accumulation_steps
             did_step, _ = finish_optimizer_step(
                 model, optimizer, scheduler, precision_mgr,
-                gradient_rescale=training_args.gradient_accumulation_steps / pending)
+                gradient_rescale=training_args.gradient_accumulation_steps / pending,
+                max_grad_norm=max_grad_norm)
             if did_step:
                 optimization_step += 1
                 _log(f"Flushed partial gradient accumulation at step {optimization_step} "
