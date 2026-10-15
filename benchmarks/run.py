@@ -1403,6 +1403,12 @@ def suite_filter_benchmark(run, args):
     run.stage("filter_benchmark/execute", lambda: run_filter_benchmark_suite(run, args))
 
 
+def suite_rescore(run, args):
+    """Re-score saved IMDb run10 checkpoints with Wilson and bootstrap CIs."""
+    from benchmarks.rescore_run import run_rescore_suite
+    run.stage("rescore/execute", lambda: run_rescore_suite(run, args))
+
+
 def suite_precision(run, args):
     from benchmarks.precision_probe import run_precision_probe
     steps = {"smoke": 2, "standard": 10, "full": 50}[args.profile]
@@ -1812,6 +1818,7 @@ def main():
         "fault_injection": lambda: suite_fault_injection(run, args),
         "eval_speed": lambda: suite_eval_speed(run, args, args.data_dir),
         "filter_benchmark": lambda: suite_filter_benchmark(run, args),
+        "rescore": lambda: suite_rescore(run, args),
     }
     for suite in suites:
         try:
