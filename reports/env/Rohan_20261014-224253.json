@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-10-14T22:42:48",
+  "python_version": "3.10.16 | packaged by Anaconda, Inc. | (main, Dec 11 2024, 16:19:12) [MSC v.1929 64 bit (AMD64)]",
+  "platform": "Windows-10-10.0.26300-SP0",
+  "platform_machine": "AMD64",
+  "platform_node": "Rohan",
+  "cpu_model": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+  "total_ram_bytes": 16866729984,
+  "torch": {
+    "version": "2.10.0+cpu",
+    "cuda_available": false,
+    "cuda_device_name": null,
+    "cuda_capability": null,
+    "mps_available": false,
+    "xpu_available": false
+  },
+  "package_versions": {
+    "transformers": "5.5.3",
+    "peft": "0.18.1",
+    "datasets": "4.5.0",
+    "safetensors": "0.5.2",
+    "kafka-python": "2.0.2",
+    "numpy": "1.26.4"
+  },
+  "kafka_import_success": true,
+  "java_version": "java version \"25.0.2\" 2026-01-20 LTS"
+}
